@@ -102,18 +102,18 @@ async def on_message(message: discord.Message):
     mention_str2 = f"<@!{bot.user.id}>"
     text = text.replace(mention_str1, "").replace(mention_str2, "").strip()
 
-    # 新格式：~要買 數量 [規格] 分享文字...
-    # 例1：~要買 3 "型號規格 可以有空格" 【淘宝/京东】... https://... 「商品」
-    # 例2：~要買 3 【淘宝/京东】... https://... 「商品」
-    # 規格部分改為可選（用 (?:"([^"]+)"\s+)?）
-    regex = r'^~要買\s+(\d+)\s+(?:"([^"]+)"\s+)?([\s\S]+)'
+    # 新格式：~要買~數量~[規格]~分享文字...
+    # 例1：~要買~3~"型號規格 可以有空格"~【淘宝/京东】... https://... 「商品」
+    # 例2：~要買~3~【淘宝/京东】... https://... 「商品」
+    # 規格部分改為可選（用 (?:~\s*"([^"]+)")?）
+    regex = r'^~要買\s*~\s*(\d+)(?:\s*~\s*"([^"]+)")?\s*~\s*([\s\S]+)'
     m = re.match(regex, text, re.IGNORECASE)
 
     if not m:
         if "~要買" in text:
             # 👉 格式不符時回提示
-            example1 = '~要買 3 【淘宝/京东】... https://... 「商品」'
-            example2 = '~要買 3 "型號規格" 【淘宝/京东】... https://... 「商品」'
+            example1 = '~要買~3~【淘宝/京东】... https://... 「商品」'
+            example2 = '~要買~3~"型號規格"~【淘宝/京东】... https://... 「商品」'
             await message.reply(
                 "格式有誤 QQ\n"
                 "請用下面其中一種格式：\n"
@@ -130,8 +130,8 @@ async def on_message(message: discord.Message):
 
     # 👉 檢查是否包含連結
     if not re.search(r'https?://', share_text):
-        example1 = '~要買 3 【淘宝/京东】... https://... 「商品」'
-        example2 = '~要買 3 "型號規格" 【淘宝/京东】... https://... 「商品」'
+        example1 = '~要買~3~【淘宝/京东】... https://... 「商品」'
+        example2 = '~要買~3~"型號規格"~【淘宝/京东】... https://... 「商品」'
         await message.reply(
             "格式有誤 QQ\n"
             "訊息中缺少連結！請用下面其中一種格式：\n"

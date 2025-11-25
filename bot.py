@@ -103,17 +103,17 @@ async def on_message(message: discord.Message):
     text = text.replace(mention_str1, "").replace(mention_str2, "").strip()
 
     # 新格式：~要買~數量~[規格]~分享文字...
-    # 例1：~要買~3~"型號規格 可以有空格"~【淘宝/京东】... https://... 「商品」
+    # 例1：~要買~3~白色~【淘宝/京东】... https://... 「商品」
     # 例2：~要買~3~【淘宝/京东】... https://... 「商品」
-    # 規格部分改為可選（用 (?:~\s*"([^"]+)")?）
-    regex = r'^~要買\s*~\s*(\d+)(?:\s*~\s*"([^"]+)")?\s*~\s*([\s\S]+)'
+    # 規格部分改為可選，僅需用 ~ 分隔即可
+    regex = r'^~要買\s*~\s*(\d+)(?:\s*~\s*([^~]+))?\s*~\s*([\s\S]+)'
     m = re.match(regex, text, re.IGNORECASE)
 
     if not m:
         if "~要買" in text:
             # 👉 格式不符時回提示
             example1 = '~要買~3~【淘宝/京东】... https://... 「商品」'
-            example2 = '~要買~3~"型號規格"~【淘宝/京东】... https://... 「商品」'
+            example2 = '~要買~3~白色~【淘宝/京东】... https://... 「商品」'
             await message.reply(
                 "格式有誤 QQ\n"
                 "請用下面其中一種格式：\n"
@@ -125,13 +125,17 @@ async def on_message(message: discord.Message):
 
 
     quantity = int(m.group(1))
-    model_spec = m.group(2) if m.group(2) else ""  # 👈 規格（顏色/型號）可能為空
+    raw_spec = m.group(2).strip() if m.group(2) else ""
+    if raw_spec.startswith('"') and raw_spec.endswith('"') and len(raw_spec) >= 2:
+        model_spec = raw_spec[1:-1].strip()
+    else:
+        model_spec = raw_spec  # 👈 規格（顏色/型號）可能為空
     share_text = m.group(3).strip()  # 淘寶分享文字
 
     # 👉 檢查是否包含連結
     if not re.search(r'https?://', share_text):
         example1 = '~要買~3~【淘宝/京东】... https://... 「商品」'
-        example2 = '~要買~3~"型號規格"~【淘宝/京东】... https://... 「商品」'
+        example2 = '~要買~3~白色~【淘宝/京东】... https://... 「商品」'
         await message.reply(
             "格式有誤 QQ\n"
             "訊息中缺少連結！請用下面其中一種格式：\n"

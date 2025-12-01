@@ -5,29 +5,30 @@
       "parameters": {
         "httpMethod": "POST",
         "path": "discord-shopping",
+        "responseMode": "responseNode",
         "options": {}
       },
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2.1,
       "position": [
-        0,
-        0
+        -624,
+        80
       ],
-      "id": "ffaa0ab0-20f0-4e95-a990-7f61d48b26eb",
+      "id": "1195d652-cc92-4ba0-8562-3046757f9b88",
       "name": "Webhook",
       "webhookId": "1cad2ec7-83d5-45cb-8ecb-6c4a0f8d663f"
     },
     {
       "parameters": {
-        "jsCode": "// ✅ Code 節點完整程式（同時支援 淘寶 / 京東）\n\nconst incomingItems = $input.all();\nconst out = [];\n\nfor (const item of incomingItems) {\n  const payload = item.json.body || item.json;\n\n  const shareText = payload.shareText || payload.fullText || '';\n  const quantityRaw = payload.quantity ?? 1;\n  const quantity = parseInt(quantityRaw, 10) || 1;\n\n  const senderId = payload.senderId || '';\n  const senderName = payload.senderName || '';\n  const createdAt = payload.createdAt || new Date().toISOString();\n\n  // 👇 先抓網址\n  const urlMatch = shareText.match(/https?:\\/\\/\\S+/);\n  const url = urlMatch ? urlMatch[0] : '';\n\n  // 👇 判斷平台：預設「淘寶」，如果看到京東關鍵字或 jd/3.cn 網址就視為「京東」\n  let platform = '淘寶';\n  if (/京东/.test(shareText) || (url && (url.includes('jd.com') || url.includes('3.cn')))) {\n    platform = '京東';\n  }\n\n  // 預購買商品名稱：優先抓「」中的文字\n  let itemName = '';\n  const titleMatch = shareText.match(/「([^」]+)」/);\n  if (titleMatch) {\n    itemName = titleMatch[1].trim();\n  } else if (urlMatch) {\n    const afterUrl = shareText.slice(urlMatch.index + urlMatch[0].length).trim();\n    itemName = afterUrl || shareText;\n  } else {\n    itemName = shareText;\n  }\n\n  // 型號規格：用 payload.modelSpec（如果你已經加了那段），沒有就先留空\n  const modelSpec = payload.modelSpec || '';\n\n  const unitPrice = '';\n  const estimatedPrice = '';\n  const actualPrice = '';\n\n  out.push({\n    json: {\n      platform,        // 👈 新增：平台（淘寶 / 京東）\n      itemName,\n      modelSpec,\n      url,\n      unitPrice,\n      quantity,\n      estimatedPrice,\n      actualPrice,\n      buyer: senderName,\n      senderId,\n      createdAt,\n    },\n  });\n}\n\nreturn out;\n"
+        "jsCode": "// === ShoppingListBot 用 Code 節點 ===\n// 同時處理 action = \"add\" / \"delete\"\n\nconst items = $input.all();\nconst out = [];\n\nconst urlRegex = /https?:\\/\\/\\S+/;\n\nfor (const item of items) {\n  // Webhook 來的 JSON 可能在 item.json 或 item.json.body\n  const payload = item.json.body || item.json || {};\n\n  const action = payload.action || 'add';\n  const senderId = payload.senderId || '';\n  const senderName = payload.senderName || '';\n  const createdAt = payload.createdAt || new Date().toISOString();\n\n  // ------------------------------------------------\n  // 共同的「平台判斷」邏輯：先用 shareText，再退而用 url\n  // ------------------------------------------------\n  let shareText = payload.shareText || payload.fullText || '';\n  let urlFromPayload = payload.url || '';\n\n  // 如果 shareText 裡有網址，就抓第一個\n  let url = '';\n  let m = shareText.match(urlRegex);\n  if (m) {\n    url = m[0];\n  }\n  // 如果 shareText 沒有網址，就用 payload.url\n  if (!url && urlFromPayload) {\n    url = urlFromPayload;\n  }\n\n  // 預設平台：淘寶\n  let platform = '淘寶';\n  // 如果文字或網址裡看得到京東關鍵字，就視為京東\n  if (\n    /京东/.test(shareText) ||\n    (url && (url.includes('jd.com') || url.includes('3.cn')))\n  ) {\n    platform = '京東';\n  }\n\n  // ------------------------------------------------\n  // action = \"add\"：新增一筆到清單\n  // ------------------------------------------------\n  if (action === 'add') {\n    const quantityRaw = payload.quantity ?? 1;\n    const quantity = parseInt(quantityRaw, 10) || 1;\n\n    // 商品名稱：優先抓最後一組「……」中的文字\n    let itemName = '';\n    const titleMatch = shareText.match(/「([^」]+)」/);\n    if (titleMatch) {\n      itemName = titleMatch[1].trim();\n    } else if (url) {\n      const idx = shareText.indexOf(url);\n      if (idx >= 0) {\n        const afterUrl = shareText.slice(idx + url.length).trim();\n        itemName = afterUrl || shareText;\n      } else {\n        itemName = shareText;\n      }\n    } else {\n      itemName = shareText;\n    }\n\n    const modelSpec = payload.modelSpec || '';\n    const unitPrice = '';\n    const estimatedPrice = '';\n    const actualPrice = '';\n\n    out.push({\n      json: {\n        action: 'add',\n        platform,        // 淘寶 / 京東\n        itemName,        // 預購買商品\n        modelSpec,       // 商品型號規格\n        url,             // 商品網址\n        unitPrice,       // 商品價格（暫空）\n        quantity,        // 商品數量\n        estimatedPrice,  // 預估價格（暫空）\n        actualPrice,     // 實際價格（暫空）\n        buyer: senderName,\n        senderId,\n        createdAt,\n      },\n    });\n\n    continue;\n  }\n\n  // ------------------------------------------------\n  // action = \"delete\"：刪除指定網址那一筆\n  // ------------------------------------------------\n  if (action === 'delete') {\n    // 這裡對於刪除，其實只需要平台 + url + senderName\n    // platform 已經上面算好了（用 shareText/url 判斷）\n    // url 也已經決定好（優先 shareText，否則 payload.url）\n\n    out.push({\n      json: {\n        action: 'delete',\n        platform,\n        url,\n        senderName,\n        senderId,\n        createdAt,\n      },\n    });\n\n    continue;\n  }\n\n  // ------------------------------------------------\n  // 其他未知 action，原樣丟出（方便偵錯）\n  // ------------------------------------------------\n  out.push({ json: payload });\n}\n\nreturn out;\n"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        208,
-        0
+        -416,
+        80
       ],
-      "id": "6179092f-6ac5-4463-8d11-15c2a6de519c",
+      "id": "70b879e5-b81b-4168-83ca-c4f90b2ea6eb",
       "name": "Code"
     },
     {
@@ -142,78 +143,17 @@
       "type": "n8n-nodes-base.googleSheets",
       "typeVersion": 4.7,
       "position": [
-        624,
-        -80
+        208,
+        0
       ],
-      "id": "d32334e4-d989-4b5f-8074-4b99ac631297",
-      "name": "Append row in sheet",
+      "id": "1b01f356-3130-490d-9648-7dad3650eb4f",
+      "name": "Append row in sheet TB",
       "credentials": {
         "googleSheetsOAuth2Api": {
-          "id": "EOLppS9bMcI35b1P",
+          "id": "TGwFp295v7gk3RIt",
           "name": "Google Sheets account"
         }
       }
-    },
-    {
-      "parameters": {
-        "rules": {
-          "values": [
-            {
-              "conditions": {
-                "options": {
-                  "caseSensitive": true,
-                  "leftValue": "",
-                  "typeValidation": "strict",
-                  "version": 2
-                },
-                "conditions": [
-                  {
-                    "leftValue": "={{$json[\"platform\"]}}",
-                    "rightValue": "淘寶",
-                    "operator": {
-                      "type": "string",
-                      "operation": "equals"
-                    },
-                    "id": "16633856-70ab-4eec-a667-a8651c6e408b"
-                  }
-                ],
-                "combinator": "and"
-              }
-            },
-            {
-              "conditions": {
-                "options": {
-                  "caseSensitive": true,
-                  "leftValue": "",
-                  "typeValidation": "strict",
-                  "version": 2
-                },
-                "conditions": [
-                  {
-                    "id": "f891a2eb-2ac7-4cfe-afd7-cf2ab322041e",
-                    "leftValue": "={{$json[\"platform\"]}}",
-                    "rightValue": "京東",
-                    "operator": {
-                      "type": "string",
-                      "operation": "equals"
-                    }
-                  }
-                ],
-                "combinator": "and"
-              }
-            }
-          ]
-        },
-        "options": {}
-      },
-      "type": "n8n-nodes-base.switch",
-      "typeVersion": 3.2,
-      "position": [
-        416,
-        0
-      ],
-      "id": "b6e994c2-1388-494c-ab1c-2b1703adc988",
-      "name": "Switch"
     },
     {
       "parameters": {
@@ -327,17 +267,582 @@
       "type": "n8n-nodes-base.googleSheets",
       "typeVersion": 4.7,
       "position": [
-        624,
-        80
+        208,
+        160
       ],
-      "id": "2141e598-5322-4cf6-a1d4-5802e3955512",
-      "name": "Append row in sheet1",
+      "id": "87c41a1d-5570-46e4-a8e3-17e8f283a7c5",
+      "name": "Append row in sheet JD",
       "credentials": {
         "googleSheetsOAuth2Api": {
-          "id": "EOLppS9bMcI35b1P",
+          "id": "TGwFp295v7gk3RIt",
           "name": "Google Sheets account"
         }
       }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{$json[\"action\"]}}",
+                    "rightValue": "add",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "cd2247ef-6d34-447c-a60e-37121f2b39e7"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "ab1f3d0e-9a81-47b0-8a8e-73b4f8614db2",
+                    "leftValue": "={{$json[\"action\"]}}",
+                    "rightValue": "delete",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.3,
+      "position": [
+        -208,
+        80
+      ],
+      "id": "0c3279fa-a6d2-479d-b5a3-7e71d986c47d",
+      "name": "Switch Action"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{$json[\"platform\"]}}",
+                    "rightValue": "淘寶",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "16633856-70ab-4eec-a667-a8651c6e408b"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "f891a2eb-2ac7-4cfe-afd7-cf2ab322041e",
+                    "leftValue": "={{$json[\"platform\"]}}",
+                    "rightValue": "京東",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        0,
+        48
+      ],
+      "id": "cdccdae5-f09f-4329-8629-397cab227e69",
+      "name": "Switch Platform"
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM",
+          "mode": "list",
+          "cachedResultName": "淘寶/京東購物清單",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 927580131,
+          "mode": "list",
+          "cachedResultName": "淘寶",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit#gid=927580131"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "商品網址",
+              "lookupValue": "={{$json[\"url\"]}}"
+            },
+            {
+              "lookupColumn": "購買人",
+              "lookupValue": "={{$json[\"senderName\"]}}"
+            }
+          ]
+        },
+        "options": {
+          "returnFirstMatch": true
+        }
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        256,
+        336
+      ],
+      "id": "d92f5181-ee6b-4aec-8f0b-12c268750fdb",
+      "name": "Get rows in sheet TB",
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "TGwFp295v7gk3RIt",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM",
+          "mode": "list",
+          "cachedResultName": "淘寶/京東購物清單",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 927580131,
+          "mode": "list",
+          "cachedResultName": "淘寶",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit#gid=927580131"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "商品網址",
+              "lookupValue": "https://e.tb.cn/h.SwuaWEoXLEzG72k?tk=w8v1fNVA4cH"
+            },
+            {
+              "lookupColumn": "購買人",
+              "lookupValue": "=ymj1123"
+            }
+          ]
+        },
+        "options": {
+          "returnFirstMatch": true
+        }
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -464,
+        416
+      ],
+      "id": "694c566f-6295-4e62-8b17-a2097554bb31",
+      "name": "Get rows in sheet TB TEST",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "TGwFp295v7gk3RIt",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "delete",
+        "documentId": {
+          "__rl": true,
+          "value": "1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM",
+          "mode": "list",
+          "cachedResultName": "淘寶/京東購物清單",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 927580131,
+          "mode": "list",
+          "cachedResultName": "淘寶",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit#gid=927580131"
+        },
+        "startIndex": "={{$json[\"row_number\"]}}"
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        672,
+        288
+      ],
+      "id": "8d16c765-b37c-4691-9ecf-4be4e8ab64e6",
+      "name": "Delete rows or columns from sheet TB",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "TGwFp295v7gk3RIt",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM",
+          "mode": "list",
+          "cachedResultName": "淘寶/京東購物清單",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "京東",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit#gid=0"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "商品網址",
+              "lookupValue": "={{$json[\"url\"]}}"
+            },
+            {
+              "lookupColumn": "購買人",
+              "lookupValue": "={{$json[\"senderName\"]}}"
+            }
+          ]
+        },
+        "options": {
+          "returnFirstMatch": true
+        }
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        256,
+        512
+      ],
+      "id": "0bf7e7b7-397d-4aac-94c7-0922e6f18193",
+      "name": "Get rows in sheet JD",
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "TGwFp295v7gk3RIt",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "delete",
+        "documentId": {
+          "__rl": true,
+          "value": "1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM",
+          "mode": "list",
+          "cachedResultName": "淘寶/京東購物清單",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "京東",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit#gid=0"
+        },
+        "startIndex": "={{$json[\"row_number\"]}}"
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        672,
+        480
+      ],
+      "id": "1410c87f-0752-474c-b2ee-ae04d19dacb0",
+      "name": "Delete rows or columns from sheet JD",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "TGwFp295v7gk3RIt",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{$json[\"platform\"]}}",
+                    "rightValue": "淘寶",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "16633856-70ab-4eec-a667-a8651c6e408b"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "f891a2eb-2ac7-4cfe-afd7-cf2ab322041e",
+                    "leftValue": "={{$json[\"platform\"]}}",
+                    "rightValue": "京東",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        0,
+        320
+      ],
+      "id": "6be18d08-d15d-40c9-a7e2-b5bea2a801e1",
+      "name": "Switch Platform1"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "ae1607ea-74c4-4e39-becb-6520850b0489",
+              "leftValue": "={{$json[\"row_number\"]}}",
+              "rightValue": "",
+              "operator": {
+                "type": "number",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        464,
+        336
+      ],
+      "id": "fb89e0bc-b723-45bd-8b78-3d1af454e177",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "ae1607ea-74c4-4e39-becb-6520850b0489",
+              "leftValue": "={{$json[\"row_number\"]}}",
+              "rightValue": "",
+              "operator": {
+                "type": "number",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        464,
+        512
+      ],
+      "id": "455a4f85-c4c8-44d5-a619-8a1e049dd558",
+      "name": "If1"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\n  \"status\": \"deleted\"\n}\n",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        848,
+        192
+      ],
+      "id": "45e4cd3d-60cd-47bc-97a9-79d128e44613",
+      "name": "Respond to Webhook1"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\n  \"status\": \"deleted\"\n}\n",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        880,
+        480
+      ],
+      "id": "9faa854a-d5ea-47cd-b72f-b5807fb8b46e",
+      "name": "Respond to Webhook"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"status\":\"not_owner_or_not_found\"}\n",
+        "options": {
+          "responseCode": 403
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        848,
+        352
+      ],
+      "id": "999aab93-cc4f-41c1-8b9d-905f3a312f3e",
+      "name": "Respond(403)"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"status\":\"not_owner_or_not_found\"}\n",
+        "options": {
+          "responseCode": 403
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        880,
+        608
+      ],
+      "id": "375dcbaf-202d-4d70-87b2-1f124664abca",
+      "name": "Respond(403)1"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"status\":\"added\"}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        384,
+        0
+      ],
+      "id": "5c7190c0-1257-4158-ae13-a594bc5761ba",
+      "name": "Respond (added)"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"status\":\"added\"}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        384,
+        160
+      ],
+      "id": "d6f3407c-dc80-4e31-bbc8-a2ed573edfa9",
+      "name": "Respond (added)1"
     }
   ],
   "pinData": {},
@@ -357,25 +862,163 @@
       "main": [
         [
           {
-            "node": "Switch",
+            "node": "Switch Action",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Switch": {
+    "Switch Action": {
       "main": [
         [
           {
-            "node": "Append row in sheet",
+            "node": "Switch Platform",
             "type": "main",
             "index": 0
           }
         ],
         [
           {
-            "node": "Append row in sheet1",
+            "node": "Switch Platform1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch Platform": {
+      "main": [
+        [
+          {
+            "node": "Append row in sheet TB",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Append row in sheet JD",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get rows in sheet TB": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get rows in sheet JD": {
+      "main": [
+        [
+          {
+            "node": "If1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch Platform1": {
+      "main": [
+        [
+          {
+            "node": "Get rows in sheet TB",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get rows in sheet JD",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Delete rows or columns from sheet TB",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond(403)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If1": {
+      "main": [
+        [
+          {
+            "node": "Delete rows or columns from sheet JD",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond(403)1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete rows or columns from sheet TB": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete rows or columns from sheet JD": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append row in sheet TB": {
+      "main": [
+        [
+          {
+            "node": "Respond (added)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append row in sheet JD": {
+      "main": [
+        [
+          {
+            "node": "Respond (added)1",
             "type": "main",
             "index": 0
           }
@@ -387,11 +1030,11 @@
   "settings": {
     "executionOrder": "v1"
   },
-  "versionId": "05a7ea87-ea77-4b22-bc4e-2652f8a3c4da",
+  "versionId": "89954763-9985-4691-8049-b8a55e5ed1e9",
   "meta": {
     "templateCredsSetupCompleted": true,
-    "instanceId": "9db13d2725b22e83be3746260645dbff2589b9fac99bd21851a2310f82914631"
+    "instanceId": "447b28fc540fbb52c629a13ba71be9946705860cbc08a149e0f9d0b24f2d2015"
   },
-  "id": "balV7GHHFKPiEPJY",
+  "id": "w0j4snoLqb4IuF5a",
   "tags": []
 }

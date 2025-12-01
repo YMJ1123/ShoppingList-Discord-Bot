@@ -28,6 +28,7 @@ A lightweight Discord bot that validates `~要買` commands and forwards them to
   - 使用 `Code` 節點解析 payload
   - 使用 `Switch` 節點依 `platform` 分流
   - 將 **淘寶訂單寫入 Sheet「淘寶」**、**京東訂單寫入 Sheet「京東」**
+- 支援 `~刪除` 指令：貼上商品連結或原分享文字，bot 會依第一個 URL 尋找並刪除對應的清單紀錄
 
 ---
 
@@ -112,13 +113,24 @@ python bot.py
 ~要買~2~25H续航+AI通话 降噪 雅灰色~【京东】https://3.cn/2v-s8bsu?... 「漫步者X3Pro真无线降噪蓝牙耳机」
 ```
 
+### 刪除格式 / Delete format
+
+```text
+~刪除 https://e.tb.cn/h.xxx
+~刪除 【淘宝】7天无理由退货 https://e.tb.cn/h.xxx 「電動牙刷」
+```
+
+- 只要在分享文字最前面加上 `~刪除`，bot 會抓取第一個 URL 並刪除對應的訂單。
+- 若僅有連結也可行：`~刪除 <URL>`。
+- 找不到符合 URL 的紀錄或格式錯誤時，bot 會回覆失敗提示。
+
 Bot 檢查：
 
 * 指令各欄位以 `~` 分隔，避免被多餘空白吞掉
-* 以 `~要買` 開頭
+* 以 `~要買` 開頭（或以 `~刪除` 開頭以觸發刪除流程）
 * `<數量>` 為整數（`int`）
 * 型號規格欄位可含空白、也可整段省略，只要不要再出現 `~`
-* 文字中至少有一個 `http://` 或 `https://` 開頭的 URL
+* 文字中至少有一個 `http://` 或 `https://` 開頭的 URL（`~刪除` 會使用第一個 URL 判斷刪除目標）
 
 若使用者打了 `~要買` 但格式不正確，bot 會回覆提示，例如：
 
@@ -208,66 +220,125 @@ Discord Bot → n8n Webhook → Code → Switch(platform)
    * **Mode**：`Run Once for All Items`
    * **Language**：`JavaScript`
 
-4. 填入類似下面的程式（實際以 repo 中版本為準）：
+4. 填入下面這段程式（`ShoppingListBot.json` 即採用此邏輯，會同時處理新增 / 刪除）：
 
    ```js
-   const incomingItems = $input.all();
+   // === ShoppingListBot 用 Code 節點 ===
+   // 同時處理 action = "add" / "delete"
+   const items = $input.all();
    const out = [];
+   const urlRegex = /https?:\/\/\S+/;
 
-   for (const item of incomingItems) {
-     // Webhook 預設會把 body 放在 json.body 裡
-     const payload = item.json.body || item.json;
-
-     const shareText = payload.shareText || payload.fullText || '';
-     const quantityRaw = payload.quantity ?? 1;
-     const quantity = parseInt(quantityRaw, 10) || 1;
-
+   for (const item of items) {
+     // Webhook 來的 JSON 可能在 item.json 或 item.json.body
+     const payload = item.json.body || item.json || {};
+     const action = payload.action || 'add';
+     const senderId = payload.senderId || '';
      const senderName = payload.senderName || '';
      const createdAt = payload.createdAt || new Date().toISOString();
 
-     // 抓第一個網址
-     const urlMatch = shareText.match(/https?:\/\/\S+/);
-     const url = urlMatch ? urlMatch[0] : '';
+     // ------------------------------------------------
+     // 共同的「平台判斷」邏輯：先用 shareText，再退而用 url
+     // ------------------------------------------------
+     let shareText = payload.shareText || payload.fullText || '';
+     let urlFromPayload = payload.url || '';
 
-     // 判斷平台：預設淘寶，若有「京东」或 jd.com / 3.cn 則視為京東
+     // 如果 shareText 裡有網址，就抓第一個
+     let url = '';
+     let m = shareText.match(urlRegex);
+     if (m) {
+       url = m[0];
+     }
+     // 如果 shareText 沒有網址，就用 payload.url
+     if (!url && urlFromPayload) {
+       url = urlFromPayload;
+     }
+
+     // 預設平台：淘寶
      let platform = '淘寶';
-     if (/京东/.test(shareText) || (url && (url.includes('jd.com') || url.includes('3.cn')))) {
+     // 如果文字或網址裡看得到京東關鍵字，就視為京東
+     if (
+       /京东/.test(shareText) ||
+       (url && (url.includes('jd.com') || url.includes('3.cn')))
+     ) {
        platform = '京東';
      }
 
-     // 商品名稱：優先抓最後一組「……」中的內容
-     let itemName = '';
-     const titleMatch = shareText.match(/「([^」]+)」/);
-     if (titleMatch) {
-       itemName = titleMatch[1].trim();
-     } else if (urlMatch) {
-       const afterUrl = shareText.slice(urlMatch.index + urlMatch[0].length).trim();
-       itemName = afterUrl || shareText;
-     } else {
-       itemName = shareText;
+     // ------------------------------------------------
+     // action = "add"：新增一筆到清單
+     // ------------------------------------------------
+     if (action === 'add') {
+       const quantityRaw = payload.quantity ?? 1;
+       const quantity = parseInt(quantityRaw, 10) || 1;
+
+       // 商品名稱：優先抓最後一組「……」中的文字
+       let itemName = '';
+       const titleMatch = shareText.match(/「([^」]+)」/);
+       if (titleMatch) {
+         itemName = titleMatch[1].trim();
+       } else if (url) {
+         const idx = shareText.indexOf(url);
+         if (idx >= 0) {
+           const afterUrl = shareText.slice(idx + url.length).trim();
+           itemName = afterUrl || shareText;
+         } else {
+           itemName = shareText;
+         }
+       } else {
+         itemName = shareText;
+       }
+
+       const modelSpec = payload.modelSpec || '';
+       const unitPrice = '';
+       const estimatedPrice = '';
+       const actualPrice = '';
+
+       out.push({
+         json: {
+           action: 'add',
+           platform,        // 淘寶 / 京東
+           itemName,        // 預購買商品
+           modelSpec,       // 商品型號規格
+           url,             // 商品網址
+           unitPrice,       // 商品價格（暫空）
+           quantity,        // 商品數量
+           estimatedPrice,  // 預估價格（暫空）
+           actualPrice,     // 實際價格（暫空）
+           buyer: senderName,
+           senderId,
+           createdAt,
+         },
+       });
+
+       continue;
      }
 
-     // 型號規格：由 bot 解析後傳入
-     const modelSpec = payload.modelSpec || '';
+     // ------------------------------------------------
+     // action = "delete"：刪除指定網址那一筆
+     // ------------------------------------------------
+     if (action === 'delete') {
+       // 這裡對於刪除，其實只需要平台 + url + senderName
+       // platform 已經上面算好了（用 shareText/url 判斷）
+       // url 也已經決定好（優先 shareText，否則 payload.url）
 
-     const unitPrice = '';
-     const estimatedPrice = '';
-     const actualPrice = '';
+       out.push({
+         json: {
+           action: 'delete',
+           platform,
+           url,
+           senderName,
+           senderId,
+           createdAt,
+         },
+       });
 
-     out.push({
-       json: {
-         platform,        // 淘寶 / 京東
-         itemName,        // 預購買商品
-         modelSpec,       // 商品型號規格
-         url,             // 商品網址
-         unitPrice,       // 商品價格（暫空）
-         quantity,        // 商品數量
-         estimatedPrice,  // 預估價格（暫空）
-         actualPrice,     // 實際價格（暫空）
-         buyer: senderName,
-         createdAt,
-       },
-     });
+       continue;
+     }
+
+     // ------------------------------------------------
+     // 其他未知 action，原樣丟出（方便偵錯）
+     // ------------------------------------------------
+     out.push({ json: payload });
    }
 
    return out;
@@ -275,10 +346,29 @@ Discord Bot → n8n Webhook → Code → Switch(platform)
 
 ---
 
-### 3. 建立 Switch Node（依平台分流）
+### 3. 建立 Switch Node（依 action 分流）
 
-1. 新增節點：`Switch`。
-2. 將 `Code → Switch` 接起來。
+1. 新增節點：`Switch`（命名為 `Switch Action` 以利辨識）。
+2. 將 `Code → Switch Action` 接起來。
+3. 設定：
+
+   * **Value / Property to evaluate**：`{{$json["action"]}}`
+   * **Data Type**：`String`
+   * **Rules**：
+     1. Equals `add`
+     2. Equals `delete`
+
+這樣就能讓後續流程分成兩條路徑：
+
+* Output 0（`add`）→ 寫入 Google Sheet
+* Output 1（`delete`）→ 依 URL + 購買人刪除對應列
+
+---
+
+### 4. 建立 Switch Node（依平台分流：Add Flow）
+
+1. 新增節點：`Switch`（建議命名為 `Switch Platform`）。
+2. 將 `Switch Action (0: add)` 接到這個 Switch。
 3. 設定：
 
    * **Value / Property to evaluate**：
@@ -295,18 +385,18 @@ Discord Bot → n8n Webhook → Code → Switch(platform)
      1. Equals `淘寶`
      2. Equals `京東`
 
-這樣：
+輸出結果：
 
-* Switch Output 0 → 淘寶
-* Switch Output 1 → 京東
+* Output 0 → 淘寶
+* Output 1 → 京東
 
-之後要擴充其他平台（例如蝦皮），只要在 Code 中增加 `platform` 判斷，並在 Switch 中再加一條 Rule 即可。
+之後要擴充其他平台（例如蝦皮），只要在 Code 中增加 `platform` 判斷，並在這個 Switch 中再加 Rule 即可。
 
 ---
 
-### 4. Google Sheets Nodes（寫入試算表）
+### 5. Google Sheets Nodes（寫入試算表：Add Flow）
 
-#### 4.1 淘寶 Sheet
+#### 5.1 淘寶 Sheet
 
 1. 新增 Google Sheets node（例如命名為 `Append 淘寶`）。
 2. 接在 Switch Output 0：`Switch (0) → Append 淘寶`。
@@ -329,7 +419,7 @@ Discord Bot → n8n Webhook → Code → Switch(platform)
 
 > 注意：一定要用「Expression」模式，否則字串 `{{$json["itemName"]}}` 會被直接寫入表格。
 
-#### 4.2 京東 Sheet
+#### 5.2 京東 Sheet
 
 1. 複製上一個 node（右鍵 `Append 淘寶` → Duplicate），改名為 `Append 京東`。
 2. 接在 Switch Output 1：`Switch (1) → Append 京東`。
@@ -340,14 +430,42 @@ Discord Bot → n8n Webhook → Code → Switch(platform)
 
 ---
 
-### 5. 啟用 Workflow
+### 6. 刪除流程：查詢並刪除指定列
+
+1. 新增第二個 `Switch`（命名為 `Switch Platform (delete)`），把 `Switch Action (1: delete)` 接進來，判斷邏輯與 add 流程相同（`platform === 淘寶` / `京東`）。
+2. 針對兩個平台各自放一個 **Google Sheets → Lookup** 節點（在介面裡叫 `Get rows in sheet`）：
+   * **Filters**：`商品網址 = {{$json["url"]}}`、`購買人 = {{$json["senderName"]}}`
+   * **Options → Return First Match**：啟用
+   * 勾選 **Always Output Data**，即便找不到列也會輸出空物件，方便後續判斷。
+3. 在每個 lookup 節點後面加一個 `If`：
+   * 條件：`{{$json["row_number"]}}` **is not empty**
+   * **True** → 代表找到同一個人貼的同一個連結。
+   * **False** → 代表連結不存在或不是同一位購買人，直接回覆 403。
+4. `If (True)` 連到 `Google Sheets → Delete rows or columns`：
+   * **Operation**：`Delete rows`
+   * **Start Index**：`{{$json["row_number"]}}`（Google Sheets node 會自動附帶的欄位）
+5. 刪除節點後方加 `Respond to Webhook`，回傳：
+   ```json
+   { "status": "deleted" }
+   ```
+6. `If (False)` 以及刪除節點拋錯時，改回傳：
+   ```json
+   { "status": "not_owner_or_not_found" }
+   ```
+   並把 **Response Code** 設為 `403`，提醒使用者要由原貼文人刪除。
+
+---
+
+### 7. 啟用 Workflow
 
 確認連線為：
 
 ```text
-Webhook → Code → Switch(platform)
-                       ├─ 0: Append 淘寶 (Sheet: 淘寶)
-                       └─ 1: Append 京東 (Sheet: 京東)
+Webhook → Code → Switch(action)
+                       ├─ add → Switch(platform) → Append 淘寶/京東 → Respond {"status":"added"}
+                       └─ delete → Switch(platform) → Get rows → If row exists?
+                                                      ├─ delete row → Respond {"status":"deleted"}
+                                                      └─ Respond 403 {"status":"not_owner_or_not_found"}
 ```
 
 然後在 n8n 右上角將 workflow 切換為 **Active**。

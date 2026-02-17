@@ -6,7 +6,7 @@ import requests
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
-from google import genai
+from openai import OpenAI
 
 # -------------------------------------------------
 #  載入環境變數 (.env)
@@ -16,13 +16,13 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
 ALLOWED_CHANNEL_IDS_RAW = os.getenv("ALLOWED_CHANNEL_IDS", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 if not DISCORD_TOKEN or not N8N_WEBHOOK_URL:
     raise RuntimeError("缺少必要的環境變數：DISCORD_TOKEN 或 N8N_WEBHOOK_URL")
 
-if not GEMINI_API_KEY:
-    raise RuntimeError("缺少必要的環境變數：GEMINI_API_KEY")
+if not GROQ_API_KEY:
+    raise RuntimeError("缺少必要的環境變數：GROQ_API_KEY")
 
 # 將 ALLOWED_CHANNEL_IDS 解析成一組 int set（空字串代表不限制）
 ALLOWED_CHANNEL_IDS = set()
@@ -39,45 +39,46 @@ for part in ALLOWED_CHANNEL_IDS_RAW.split(","):
 URL_REGEX = re.compile(r"https?://\S+")
 
 # -------------------------------------------------
-#  初始化 Gemini（使用新版 google-genai SDK）
+#  初始化 Groq（OpenAI 相容 API）
 # -------------------------------------------------
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-GEMINI_MODEL = "gemini-2.0-flash-lite"
-GEMINI_MAX_RETRIES = 3
+groq_client = OpenAI(
+    base_url="https://api.groq.com/openai/v1",
+    api_key=GROQ_API_KEY,
+)
+GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MAX_RETRIES = 3
 
-GEMINI_PROMPT_TEMPLATE = (
-    "你是一個購物助手。請從這段 Discord 訊息中提取購物資訊：\n"
-    "'{message_content}'\n\n"
-    "請嚴格回傳以下 JSON 格式（不要加 markdown 標記、不要加任何解釋文字，只輸出純 JSON）：\n"
-    '{{"itemName": "商品名稱", "quantity": 1, "modelSpec": "型號規格", "url": "網址"}}\n\n'
+SYSTEM_PROMPT = (
+    "你是一個購物助手。使用者會傳來 Discord 購物訊息，你要從中提取購物資訊。\n"
+    "請嚴格回傳以下 JSON 格式：\n"
+    '{"itemName": "商品名稱", "quantity": 1, "modelSpec": "型號規格", "url": "網址"}\n\n'
     "規則：\n"
     "- itemName：商品名稱，從訊息中提取。如果訊息包含「...」格式的商品名，優先使用。\n"
     "- quantity：數量，必須是整數。如果使用者用中文數字（如 兩台、三個），請轉換為阿拉伯數字。預設為 1。\n"
     "- modelSpec：型號、規格、顏色等描述（如 白色、256GB）。如果沒有就留空字串。\n"
-    "- url：訊息中的網址（https:// 開頭）。如果沒有就留空字串。\n"
+    "- url：訊息中的網址（https:// 開頭）。如果沒有就留空字串，要注意不該有空格。\n"
     "- 如果資訊缺失請留空字串，數量預設為 1。\n"
     "- 只輸出 JSON，不要有其他解釋文字。"
 )
 
 
-async def parse_with_gemini(message_content: str) -> dict | None:
-    """呼叫 Gemini 解析購物訊息，含 429 自動重試，回傳 dict 或 None。"""
-    prompt = GEMINI_PROMPT_TEMPLATE.format(message_content=message_content)
+async def parse_with_llm(message_content: str) -> dict | None:
+    """呼叫 Groq API 解析購物訊息，含 429 自動重試，回傳 dict 或 None。"""
     raw_text = ""
 
-    for attempt in range(1, GEMINI_MAX_RETRIES + 1):
+    for attempt in range(1, GROQ_MAX_RETRIES + 1):
         try:
-            response = gemini_client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
+            response = groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": message_content},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.1,
+                max_tokens=512,
             )
-            raw_text = response.text.strip()
-
-            # Gemini 有時會包裹在 ```json ... ``` 裡，幫它去掉
-            if raw_text.startswith("```"):
-                raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
-                raw_text = re.sub(r"\s*```$", "", raw_text)
-
+            raw_text = response.choices[0].message.content.strip()
             parsed = json.loads(raw_text)
 
             return {
@@ -88,24 +89,21 @@ async def parse_with_gemini(message_content: str) -> dict | None:
             }
 
         except json.JSONDecodeError as e:
-            print(f"[ERROR] Gemini 回傳的不是有效 JSON: {e}")
+            print(f"[ERROR] LLM 回傳的不是有效 JSON: {e}")
             print(f"[ERROR] 原始回傳: {raw_text!r}")
             return None
 
         except Exception as e:
             error_str = str(e)
-            is_rate_limit = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
+            is_rate_limit = "429" in error_str or "rate_limit" in error_str.lower()
 
-            if is_rate_limit and attempt < GEMINI_MAX_RETRIES:
-                # 從錯誤訊息中嘗試解析建議等待秒數，預設 10 秒
-                wait_match = re.search(r"retry(?:Delay)?.*?(\d+)", error_str, re.IGNORECASE)
-                wait_sec = int(wait_match.group(1)) if wait_match else 10
-                wait_sec = min(wait_sec, 30)  # 最多等 30 秒
-                print(f"[WARN] Gemini 429 rate limit，第 {attempt} 次重試，等待 {wait_sec} 秒...")
+            if is_rate_limit and attempt < GROQ_MAX_RETRIES:
+                wait_sec = min(10 * attempt, 30)
+                print(f"[WARN] Groq 429 rate limit，第 {attempt} 次重試，等待 {wait_sec} 秒...")
                 await asyncio.sleep(wait_sec)
                 continue
 
-            print(f"[ERROR] 呼叫 Gemini 時發生錯誤 (attempt {attempt}/{GEMINI_MAX_RETRIES}): {e}")
+            print(f"[ERROR] 呼叫 Groq 時發生錯誤 (attempt {attempt}/{GROQ_MAX_RETRIES}): {e}")
             return None
 
     return None
@@ -127,7 +125,7 @@ async def on_ready():
         print(f"Allowed channel IDs: {sorted(ALLOWED_CHANNEL_IDS)}")
     else:
         print("Allowed channel IDs: 不限制（所有頻道都會處理）")
-    print(f"Gemini model: {GEMINI_MODEL} ✓")
+    print(f"LLM: Groq {GROQ_MODEL} ✓")
 
 
 # -------------------------------------------------
@@ -189,7 +187,7 @@ async def on_message(message: discord.Message):
         return
 
     # ============================================
-    # 2) ~要買：使用 Gemini 解析自然語言，新增到購物清單
+    # 2) ~要買：使用 LLM 解析自然語言，新增到購物清單
     # ============================================
     if not text.startswith("~要買"):
         await bot.process_commands(message)
@@ -198,13 +196,13 @@ async def on_message(message: discord.Message):
     # 先給使用者一個「處理中」的反應
     await message.add_reaction("⏳")
 
-    parsed = await parse_with_gemini(text)
+    parsed = await parse_with_llm(text)
 
     if parsed is None:
         await message.remove_reaction("⏳", bot.user)
         await message.reply(
             "AI 解析服務暫時忙碌，請稍後再試一次 🔄\n"
-            "（如果持續失敗，可能是 Gemini API 額度用完了）"
+            "（如果持續失敗，可能是 API 額度用完了）"
         )
         await bot.process_commands(message)
         return
@@ -225,7 +223,7 @@ async def on_message(message: discord.Message):
     model_spec = parsed["modelSpec"]
     url = parsed["url"]
 
-    # 如果 Gemini 沒抓到 URL，從原始訊息中再嘗試 regex 撈一次
+    # 如果 LLM 沒抓到 URL，從原始訊息中再嘗試 regex 撈一次
     if not url:
         url_match = URL_REGEX.search(text)
         if url_match:

@@ -1,11 +1,12 @@
 import os
 import re
 import json
+import asyncio
 import requests
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai
 
 # -------------------------------------------------
 #  載入環境變數 (.env)
@@ -38,10 +39,11 @@ for part in ALLOWED_CHANNEL_IDS_RAW.split(","):
 URL_REGEX = re.compile(r"https?://\S+")
 
 # -------------------------------------------------
-#  初始化 Gemini
+#  初始化 Gemini（使用新版 google-genai SDK）
 # -------------------------------------------------
-genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+GEMINI_MODEL = "gemini-2.0-flash-lite"
+GEMINI_MAX_RETRIES = 3
 
 GEMINI_PROMPT_TEMPLATE = (
     "你是一個購物助手。請從這段 Discord 訊息中提取購物資訊：\n"
@@ -59,36 +61,54 @@ GEMINI_PROMPT_TEMPLATE = (
 
 
 async def parse_with_gemini(message_content: str) -> dict | None:
-    """呼叫 Gemini 解析購物訊息，回傳 dict 或 None（解析失敗時）。"""
+    """呼叫 Gemini 解析購物訊息，含 429 自動重試，回傳 dict 或 None。"""
     prompt = GEMINI_PROMPT_TEMPLATE.format(message_content=message_content)
+    raw_text = ""
 
-    try:
-        response = gemini_model.generate_content(prompt)
-        raw_text = response.text.strip()
+    for attempt in range(1, GEMINI_MAX_RETRIES + 1):
+        try:
+            response = gemini_client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+            )
+            raw_text = response.text.strip()
 
-        # Gemini 有時會包裹在 ```json ... ``` 裡，幫它去掉
-        if raw_text.startswith("```"):
-            raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
-            raw_text = re.sub(r"\s*```$", "", raw_text)
+            # Gemini 有時會包裹在 ```json ... ``` 裡，幫它去掉
+            if raw_text.startswith("```"):
+                raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
+                raw_text = re.sub(r"\s*```$", "", raw_text)
 
-        parsed = json.loads(raw_text)
+            parsed = json.loads(raw_text)
 
-        result = {
-            "itemName": str(parsed.get("itemName", "")),
-            "quantity": int(parsed.get("quantity", 1)) if parsed.get("quantity") else 1,
-            "modelSpec": str(parsed.get("modelSpec", "")),
-            "url": str(parsed.get("url", "")),
-        }
+            return {
+                "itemName": str(parsed.get("itemName", "")),
+                "quantity": int(parsed.get("quantity", 1)) if parsed.get("quantity") else 1,
+                "modelSpec": str(parsed.get("modelSpec", "")),
+                "url": str(parsed.get("url", "")),
+            }
 
-        return result
+        except json.JSONDecodeError as e:
+            print(f"[ERROR] Gemini 回傳的不是有效 JSON: {e}")
+            print(f"[ERROR] 原始回傳: {raw_text!r}")
+            return None
 
-    except json.JSONDecodeError as e:
-        print(f"[ERROR] Gemini 回傳的不是有效 JSON: {e}")
-        print(f"[ERROR] 原始回傳: {raw_text!r}")
-        return None
-    except Exception as e:
-        print(f"[ERROR] 呼叫 Gemini 時發生錯誤: {e}")
-        return None
+        except Exception as e:
+            error_str = str(e)
+            is_rate_limit = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
+
+            if is_rate_limit and attempt < GEMINI_MAX_RETRIES:
+                # 從錯誤訊息中嘗試解析建議等待秒數，預設 10 秒
+                wait_match = re.search(r"retry(?:Delay)?.*?(\d+)", error_str, re.IGNORECASE)
+                wait_sec = int(wait_match.group(1)) if wait_match else 10
+                wait_sec = min(wait_sec, 30)  # 最多等 30 秒
+                print(f"[WARN] Gemini 429 rate limit，第 {attempt} 次重試，等待 {wait_sec} 秒...")
+                await asyncio.sleep(wait_sec)
+                continue
+
+            print(f"[ERROR] 呼叫 Gemini 時發生錯誤 (attempt {attempt}/{GEMINI_MAX_RETRIES}): {e}")
+            return None
+
+    return None
 
 
 # -------------------------------------------------
@@ -107,7 +127,7 @@ async def on_ready():
         print(f"Allowed channel IDs: {sorted(ALLOWED_CHANNEL_IDS)}")
     else:
         print("Allowed channel IDs: 不限制（所有頻道都會處理）")
-    print("Gemini model: gemini-1.5-flash ✓")
+    print(f"Gemini model: {GEMINI_MODEL} ✓")
 
 
 # -------------------------------------------------
@@ -180,10 +200,19 @@ async def on_message(message: discord.Message):
 
     parsed = await parse_with_gemini(text)
 
-    if not parsed or not parsed.get("itemName"):
+    if parsed is None:
         await message.remove_reaction("⏳", bot.user)
         await message.reply(
-            "我沒辦法理解這段訊息 QQ\n"
+            "AI 解析服務暫時忙碌，請稍後再試一次 🔄\n"
+            "（如果持續失敗，可能是 Gemini API 額度用完了）"
+        )
+        await bot.process_commands(message)
+        return
+
+    if not parsed.get("itemName"):
+        await message.remove_reaction("⏳", bot.user)
+        await message.reply(
+            "我沒辦法從訊息中提取到商品名稱 QQ\n"
             "請試試類似這樣的格式：\n"
             "`~要買 兩台白色的小米風扇 https://...`\n"
             "`~要買 【淘宝】... https://e.tb.cn/h.xxx 「電動牙刷」`"

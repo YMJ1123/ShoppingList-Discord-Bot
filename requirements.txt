@@ -1,5 +1,4 @@
+google-generativeai
 discord.py>=2.3.2
 requests>=2.31.0
-
-
-
+python-dotenv

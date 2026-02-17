@@ -1,9 +1,11 @@
 import os
 import re
+import json
 import requests
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
+import google.generativeai as genai
 
 # -------------------------------------------------
 #  載入環境變數 (.env)
@@ -13,9 +15,13 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
 ALLOWED_CHANNEL_IDS_RAW = os.getenv("ALLOWED_CHANNEL_IDS", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not DISCORD_TOKEN or not N8N_WEBHOOK_URL:
     raise RuntimeError("缺少必要的環境變數：DISCORD_TOKEN 或 N8N_WEBHOOK_URL")
+
+if not GEMINI_API_KEY:
+    raise RuntimeError("缺少必要的環境變數：GEMINI_API_KEY")
 
 # 將 ALLOWED_CHANNEL_IDS 解析成一組 int set（空字串代表不限制）
 ALLOWED_CHANNEL_IDS = set()
@@ -30,6 +36,60 @@ for part in ALLOWED_CHANNEL_IDS_RAW.split(","):
 
 # 抓第一個網址用的 regex
 URL_REGEX = re.compile(r"https?://\S+")
+
+# -------------------------------------------------
+#  初始化 Gemini
+# -------------------------------------------------
+genai.configure(api_key=GEMINI_API_KEY)
+gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+
+GEMINI_PROMPT_TEMPLATE = (
+    "你是一個購物助手。請從這段 Discord 訊息中提取購物資訊：\n"
+    "'{message_content}'\n\n"
+    "請嚴格回傳以下 JSON 格式（不要加 markdown 標記、不要加任何解釋文字，只輸出純 JSON）：\n"
+    '{{"itemName": "商品名稱", "quantity": 1, "modelSpec": "型號規格", "url": "網址"}}\n\n'
+    "規則：\n"
+    "- itemName：商品名稱，從訊息中提取。如果訊息包含「...」格式的商品名，優先使用。\n"
+    "- quantity：數量，必須是整數。如果使用者用中文數字（如 兩台、三個），請轉換為阿拉伯數字。預設為 1。\n"
+    "- modelSpec：型號、規格、顏色等描述（如 白色、256GB）。如果沒有就留空字串。\n"
+    "- url：訊息中的網址（https:// 開頭）。如果沒有就留空字串。\n"
+    "- 如果資訊缺失請留空字串，數量預設為 1。\n"
+    "- 只輸出 JSON，不要有其他解釋文字。"
+)
+
+
+async def parse_with_gemini(message_content: str) -> dict | None:
+    """呼叫 Gemini 解析購物訊息，回傳 dict 或 None（解析失敗時）。"""
+    prompt = GEMINI_PROMPT_TEMPLATE.format(message_content=message_content)
+
+    try:
+        response = gemini_model.generate_content(prompt)
+        raw_text = response.text.strip()
+
+        # Gemini 有時會包裹在 ```json ... ``` 裡，幫它去掉
+        if raw_text.startswith("```"):
+            raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
+            raw_text = re.sub(r"\s*```$", "", raw_text)
+
+        parsed = json.loads(raw_text)
+
+        result = {
+            "itemName": str(parsed.get("itemName", "")),
+            "quantity": int(parsed.get("quantity", 1)) if parsed.get("quantity") else 1,
+            "modelSpec": str(parsed.get("modelSpec", "")),
+            "url": str(parsed.get("url", "")),
+        }
+
+        return result
+
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] Gemini 回傳的不是有效 JSON: {e}")
+        print(f"[ERROR] 原始回傳: {raw_text!r}")
+        return None
+    except Exception as e:
+        print(f"[ERROR] 呼叫 Gemini 時發生錯誤: {e}")
+        return None
+
 
 # -------------------------------------------------
 #  Discord Bot 初始化
@@ -47,6 +107,7 @@ async def on_ready():
         print(f"Allowed channel IDs: {sorted(ALLOWED_CHANNEL_IDS)}")
     else:
         print("Allowed channel IDs: 不限制（所有頻道都會處理）")
+    print("Gemini model: gemini-1.5-flash ✓")
 
 
 # -------------------------------------------------
@@ -68,9 +129,6 @@ async def on_message(message: discord.Message):
     # ============================================
     # 1) ~刪除：刪除自己加的那筆（用網址辨識）
     # ============================================
-    # 用法：
-    #   ~刪除 https://e.tb.cn/h.xxx
-    #   ~刪除 〖淘宝〗... https://e.tb.cn/h.xxx 「商品」
     if text.startswith("~刪除"):
         url_match = URL_REGEX.search(text)
         if not url_match:
@@ -111,66 +169,56 @@ async def on_message(message: discord.Message):
         return
 
     # ============================================
-    # 2) ~要買：新增一筆到購物清單
-    #    格式（以 ~ 分隔）：
-    #      有規格：~要買~3~白色~【淘宝】... https://... 「商品」
-    #      無規格：~要買~3~【淘宝】... https://... 「商品」
+    # 2) ~要買：使用 Gemini 解析自然語言，新增到購物清單
     # ============================================
     if not text.startswith("~要買"):
-        # 其餘訊息交給 commands 系統
         await bot.process_commands(message)
         return
 
-    # 以 ~ 分隔，並去掉空字串：
-    #   "~要買~3~白色~分享文字" -> ["要買","3","白色","分享文字"]
-    parts = text.split("~")
-    parts = [p for p in parts if p != ""]
+    # 先給使用者一個「處理中」的反應
+    await message.add_reaction("⏳")
 
-    if len(parts) < 3:
-        usage1 = "~要買~3~白色~【淘宝】7天无理由退货 https://e.tb.cn/h.xxx 「電動牙刷」"
-        usage2 = "~要買~3~【淘宝】7天无理由退货 https://e.tb.cn/h.xxx 「電動牙刷」"
+    parsed = await parse_with_gemini(text)
+
+    if not parsed or not parsed.get("itemName"):
+        await message.remove_reaction("⏳", bot.user)
         await message.reply(
-            "格式怪怪的 QQ\n"
-            "請用下面這種格式，例如：\n"
-            f"`{usage1}`\n或（沒有規格）\n`{usage2}`"
+            "我沒辦法理解這段訊息 QQ\n"
+            "請試試類似這樣的格式：\n"
+            "`~要買 兩台白色的小米風扇 https://...`\n"
+            "`~要買 【淘宝】... https://e.tb.cn/h.xxx 「電動牙刷」`"
         )
         await bot.process_commands(message)
         return
 
-    # parts[0] 理論上會是 "要買"，但就算不是也不太影響後面解析
-    command_name = parts[0].strip()
+    item_name = parsed["itemName"]
+    quantity = parsed["quantity"]
+    model_spec = parsed["modelSpec"]
+    url = parsed["url"]
 
-    quantity_str = parts[1].strip()
-    try:
-        quantity = int(quantity_str)
-    except ValueError:
-        await message.reply("數量要是整數喔，例如：`~要買~3~白色~...`")
-        await bot.process_commands(message)
-        return
+    # 如果 Gemini 沒抓到 URL，從原始訊息中再嘗試 regex 撈一次
+    if not url:
+        url_match = URL_REGEX.search(text)
+        if url_match:
+            url = url_match.group(0)
 
-    # 判斷有沒有「型號規格」欄位：
-    #   有規格：["要買","3","白色","分享文字..."]
-    #   無規格：["要買","3","分享文字..."]
-    if len(parts) >= 4:
-        model_spec = parts[2].strip()
-        # 分享文字可能理論上還會有 ~，所以把剩下全部 join 回去
-        share_text = "~".join(parts[3:]).strip()
-    else:
-        model_spec = ""
-        share_text = "~".join(parts[2:]).strip()
-
-    # 檢查分享文字裡至少要有一個 URL
-    if not URL_REGEX.search(share_text):
-        await message.reply("我在分享文字裡找不到網址 QQ\n請確認有貼 https:// 開頭的購物連結。")
+    if not url:
+        await message.remove_reaction("⏳", bot.user)
+        await message.reply(
+            "我在訊息裡找不到購物網址 QQ\n"
+            "請確認有貼上 https:// 開頭的購物連結。"
+        )
         await bot.process_commands(message)
         return
 
     payload = {
         "action": "add",
         "fullText": text,
-        "shareText": share_text,
+        "shareText": text,
+        "itemName": item_name,
         "quantity": quantity,
         "modelSpec": model_spec,
+        "url": url,
         "senderId": str(message.author.id),
         "senderName": message.author.name,
         "channelId": str(message.channel.id),
@@ -181,15 +229,20 @@ async def on_message(message: discord.Message):
         resp = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=8)
         print("Sent ADD to n8n:", resp.status_code, resp.text[:200])
 
+        await message.remove_reaction("⏳", bot.user)
+
         if resp.ok:
+            summary_parts = [f"{quantity} 件"]
             if model_spec:
-                await message.reply(f"已把「{quantity} 件 {model_spec}」商品加入購物清單 🧾")
-            else:
-                await message.reply(f"已把「{quantity} 件」商品加入購物清單 🧾")
+                summary_parts.append(model_spec)
+            summary_parts.append(f"「{item_name}」")
+            summary = " ".join(summary_parts)
+            await message.reply(f"已把 {summary} 加入購物清單 🧾")
         else:
             await message.reply("新增請求傳到 n8n 失敗 QQ")
     except Exception as e:
         print("Error sending add to n8n:", e)
+        await message.remove_reaction("⏳", bot.user)
         await message.reply("新增時我撞牆了 QQ 請幫我看一下 log")
 
     await bot.process_commands(message)

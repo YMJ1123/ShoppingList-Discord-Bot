@@ -129,7 +129,7 @@ async def on_ready():
 
 
 # -------------------------------------------------
-#  主訊息處理：~要買 / ~刪除
+#  主訊息處理：買 / ~刪除
 # -------------------------------------------------
 @bot.event
 async def on_message(message: discord.Message):
@@ -187,9 +187,9 @@ async def on_message(message: discord.Message):
         return
 
     # ============================================
-    # 2) ~要買：使用 LLM 解析自然語言，新增到購物清單
+    # 2) 買：使用 LLM 解析自然語言，新增到購物清單
     # ============================================
-    if not text.startswith("~要買"):
+    if not text.startswith("買"):
         await bot.process_commands(message)
         return
 
@@ -212,8 +212,8 @@ async def on_message(message: discord.Message):
         await message.reply(
             "我沒辦法從訊息中提取到商品名稱 QQ\n"
             "請試試類似這樣的格式：\n"
-            "`~要買 兩台白色的小米風扇 https://...`\n"
-            "`~要買 【淘宝】... https://e.tb.cn/h.xxx 「電動牙刷」`"
+            "`買 兩台白色的小米風扇 https://...`\n"
+            "`買 【淘宝】... https://e.tb.cn/h.xxx 「電動牙刷」`"
         )
         await bot.process_commands(message)
         return

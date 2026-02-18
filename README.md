@@ -1,34 +1,32 @@
 
 # Shopping List Discord Bot
 
-簡易的 Discord 購物清單 bot，會驗證 `~要買` 指令並把資料送到 n8n Webhook，再由 n8n 寫入 Google 試算表。  
-A lightweight Discord bot that validates `~要買` commands and forwards them to an n8n webhook, which appends rows to a Google Sheet.
+Discord 購物清單 bot，使用 **AI（Groq / Llama 3.3 70B）** 自然語言解析 `買` 指令，將商品資訊送到 n8n Webhook，再由 n8n 寫入 Google 試算表。  
+A Discord bot that uses **AI-powered natural language processing (Groq / Llama 3.3 70B)** to parse `買` commands and forward structured data to an n8n webhook, which appends rows to a Google Sheet.
 
 ---
 
 ## Features / 功能簡介
 
-- 在指定的 Discord 頻道監聽指令（不用 @ bot，直接打指令即可）：
-  - `~要買~3~白色~【淘宝】... https://link 「商品名稱」`
-  - `~要買~2~25H续航+AI通话 降噪 雅灰色~【京东】https://link 「商品名稱」`
-- 驗證格式：
-  - 欄位是否以 `~` 分隔
-  - 是否以 `~要買` 開頭
-  - `<數量>` 是否為整數
-  - 型號規格欄位若存在，內容不得包含 `~`（可含空白，可完全省略）
-  - 內容是否包含 `http://` 或 `https://` 開頭的連結
-- 自動解析出：
-  - **預購買商品**：從最後一組 `「……」` 內抓商品名稱
-  - **商品型號規格**：從 `~要買~<數量>~這一段~...` 中抓整段
-  - **商品網址**：抓文字中第一個 URL
-  - **商品數量**
+- 在指定的 Discord 頻道監聽指令（不用 @ bot，直接打指令即可）
+- **AI 自然語言解析**（透過 Groq API + Llama 3.3 70B）：
+  - 不需要嚴格格式，用自然語言即可
+  - `買 兩台白色的小米風扇 https://...`
+  - `買 【淘宝】... https://e.tb.cn/h.xxx 「電動牙刷」`
+  - `買1個型號:深空灰 的【淘宝】... https://e.tb.cn/h.xxx 「手機掛繩」`
+- AI 自動從訊息中提取：
+  - **商品名稱**：從「...」格式或自然語言中辨識
+  - **商品型號規格**：顏色、型號、規格等描述
+  - **商品網址**：`https://` 開頭的購物連結
+  - **商品數量**：支援中文數字（兩台 → 2、三個 → 3）
   - **購買人**：Discord username
   - **平台**：依分享文字／網址自動辨識「淘寶 / 京東」
 - 透過 n8n：
-  - 使用 `Code` 節點解析 payload
+  - 使用 `Code` 節點解析 payload（優先使用 AI 預解析的欄位）
   - 使用 `Switch` 節點依 `platform` 分流
   - 將 **淘寶訂單寫入 Sheet「淘寶」**、**京東訂單寫入 Sheet「京東」**
 - 支援 `~刪除` 指令：貼上商品連結或原分享文字，bot 會依第一個 URL 尋找並刪除對應的清單紀錄
+- 429 rate limit 自動重試機制（最多 3 次）
 
 ---
 
@@ -37,6 +35,7 @@ A lightweight Discord bot that validates `~要買` commands and forwards them to
 - Python 3.10+
 - n8n（本機或遠端皆可）
 - Google 帳號（用來建立試算表與 API 憑證）
+- **Groq API Key**（免費，不需信用卡，到 [console.groq.com](https://console.groq.com) 申請）
 - 一個 Discord Bot：
   - 已建立於 Discord Developer Portal
   - 在 Bot 設定中啟用 **MESSAGE CONTENT INTENT**
@@ -45,7 +44,7 @@ Python 套件依 `requirements.txt` 安裝：
 
 ```bash
 python -m pip install -r requirements.txt
-````
+```
 
 ---
 
@@ -67,6 +66,7 @@ cp env.example .env
 DISCORD_TOKEN=YOUR_DISCORD_BOT_TOKEN
 N8N_WEBHOOK_URL=http://localhost:5678/webhook/discord-shopping
 ALLOWED_CHANNEL_IDS=123456789012345678,987654321098765432
+GROQ_API_KEY=gsk_your_groq_api_key
 ```
 
 * `DISCORD_TOKEN`
@@ -82,6 +82,10 @@ ALLOWED_CHANNEL_IDS=123456789012345678,987654321098765432
 
   * 允許 bot 處理的頻道 ID，逗號分隔
   * 可在 Discord 中開啟 Developer Mode 後，右鍵頻道 → Copy Channel ID
+* `GROQ_API_KEY`
+
+  * 到 [console.groq.com](https://console.groq.com) 註冊後，在 API Keys 頁面建立
+  * 免費方案：每分鐘 1,000 請求、每日約 14,000 請求，不需信用卡
 
 ### 2. 安裝相依套件
 
@@ -99,21 +103,28 @@ python bot.py
 
 ## Command Format / 指令格式
 
-### 正確格式
+### 買（自然語言，AI 解析）
 
-```text
-~要買~<數量>~<型號規格 可以有空格>~<平台分享文字（含網址與商品名稱）>
-~要買~<數量>~<平台分享文字（含網址與商品名稱）>   ← 無規格可直接把整個欄位拿掉
-```
+不需要嚴格格式，只要以 `買` 開頭，後面用自然語言描述即可。AI 會自動提取商品名稱、數量、型號規格和網址。
 
 範例：
 
 ```text
-~要買~3~白色~【淘宝】7天无理由退货 https://e.tb.cn/h.xxx 「電動牙刷」
-~要買~2~25H续航+AI通话 降噪 雅灰色~【京东】https://3.cn/2v-s8bsu?... 「漫步者X3Pro真无线降噪蓝牙耳机」
+買 兩台白色的小米風扇 https://e.tb.cn/h.xxx
+買 【淘宝】7天无理由退货 https://e.tb.cn/h.xxx 「電動牙刷」
+買1個型號:深空灰 的【淘宝】大促价保 https://e.tb.cn/h.xxx 「手機掛繩」
+買 三個【京东】https://3.cn/2v-s8bsu 「藍牙耳機」
 ```
 
-### 刪除格式 / Delete format
+AI 會自動辨識：
+* 中文數字 → 阿拉伯數字（兩台 → 2、三個 → 3）
+* 顏色/型號/規格描述（白色、深空灰、256GB...）
+* 「...」中的商品名稱
+* `https://` 開頭的購物連結
+
+唯一的硬性要求：**訊息中必須包含至少一個 `https://` 開頭的購物網址**。
+
+### ~刪除（Regex 解析，不使用 AI）
 
 ```text
 ~刪除 https://e.tb.cn/h.xxx
@@ -124,22 +135,6 @@ python bot.py
 - 若僅有連結也可行：`~刪除 <URL>`。
 - 找不到符合 URL 的紀錄或格式錯誤時，bot 會回覆失敗提示。
 
-Bot 檢查：
-
-* 指令各欄位以 `~` 分隔，避免被多餘空白吞掉
-* 以 `~要買` 開頭（或以 `~刪除` 開頭以觸發刪除流程）
-* `<數量>` 為整數（`int`）
-* 型號規格欄位可含空白、也可整段省略，只要不要再出現 `~`
-* 文字中至少有一個 `http://` 或 `https://` 開頭的 URL（`~刪除` 會使用第一個 URL 判斷刪除目標）
-
-若使用者打了 `~要買` 但格式不正確，bot 會回覆提示，例如：
-
-```text
-格式怪怪的 QQ
-請用下面這種格式：
-~要買~3~型號規格 可以有空格~【淘宝/京东】... https://link 「商品」
-```
-
 ---
 
 ## n8n Workflow Setup / n8n 工作流程設定
@@ -147,9 +142,9 @@ Bot 檢查：
 整體流程示意：
 
 ```text
-Discord Bot → n8n Webhook → Code → Switch(platform)
-                                       ├─ 淘寶 → Google Sheets (Sheet: 淘寶)
-                                       └─ 京東 → Google Sheets (Sheet: 京東)
+Discord Bot (AI 解析) → n8n Webhook → Code → Switch(platform)
+                                                 ├─ 淘寶 → Google Sheets (Sheet: 淘寶)
+                                                 └─ 京東 → Google Sheets (Sheet: 京東)
 ```
 
 ### ⚡ Quick Start：從 repo 匯入現成 workflow / Import the pre-built workflow from the repo
@@ -220,43 +215,36 @@ Discord Bot → n8n Webhook → Code → Switch(platform)
    * **Mode**：`Run Once for All Items`
    * **Language**：`JavaScript`
 
-4. 填入下面這段程式（`ShoppingListBot.json` 即採用此邏輯，會同時處理新增 / 刪除）：
+4. 填入下面這段程式（`ShoppingListBot.json` 即採用此邏輯，會同時處理新增 / 刪除）。
+   注意：Python 端已透過 AI 預解析好 `itemName` / `quantity` / `modelSpec` / `url`，此節點優先使用這些現成欄位：
 
    ```js
    // === ShoppingListBot 用 Code 節點 ===
    // 同時處理 action = "add" / "delete"
+   // Python 端已透過 AI 解析好 itemName / quantity / modelSpec / url
+   // 此節點優先使用這些現成欄位，減少二度 Regex 解析
+
    const items = $input.all();
    const out = [];
    const urlRegex = /https?:\/\/\S+/;
 
    for (const item of items) {
-     // Webhook 來的 JSON 可能在 item.json 或 item.json.body
      const payload = item.json.body || item.json || {};
      const action = payload.action || 'add';
      const senderId = payload.senderId || '';
      const senderName = payload.senderName || '';
      const createdAt = payload.createdAt || new Date().toISOString();
 
-     // ------------------------------------------------
-     // 共同的「平台判斷」邏輯：先用 shareText，再退而用 url
-     // ------------------------------------------------
+     // 決定 URL：優先用 payload.url（Python 端已解析好）
      let shareText = payload.shareText || payload.fullText || '';
-     let urlFromPayload = payload.url || '';
-
-     // 如果 shareText 裡有網址，就抓第一個
-     let url = '';
-     let m = shareText.match(urlRegex);
-     if (m) {
-       url = m[0];
-     }
-     // 如果 shareText 沒有網址，就用 payload.url
-     if (!url && urlFromPayload) {
-       url = urlFromPayload;
+     let url = payload.url || '';
+     if (!url) {
+       const m = shareText.match(urlRegex);
+       if (m) url = m[0];
      }
 
      // 預設平台：淘寶
      let platform = '淘寶';
-     // 如果文字或網址裡看得到京東關鍵字，就視為京東
      if (
        /京东/.test(shareText) ||
        (url && (url.includes('jd.com') || url.includes('3.cn')))
@@ -264,80 +252,40 @@ Discord Bot → n8n Webhook → Code → Switch(platform)
        platform = '京東';
      }
 
-     // ------------------------------------------------
-     // action = "add"：新增一筆到清單
-     // ------------------------------------------------
      if (action === 'add') {
-       const quantityRaw = payload.quantity ?? 1;
-       const quantity = parseInt(quantityRaw, 10) || 1;
+       const quantity = parseInt(payload.quantity, 10) || 1;
 
-       // 商品名稱：優先抓最後一組「……」中的文字
-       let itemName = '';
-       const titleMatch = shareText.match(/「([^」]+)」/);
-       if (titleMatch) {
-         itemName = titleMatch[1].trim();
-       } else if (url) {
-         const idx = shareText.indexOf(url);
-         if (idx >= 0) {
-           const afterUrl = shareText.slice(idx + url.length).trim();
-           itemName = afterUrl || shareText;
+       // 優先使用 AI 預解析的 itemName
+       let itemName = payload.itemName || '';
+       if (!itemName) {
+         const titleMatch = shareText.match(/「([^」]+)」/);
+         if (titleMatch) {
+           itemName = titleMatch[1].trim();
          } else {
            itemName = shareText;
          }
-       } else {
-         itemName = shareText;
        }
-
-       const modelSpec = payload.modelSpec || '';
-       const unitPrice = '';
-       const estimatedPrice = '';
-       const actualPrice = '';
 
        out.push({
          json: {
            action: 'add',
-           platform,        // 淘寶 / 京東
-           itemName,        // 預購買商品
-           modelSpec,       // 商品型號規格
-           url,             // 商品網址
-           unitPrice,       // 商品價格（暫空）
-           quantity,        // 商品數量
-           estimatedPrice,  // 預估價格（暫空）
-           actualPrice,     // 實際價格（暫空）
-           buyer: senderName,
-           senderId,
-           createdAt,
+           platform, itemName,
+           modelSpec: payload.modelSpec || '',
+           url, unitPrice: '',
+           quantity, estimatedPrice: '', actualPrice: '',
+           buyer: senderName, senderId, createdAt,
          },
        });
-
        continue;
      }
 
-     // ------------------------------------------------
-     // action = "delete"：刪除指定網址那一筆
-     // ------------------------------------------------
      if (action === 'delete') {
-       // 這裡對於刪除，其實只需要平台 + url + senderName
-       // platform 已經上面算好了（用 shareText/url 判斷）
-       // url 也已經決定好（優先 shareText，否則 payload.url）
-
        out.push({
-         json: {
-           action: 'delete',
-           platform,
-           url,
-           senderName,
-           senderId,
-           createdAt,
-         },
+         json: { action: 'delete', platform, url, senderName, senderId, createdAt },
        });
-
        continue;
      }
 
-     // ------------------------------------------------
-     // 其他未知 action，原樣丟出（方便偵錯）
-     // ------------------------------------------------
      out.push({ json: payload });
    }
 
@@ -461,11 +409,11 @@ Discord Bot → n8n Webhook → Code → Switch(platform)
 確認連線為：
 
 ```text
-Webhook → Code → Switch(action)
-                       ├─ add → Switch(platform) → Append 淘寶/京東 → Respond {"status":"added"}
-                       └─ delete → Switch(platform) → Get rows → If row exists?
-                                                      ├─ delete row → Respond {"status":"deleted"}
-                                                      └─ Respond 403 {"status":"not_owner_or_not_found"}
+Webhook → Code (AI 已預解析) → Switch(action)
+                                     ├─ add → Switch(platform) → Append 淘寶/京東 → Respond {"status":"added"}
+                                     └─ delete → Switch(platform) → Get rows → If row exists?
+                                                                    ├─ delete row → Respond {"status":"deleted"}
+                                                                    └─ Respond 403 {"status":"not_owner_or_not_found"}
 ```
 
 然後在 n8n 右上角將 workflow 切換為 **Active**。
@@ -635,7 +583,12 @@ git push -u origin main
 
   * 確認 `DISCORD_TOKEN` 是否正確、Bot 是否有加入伺服器
   * 確認 `ALLOWED_CHANNEL_IDS` 是否包含目前頻道 ID
-  * 確認訊息是否以 `~要買` 開頭
+  * 確認訊息是否以 `買` 開頭
+* **AI 解析失敗（回覆「AI 解析服務暫時忙碌」）**
+
+  * 確認 `GROQ_API_KEY` 是否正確設定在 `.env` 中
+  * 到 [console.groq.com/settings/limits](https://console.groq.com/settings/limits) 確認 API 額度
+  * Bot 有內建 429 rate limit 自動重試（最多 3 次），正常使用不太會撞到限制
 * **n8n 沒有任何執行紀錄**
 
   * 確認 workflow 狀態是 Active

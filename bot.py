@@ -94,7 +94,7 @@ async def on_message(message: discord.Message):
         }
 
         try:
-            resp = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=8)
+            resp = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=30)
             print("Sent DELETE to n8n:", resp.status_code, resp.text[:200])
 
             if resp.status_code == 200:
@@ -178,7 +178,7 @@ async def on_message(message: discord.Message):
     }
 
     try:
-        resp = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=8)
+        resp = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=30)
         print("Sent ADD to n8n:", resp.status_code, resp.text[:200])
 
         if resp.ok:

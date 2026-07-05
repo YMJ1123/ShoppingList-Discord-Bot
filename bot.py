@@ -6,7 +6,7 @@ import requests
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import AsyncOpenAI, RateLimitError
 
 # -------------------------------------------------
 #  載入環境變數 (.env)
@@ -35,13 +35,40 @@ for part in ALLOWED_CHANNEL_IDS_RAW.split(","):
     except ValueError:
         print(f"[WARN] 無法解析頻道 ID：{part!r}（已略過）")
 
-# 抓第一個網址用的 regex
-URL_REGEX = re.compile(r"https?://\S+")
+# 抓第一個網址用的 regex（不吃空白、CJK 字元與全形標點——淘寶/京東分享文常把網址和中文擠在一起）
+URL_REGEX = re.compile(r"https?://[^\s　-〿一-鿿＀-￯「-』]+")
+
+# 網址結尾常見的標點（regex 可能把它們一起吃進來，要剝掉）
+URL_TRAILING_PUNCT = ".,;:!?)]>\"'"
+
+
+def extract_first_url(text: str) -> str | None:
+    """從文字中抓出第一個網址，並剝掉結尾誤吃的標點符號。"""
+    match = URL_REGEX.search(text)
+    if not match:
+        return None
+    return match.group(0).rstrip(URL_TRAILING_PUNCT)
+
+
+def safe_quantity(value) -> int:
+    """把 LLM 回傳的數量安全轉成正整數，失敗一律回 1。"""
+    try:
+        qty = int(float(value))
+    except (TypeError, ValueError):
+        return 1
+    return qty if qty > 0 else 1
+
+
+async def post_to_n8n(payload: dict):
+    """在 thread 裡送 webhook，避免卡住 Discord 的 event loop。"""
+    return await asyncio.to_thread(
+        requests.post, N8N_WEBHOOK_URL, json=payload, timeout=8
+    )
 
 # -------------------------------------------------
 #  初始化 Groq（OpenAI 相容 API）
 # -------------------------------------------------
-groq_client = OpenAI(
+groq_client = AsyncOpenAI(
     base_url="https://api.groq.com/openai/v1",
     api_key=GROQ_API_KEY,
 )
@@ -68,7 +95,7 @@ async def parse_with_llm(message_content: str) -> dict | None:
 
     for attempt in range(1, GROQ_MAX_RETRIES + 1):
         try:
-            response = groq_client.chat.completions.create(
+            response = await groq_client.chat.completions.create(
                 model=GROQ_MODEL,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
@@ -83,7 +110,7 @@ async def parse_with_llm(message_content: str) -> dict | None:
 
             return {
                 "itemName": str(parsed.get("itemName", "")),
-                "quantity": int(parsed.get("quantity", 1)) if parsed.get("quantity") else 1,
+                "quantity": safe_quantity(parsed.get("quantity")),
                 "modelSpec": str(parsed.get("modelSpec", "")),
                 "url": str(parsed.get("url", "")),
             }
@@ -93,16 +120,16 @@ async def parse_with_llm(message_content: str) -> dict | None:
             print(f"[ERROR] 原始回傳: {raw_text!r}")
             return None
 
-        except Exception as e:
-            error_str = str(e)
-            is_rate_limit = "429" in error_str or "rate_limit" in error_str.lower()
-
-            if is_rate_limit and attempt < GROQ_MAX_RETRIES:
+        except RateLimitError:
+            if attempt < GROQ_MAX_RETRIES:
                 wait_sec = min(10 * attempt, 30)
                 print(f"[WARN] Groq 429 rate limit，第 {attempt} 次重試，等待 {wait_sec} 秒...")
                 await asyncio.sleep(wait_sec)
                 continue
+            print(f"[ERROR] Groq rate limit，重試 {GROQ_MAX_RETRIES} 次後放棄")
+            return None
 
+        except Exception as e:
             print(f"[ERROR] 呼叫 Groq 時發生錯誤 (attempt {attempt}/{GROQ_MAX_RETRIES}): {e}")
             return None
 
@@ -116,6 +143,17 @@ intents = discord.Intents.default()
 intents.message_content = True  # 一定要開，不然讀不到訊息內容
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+async def safe_react(message: discord.Message, emoji: str, remove: bool = False):
+    """加/移除反應失敗（例如缺權限）時不要讓整個訊息處理中斷。"""
+    try:
+        if remove:
+            await message.remove_reaction(emoji, bot.user)
+        else:
+            await message.add_reaction(emoji)
+    except discord.HTTPException as e:
+        print(f"[WARN] 無法{'移除' if remove else '加上'}反應 {emoji}: {e}")
 
 
 @bot.event
@@ -133,8 +171,8 @@ async def on_ready():
 # -------------------------------------------------
 @bot.event
 async def on_message(message: discord.Message):
-    # 不處理自己
-    if message.author == bot.user:
+    # 不處理任何 bot（包含自己），避免和其他 bot 互相觸發
+    if message.author.bot:
         return
 
     # 如果有設定 ALLOWED_CHANNEL_IDS，就只處理這些頻道
@@ -148,8 +186,8 @@ async def on_message(message: discord.Message):
     # 1) ~刪除：刪除自己加的那筆（用網址辨識）
     # ============================================
     if text.startswith("~刪除"):
-        url_match = URL_REGEX.search(text)
-        if not url_match:
+        url_to_delete = extract_first_url(text)
+        if not url_to_delete:
             usage = "~刪除 https://e.tb.cn/h.xxx"
             await message.reply(
                 "看不到要刪除的連結 QQ\n"
@@ -157,8 +195,6 @@ async def on_message(message: discord.Message):
             )
             await bot.process_commands(message)
             return
-
-        url_to_delete = url_match.group(0)
 
         payload = {
             "action": "delete",
@@ -170,7 +206,7 @@ async def on_message(message: discord.Message):
         }
 
         try:
-            resp = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=8)
+            resp = await post_to_n8n(payload)
             print("Sent DELETE to n8n:", resp.status_code, resp.text[:200])
 
             if resp.status_code == 200:
@@ -194,12 +230,12 @@ async def on_message(message: discord.Message):
         return
 
     # 先給使用者一個「處理中」的反應
-    await message.add_reaction("⏳")
+    await safe_react(message, "⏳")
 
     parsed = await parse_with_llm(text)
 
     if parsed is None:
-        await message.remove_reaction("⏳", bot.user)
+        await safe_react(message, "⏳", remove=True)
         await message.reply(
             "AI 解析服務暫時忙碌，請稍後再試一次 🔄\n"
             "（如果持續失敗，可能是 API 額度用完了）"
@@ -208,7 +244,7 @@ async def on_message(message: discord.Message):
         return
 
     if not parsed.get("itemName"):
-        await message.remove_reaction("⏳", bot.user)
+        await safe_react(message, "⏳", remove=True)
         await message.reply(
             "我沒辦法從訊息中提取到商品名稱 QQ\n"
             "請試試類似這樣的格式：\n"
@@ -225,12 +261,10 @@ async def on_message(message: discord.Message):
 
     # 如果 LLM 沒抓到 URL，從原始訊息中再嘗試 regex 撈一次
     if not url:
-        url_match = URL_REGEX.search(text)
-        if url_match:
-            url = url_match.group(0)
+        url = extract_first_url(text) or ""
 
     if not url:
-        await message.remove_reaction("⏳", bot.user)
+        await safe_react(message, "⏳", remove=True)
         await message.reply(
             "我在訊息裡找不到購物網址 QQ\n"
             "請確認有貼上 https:// 開頭的購物連結。"
@@ -253,10 +287,10 @@ async def on_message(message: discord.Message):
     }
 
     try:
-        resp = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=8)
+        resp = await post_to_n8n(payload)
         print("Sent ADD to n8n:", resp.status_code, resp.text[:200])
 
-        await message.remove_reaction("⏳", bot.user)
+        await safe_react(message, "⏳", remove=True)
 
         if resp.ok:
             summary_parts = [f"{quantity} 件"]
@@ -269,7 +303,7 @@ async def on_message(message: discord.Message):
             await message.reply("新增請求傳到 n8n 失敗 QQ")
     except Exception as e:
         print("Error sending add to n8n:", e)
-        await message.remove_reaction("⏳", bot.user)
+        await safe_react(message, "⏳", remove=True)
         await message.reply("新增時我撞牆了 QQ 請幫我看一下 log")
 
     await bot.process_commands(message)

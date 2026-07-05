@@ -20,7 +20,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// === ShoppingListBot 用 Code 節點 ===\n// 同時處理 action = \"add\" / \"delete\"\n// Python 端已透過 Gemini AI 解析好 itemName / quantity / modelSpec / url\n// 此節點優先使用這些現成欄位，減少二度 Regex 解析\n\nconst items = $input.all();\nconst out = [];\n\nconst urlRegex = /https?:\\/\\/\\S+/;\n\nfor (const item of items) {\n  // Webhook 來的 JSON 可能在 item.json 或 item.json.body\n  const payload = item.json.body || item.json || {};\n\n  const action = payload.action || 'add';\n  const senderId = payload.senderId || '';\n  const senderName = payload.senderName || '';\n  const createdAt = payload.createdAt || new Date().toISOString();\n\n  // ------------------------------------------------\n  // 決定 URL：優先用 payload.url（Python 端已解析好）\n  // ------------------------------------------------\n  let shareText = payload.shareText || payload.fullText || '';\n  let url = payload.url || '';\n\n  // 如果 payload.url 為空，再嘗試從 shareText 裡抓\n  if (!url) {\n    const m = shareText.match(urlRegex);\n    if (m) {\n      url = m[0];\n    }\n  }\n\n  // 預設平台：淘寶\n  let platform = '淘寶';\n  // 如果文字或網址裡看得到京東關鍵字，就視為京東\n  if (\n    /京东/.test(shareText) ||\n    (url && (url.includes('jd.com') || url.includes('3.cn')))\n  ) {\n    platform = '京東';\n  }\n\n  // ------------------------------------------------\n  // action = \"add\"：新增一筆到清單\n  // ------------------------------------------------\n  if (action === 'add') {\n    const quantity = parseInt(payload.quantity, 10) || 1;\n\n    // 商品名稱：優先使用 Python/Gemini 預解析的 itemName\n    let itemName = payload.itemName || '';\n\n    // 備援：如果 Python 端沒提供 itemName，才用舊的 Regex 邏輯\n    if (!itemName) {\n      const titleMatch = shareText.match(/「([^」]+)」/);\n      if (titleMatch) {\n        itemName = titleMatch[1].trim();\n      } else if (url) {\n        const idx = shareText.indexOf(url);\n        if (idx >= 0) {\n          const afterUrl = shareText.slice(idx + url.length).trim();\n          itemName = afterUrl || shareText;\n        } else {\n          itemName = shareText;\n        }\n      } else {\n        itemName = shareText;\n      }\n    }\n\n    const modelSpec = payload.modelSpec || '';\n    const unitPrice = '';\n    const estimatedPrice = '';\n    const actualPrice = '';\n\n    out.push({\n      json: {\n        action: 'add',\n        platform,        // 淘寶 / 京東\n        itemName,        // 預購買商品\n        modelSpec,       // 商品型號規格\n        url,             // 商品網址\n        unitPrice,       // 商品價格（暫空）\n        quantity,        // 商品數量\n        estimatedPrice,  // 預估價格（暫空）\n        actualPrice,     // 實際價格（暫空）\n        buyer: senderName,\n        senderId,\n        createdAt,\n      },\n    });\n\n    continue;\n  }\n\n  // ------------------------------------------------\n  // action = \"delete\"：刪除指定網址那一筆\n  // ------------------------------------------------\n  if (action === 'delete') {\n    out.push({\n      json: {\n        action: 'delete',\n        platform,\n        url,\n        senderName,\n        senderId,\n        createdAt,\n      },\n    });\n\n    continue;\n  }\n\n  // ------------------------------------------------\n  // 其他未知 action，原樣丟出（方便偵錯）\n  // ------------------------------------------------\n  out.push({ json: payload });\n}\n\nreturn out;\n"
+        "jsCode": "// === ShoppingListBot 用 Code 節點 ===\n// 同時處理 action = \"add\" / \"delete\"\n// Python 端已透過 Gemini AI 解析好 itemName / quantity / modelSpec / url\n// 此節點優先使用這些現成欄位，減少二度 Regex 解析\n\nconst items = $input.all();\nconst out = [];\n\nconst urlRegex = /https?:\\/\\/\\S+/;\n\nfor (const item of items) {\n  // Webhook 來的 JSON 可能在 item.json 或 item.json.body\n  const payload = item.json.body || item.json || {};\n\n  const action = payload.action || 'add';\n  const senderId = payload.senderId || '';\n  const senderName = payload.senderName || '';\n  const createdAt = payload.createdAt || new Date().toISOString();\n\n  // ------------------------------------------------\n  // 決定 URL：優先用 payload.url（Python 端已解析好）\n  // ------------------------------------------------\n  let shareText = payload.shareText || payload.fullText || '';\n  let url = payload.url || '';\n\n  // 如果 payload.url 為空，再嘗試從 shareText 裡抓\n  if (!url) {\n    const m = shareText.match(urlRegex);\n    if (m) {\n      url = m[0];\n    }\n  }\n\n  // 預設平台：淘寶\n  let platform = '淘寶';\n  // 如果文字或網址裡看得到京東關鍵字，就視為京東\n  if (\n    /京东/.test(shareText) ||\n    (url && (url.includes('jd.com') || url.includes('3.cn')))\n  ) {\n    platform = '京東';\n  }\n\n  // ------------------------------------------------\n  // action = \"add\"：新增一筆到清單\n  // ------------------------------------------------\n  if (action === 'add') {\n    const quantity = parseInt(payload.quantity, 10) || 1;\n\n    // 商品名稱：優先使用 Python/Gemini 預解析的 itemName\n    let itemName = payload.itemName || '';\n\n    // 備援：如果 Python 端沒提供 itemName，才用舊的 Regex 邏輯\n    if (!itemName) {\n      const titleMatch = shareText.match(/「([^」]+)」/);\n      if (titleMatch) {\n        itemName = titleMatch[1].trim();\n      } else if (url) {\n        const idx = shareText.indexOf(url);\n        if (idx >= 0) {\n          const afterUrl = shareText.slice(idx + url.length).trim();\n          itemName = afterUrl || shareText;\n        } else {\n          itemName = shareText;\n        }\n      } else {\n        itemName = shareText;\n      }\n    }\n\n    const modelSpec = payload.modelSpec || '';\n    const unitPrice = '';\n    const estimatedPrice = '';\n    const actualPrice = '';\n\n    out.push({\n      json: {\n        action: 'add',\n        platform,        // 淘寶 / 京東\n        itemName,        // 預購買商品\n        modelSpec,       // 商品型號規格\n        url,             // 商品網址\n        unitPrice,       // 商品價格（暫空）\n        quantity,        // 商品數量\n        estimatedPrice,  // 預估價格（暫空）\n        actualPrice,     // 實際價格（暫空）\n        buyer: senderName,\n        senderId,\n        createdAt,\n      },\n    });\n\n    continue;\n  }\n\n  // ------------------------------------------------\n  // action = \"delete\"：刪除指定網址那一筆\n  // ------------------------------------------------\n  if (action === 'delete') {\n    out.push({\n      json: {\n        action: 'delete',\n        platform,\n        url,\n        itemName: (payload.itemName || '').toString().trim(),\n        senderName,\n        senderId,\n        createdAt,\n      },\n    });\n\n    continue;\n  }\n\n  // ------------------------------------------------\n  // 其他未知 action，原樣丟出（方便偵錯）\n  // ------------------------------------------------\n  out.push({ json: payload });\n}\n\nreturn out;\n"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -421,18 +421,12 @@
         "filtersUI": {
           "values": [
             {
-              "lookupColumn": "商品網址",
-              "lookupValue": "={{$json[\"url\"]}}"
-            },
-            {
               "lookupColumn": "購買人",
-              "lookupValue": "={{$json[\"senderName\"]}}"
+              "lookupValue": "={{ $('Code').first().json.senderName }}"
             }
           ]
         },
-        "options": {
-          "returnFirstMatch": true
-        }
+        "options": {}
       },
       "type": "n8n-nodes-base.googleSheets",
       "typeVersion": 4.7,
@@ -448,54 +442,8 @@
           "id": "TGwFp295v7gk3RIt",
           "name": "Google Sheets account"
         }
-      }
-    },
-    {
-      "parameters": {
-        "documentId": {
-          "__rl": true,
-          "value": "1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM",
-          "mode": "list",
-          "cachedResultName": "淘寶/京東購物清單",
-          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit?usp=drivesdk"
-        },
-        "sheetName": {
-          "__rl": true,
-          "value": 927580131,
-          "mode": "list",
-          "cachedResultName": "淘寶",
-          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit#gid=927580131"
-        },
-        "filtersUI": {
-          "values": [
-            {
-              "lookupColumn": "商品網址",
-              "lookupValue": "https://e.tb.cn/h.SwuaWEoXLEzG72k?tk=w8v1fNVA4cH"
-            },
-            {
-              "lookupColumn": "購買人",
-              "lookupValue": "=ymj1123"
-            }
-          ]
-        },
-        "options": {
-          "returnFirstMatch": true
-        }
       },
-      "type": "n8n-nodes-base.googleSheets",
-      "typeVersion": 4.7,
-      "position": [
-        -464,
-        416
-      ],
-      "id": "694c566f-6295-4e62-8b17-a2097554bb31",
-      "name": "Get rows in sheet TB TEST",
-      "credentials": {
-        "googleSheetsOAuth2Api": {
-          "id": "TGwFp295v7gk3RIt",
-          "name": "Google Sheets account"
-        }
-      }
+      "executeOnce": true
     },
     {
       "parameters": {
@@ -519,8 +467,8 @@
       "type": "n8n-nodes-base.googleSheets",
       "typeVersion": 4.7,
       "position": [
-        672,
-        288
+        976,
+        304
       ],
       "id": "8d16c765-b37c-4691-9ecf-4be4e8ab64e6",
       "name": "Delete rows or columns from sheet TB",
@@ -550,18 +498,12 @@
         "filtersUI": {
           "values": [
             {
-              "lookupColumn": "商品網址",
-              "lookupValue": "={{$json[\"url\"]}}"
-            },
-            {
               "lookupColumn": "購買人",
-              "lookupValue": "={{$json[\"senderName\"]}}"
+              "lookupValue": "={{ $('Code').first().json.senderName }}"
             }
           ]
         },
-        "options": {
-          "returnFirstMatch": true
-        }
+        "options": {}
       },
       "type": "n8n-nodes-base.googleSheets",
       "typeVersion": 4.7,
@@ -577,7 +519,8 @@
           "id": "TGwFp295v7gk3RIt",
           "name": "Google Sheets account"
         }
-      }
+      },
+      "executeOnce": true
     },
     {
       "parameters": {
@@ -601,8 +544,8 @@
       "type": "n8n-nodes-base.googleSheets",
       "typeVersion": 4.7,
       "position": [
-        672,
-        480
+        976,
+        464
       ],
       "id": "1410c87f-0752-474c-b2ee-ae04d19dacb0",
       "name": "Delete rows or columns from sheet JD",
@@ -615,67 +558,6 @@
     },
     {
       "parameters": {
-        "rules": {
-          "values": [
-            {
-              "conditions": {
-                "options": {
-                  "caseSensitive": true,
-                  "leftValue": "",
-                  "typeValidation": "strict",
-                  "version": 2
-                },
-                "conditions": [
-                  {
-                    "leftValue": "={{$json[\"platform\"]}}",
-                    "rightValue": "淘寶",
-                    "operator": {
-                      "type": "string",
-                      "operation": "equals"
-                    },
-                    "id": "16633856-70ab-4eec-a667-a8651c6e408b"
-                  }
-                ],
-                "combinator": "and"
-              }
-            },
-            {
-              "conditions": {
-                "options": {
-                  "caseSensitive": true,
-                  "leftValue": "",
-                  "typeValidation": "strict",
-                  "version": 2
-                },
-                "conditions": [
-                  {
-                    "id": "f891a2eb-2ac7-4cfe-afd7-cf2ab322041e",
-                    "leftValue": "={{$json[\"platform\"]}}",
-                    "rightValue": "京東",
-                    "operator": {
-                      "type": "string",
-                      "operation": "equals"
-                    }
-                  }
-                ],
-                "combinator": "and"
-              }
-            }
-          ]
-        },
-        "options": {}
-      },
-      "type": "n8n-nodes-base.switch",
-      "typeVersion": 3.2,
-      "position": [
-        0,
-        320
-      ],
-      "id": "6be18d08-d15d-40c9-a7e2-b5bea2a801e1",
-      "name": "Switch Platform1"
-    },
-    {
-      "parameters": {
         "conditions": {
           "options": {
             "caseSensitive": true,
@@ -685,12 +567,12 @@
           },
           "conditions": [
             {
-              "id": "ae1607ea-74c4-4e39-becb-6520850b0489",
-              "leftValue": "={{$json[\"row_number\"]}}",
+              "id": "9b54f349-06f0-4ff6-9beb-17ee63c1f5f1",
+              "leftValue": "={{ $json.found }}",
               "rightValue": "",
               "operator": {
-                "type": "number",
-                "operation": "notEmpty",
+                "type": "boolean",
+                "operation": "true",
                 "singleValue": true
               }
             }
@@ -702,50 +584,16 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
       "position": [
-        464,
-        336
+        624,
+        416
       ],
       "id": "fb89e0bc-b723-45bd-8b78-3d1af454e177",
       "name": "If"
     },
     {
       "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "leftValue": "",
-            "typeValidation": "strict",
-            "version": 2
-          },
-          "conditions": [
-            {
-              "id": "ae1607ea-74c4-4e39-becb-6520850b0489",
-              "leftValue": "={{$json[\"row_number\"]}}",
-              "rightValue": "",
-              "operator": {
-                "type": "number",
-                "operation": "notEmpty",
-                "singleValue": true
-              }
-            }
-          ],
-          "combinator": "and"
-        },
-        "options": {}
-      },
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2.2,
-      "position": [
-        464,
-        512
-      ],
-      "id": "455a4f85-c4c8-44d5-a619-8a1e049dd558",
-      "name": "If1"
-    },
-    {
-      "parameters": {
         "respondWith": "json",
-        "responseBody": "{\n  \"status\": \"deleted\"\n}\n",
+        "responseBody": "={{ JSON.stringify({status: 'deleted', itemName: $('Find Delete Target').first().json.itemName || ''}) }}",
         "options": {
           "responseCode": 200
         }
@@ -753,8 +601,8 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.4,
       "position": [
-        848,
-        192
+        1152,
+        304
       ],
       "id": "45e4cd3d-60cd-47bc-97a9-79d128e44613",
       "name": "Respond to Webhook1"
@@ -762,7 +610,7 @@
     {
       "parameters": {
         "respondWith": "json",
-        "responseBody": "{\n  \"status\": \"deleted\"\n}\n",
+        "responseBody": "={{ JSON.stringify({status: 'deleted', itemName: $('Find Delete Target').first().json.itemName || ''}) }}",
         "options": {
           "responseCode": 200
         }
@@ -770,8 +618,8 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.4,
       "position": [
-        880,
-        480
+        1152,
+        464
       ],
       "id": "9faa854a-d5ea-47cd-b72f-b5807fb8b46e",
       "name": "Respond to Webhook"
@@ -779,36 +627,19 @@
     {
       "parameters": {
         "respondWith": "json",
-        "responseBody": "{\"status\":\"not_owner_or_not_found\"}\n",
+        "responseBody": "{\"status\":\"not_found\"}\n",
         "options": {
-          "responseCode": 403
+          "responseCode": 404
         }
       },
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.4,
       "position": [
-        848,
-        352
+        800,
+        544
       ],
       "id": "999aab93-cc4f-41c1-8b9d-905f3a312f3e",
-      "name": "Respond(403)"
-    },
-    {
-      "parameters": {
-        "respondWith": "json",
-        "responseBody": "{\"status\":\"not_owner_or_not_found\"}\n",
-        "options": {
-          "responseCode": 403
-        }
-      },
-      "type": "n8n-nodes-base.respondToWebhook",
-      "typeVersion": 1.4,
-      "position": [
-        880,
-        608
-      ],
-      "id": "375dcbaf-202d-4d70-87b2-1f124664abca",
-      "name": "Respond(403)1"
+      "name": "Respond(404)"
     },
     {
       "parameters": {
@@ -843,6 +674,80 @@
       ],
       "id": "d6f3407c-dc80-4e31-bbc8-a2ed573edfa9",
       "name": "Respond (added)1"
+    },
+    {
+      "parameters": {
+        "jsCode": "// 在使用者自己加入的列中，用網址或商品名稱找出要刪除的那一筆\nconst req = $('Code').first().json;\nconst norm = (s) => (s ?? '').toString().trim().toLowerCase();\n\nconst collect = (nodeName, sheet) => {\n  let items = [];\n  try {\n    items = $(nodeName).all();\n  } catch (e) {\n    return [];\n  }\n  const seen = new Set();\n  const out = [];\n  for (const it of items) {\n    const r = it.json || {};\n    if (r.row_number === undefined || r.row_number === null || r.row_number === '') continue;\n    if (seen.has(r.row_number)) continue; // executeOnce 保險用：去除重複列\n    seen.add(r.row_number);\n    out.push({ ...r, _sheet: sheet });\n  }\n  return out;\n};\n\nconst candidates = [\n  ...collect('Get rows in sheet TB', 'TB'),\n  ...collect('Get rows in sheet JD', 'JD'),\n];\n\nlet match = null;\n\n// 1) 有網址就先用網址精確比對\nconst url = norm(req.url);\nif (url) {\n  match = candidates.find((r) => norm(r['商品網址']) === url) || null;\n}\n\n// 2) 沒中再用商品名稱：先完全相同，再互相包含（模糊比對）\nif (!match && req.itemName) {\n  const q = norm(req.itemName);\n  match =\n    candidates.find((r) => norm(r['預購買商品']) === q) ||\n    candidates.find((r) => norm(r['預購買商品']).includes(q)) ||\n    candidates.find((r) => {\n      const name = norm(r['預購買商品']);\n      return name && q.includes(name);\n    }) ||\n    null;\n}\n\nif (!match) {\n  return [{ json: { found: false } }];\n}\n\nreturn [\n  {\n    json: {\n      found: true,\n      sheet: match._sheet,\n      row_number: match.row_number,\n      itemName: match['預購買商品'] || '',\n    },\n  },\n];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        464,
+        416
+      ],
+      "id": "267e288d-b4d6-47a1-b8d4-0791b94ae4a9",
+      "name": "Find Delete Target"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "8143aa0f-0bdb-4a5f-b96f-a4595e4a3ed4",
+                    "leftValue": "={{ $json[\"sheet\"] }}",
+                    "rightValue": "TB",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "9e68d96a-abd1-432d-996e-83f932cc9698",
+                    "leftValue": "={{ $json[\"sheet\"] }}",
+                    "rightValue": "JD",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        800,
+        384
+      ],
+      "id": "f8383c0d-9ddc-48e2-ac8e-fcf6c186ce7d",
+      "name": "Switch Sheet"
     }
   ],
   "pinData": {},
@@ -880,7 +785,7 @@
         ],
         [
           {
-            "node": "Switch Platform1",
+            "node": "Get rows in sheet TB",
             "type": "main",
             "index": 0
           }
@@ -909,7 +814,7 @@
       "main": [
         [
           {
-            "node": "If",
+            "node": "Get rows in sheet JD",
             "type": "main",
             "index": 0
           }
@@ -920,25 +825,7 @@
       "main": [
         [
           {
-            "node": "If1",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Switch Platform1": {
-      "main": [
-        [
-          {
-            "node": "Get rows in sheet TB",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Get rows in sheet JD",
+            "node": "Find Delete Target",
             "type": "main",
             "index": 0
           }
@@ -949,32 +836,14 @@
       "main": [
         [
           {
-            "node": "Delete rows or columns from sheet TB",
+            "node": "Switch Sheet",
             "type": "main",
             "index": 0
           }
         ],
         [
           {
-            "node": "Respond(403)",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "If1": {
-      "main": [
-        [
-          {
-            "node": "Delete rows or columns from sheet JD",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Respond(403)1",
+            "node": "Respond(404)",
             "type": "main",
             "index": 0
           }
@@ -1019,6 +888,35 @@
         [
           {
             "node": "Respond (added)1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Delete Target": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch Sheet": {
+      "main": [
+        [
+          {
+            "node": "Delete rows or columns from sheet TB",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Delete rows or columns from sheet JD",
             "type": "main",
             "index": 0
           }

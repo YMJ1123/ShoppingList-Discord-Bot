@@ -121,6 +121,85 @@ check('JD 的列產生 JD_DELETE', () => {
 });
 
 // ============================================================
+// 迴歸測試：2026-09-10 實際踩到的問題。淘寶長網址帶一堆追蹤參數，
+// 新增時存的和刪除時送來的網址字串不一樣，導致永遠刪不掉。
+console.log('\ndelete：淘寶長網址（追蹤參數會變）');
+
+const TB_CLEAN =
+  'https://item.taobao.com/item.htm?abbucket=10&id=652762230399&mi_id=0000PANjxDe' +
+  '&ns=1&skuId=4709862357636&spm=a21n57.1.hoverItem.37' +
+  '&utparam=%7B%22aplus_abtest%22%3A%22bcb827415a592b935282236e5ea4572f%22%7D&xxc=taobaoSearch';
+// LLM 截斷過的版本（實測 507 字被剪成 256 字）
+const TB_TRUNCATED =
+  'https://item.taobao.com/item.htm?abbucket=10&id=652762230399&mi_id=0000PANjxDe&ns=1&skuId=4709862357636&spm=a21n57';
+// regex 吃到 markdown 包裝的版本
+const TB_MANGLED = `${TB_CLEAN}](${TB_CLEAN})`;
+// 同一個商品，但從別的入口複製（spm / scm / pvid 全都不同）
+const TB_OTHER_ENTRY =
+  'https://item.taobao.com/item.htm?id=652762230399&scm=1007.40986.467924.0' +
+  '&pvid=10aed698-304a-4b33-a9ac-b3b4b35ca377&spm=a21bo.jianhua&xxc=home_recommend';
+
+const tbRows = [
+  row({ row: 2, item: '卡片收集册卡牌活页收藏册', url: TB_CLEAN, buyer: 'amy', status: '待下單' }),
+];
+
+for (const [label, sent] of [
+  ['一模一樣的網址', TB_CLEAN],
+  ['LLM 截斷過的網址', TB_TRUNCATED],
+  ['吃到 markdown 包裝的網址', TB_MANGLED],
+  ['從別的入口複製的網址', TB_OTHER_ENTRY],
+]) {
+  check(`${label} → 都能刪到同一筆`, () => {
+    const j = only(plan(req({ action: 'delete', url: sent }), tbRows));
+    assert.strictEqual(j._target, 'TB_DELETE', `${label} 沒對上`);
+    assert.strictEqual(j.row_number, 2);
+  });
+}
+
+check('表格裡存的是壞網址也照樣刪得掉（舊資料）', () => {
+  const rows = [row({ row: 2, item: '卡册', url: TB_MANGLED, buyer: 'amy', status: '待下單' })];
+  const j = only(plan(req({ action: 'delete', url: TB_CLEAN }), rows));
+  assert.strictEqual(j._target, 'TB_DELETE');
+});
+
+check('天貓網址同樣認 id', () => {
+  const tmall = 'https://detail.tmall.com/item.htm?abbucket=10&id=790842407992&skuId=6286128578011&spm=a21n57.1';
+  const rows = [row({ row: 2, item: '收纳册', url: tmall, buyer: 'amy', status: '待下單' })];
+  const j = only(plan(req({ action: 'delete', url: 'https://detail.tmall.com/item.htm?id=790842407992&scm=other' }), rows));
+  assert.strictEqual(j._target, 'TB_DELETE');
+});
+
+check('京東網址認 item.jd.com 的商品 ID', () => {
+  const rows = [
+    row({ row: 2, item: '耳機', url: 'https://item.jd.com/100012043978.html?extra=1', buyer: 'amy', status: '待下單', sheet: 'JD' }),
+  ];
+  const j = only(plan(req({ action: 'delete', url: 'https://item.jd.com/100012043978.html' }), rows));
+  assert.strictEqual(j._target, 'JD_DELETE');
+});
+
+check('短連結沒有 id，用去掉 query 的網址比對', () => {
+  const rows = [row({ row: 2, item: '風扇', url: 'https://e.tb.cn/h.abc?tk=xyz', buyer: 'amy', status: '待下單' })];
+  const j = only(plan(req({ action: 'delete', url: 'https://e.tb.cn/h.abc?tk=DIFFERENT' }), rows));
+  assert.strictEqual(j._target, 'TB_DELETE');
+});
+
+check('不同商品不會被誤判成同一筆', () => {
+  const rows = [
+    row({ row: 2, item: 'A', url: 'https://item.taobao.com/item.htm?id=652762230399', buyer: 'amy', status: '待下單' }),
+    row({ row: 3, item: 'B', url: 'https://item.taobao.com/item.htm?id=790842407992', buyer: 'amy', status: '待下單' }),
+  ];
+  const j = only(plan(req({ action: 'delete', url: 'https://item.taobao.com/item.htm?id=790842407992&spm=zzz' }), rows));
+  assert.strictEqual(j.row_number, 3, '應該刪到 B');
+});
+
+check('skuId / mi_id 不會被誤當成商品 id', () => {
+  // 只有 skuId 而沒有 id 的網址，不該和帶 id 的那筆對上
+  const rows = [row({ row: 2, item: 'A', url: 'https://item.taobao.com/item.htm?id=652762230399', buyer: 'amy', status: '待下單' })];
+  const j = only(plan(req({ action: 'delete', url: 'https://item.taobao.com/item.htm?skuId=652762230399' }), rows));
+  assert.strictEqual(j._response.status, 'not_found', 'skuId 不該被當成商品 id');
+});
+
+// ============================================================
 console.log('\nclose');
 const closeRows = [
   row({ row: 2, item: '電動牙刷', buyer: 'amy', qty: 1, unit: '99', est: '99', status: '待下單' }),

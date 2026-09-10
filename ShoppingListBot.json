@@ -28,7 +28,7 @@
         -660,
         220
       ],
-      "id": "9601151a-e26e-4e60-b6e7-3ca1353d72e5",
+      "id": "a96fdae1-bee6-405a-9ca6-3883b31c7793",
       "name": "Parse Request"
     },
     {
@@ -55,7 +55,7 @@
         -440,
         220
       ],
-      "id": "9dfb28ec-109f-4277-a3ba-cf6703f71d6f",
+      "id": "ba910428-2794-4ea6-bb4a-9c9163e4c403",
       "name": "Load TB",
       "credentials": {
         "googleSheetsOAuth2Api": {
@@ -90,7 +90,7 @@
         -220,
         220
       ],
-      "id": "eac25a88-f875-4aaa-b229-371c09a56368",
+      "id": "4caabc2a-8899-4b9c-b828-7385931d0b74",
       "name": "Load JD",
       "credentials": {
         "googleSheetsOAuth2Api": {
@@ -103,7 +103,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// ============================================================\n//  n8n Code 節點：Plan\n//  購物清單的全部決策邏輯都集中在這裡。\n//\n//  輸入：Parse Request 的請求 + Load TB / Load JD 撈出來的所有列\n//  輸出：每個 item 帶 _target，由 Switch Target 分流到對應的 Sheets 節點\n//        TB_APPEND / JD_APPEND / TB_UPDATE / JD_UPDATE / TB_DELETE / JD_DELETE / READ\n//        每個 item 都帶同一份 _response，Respond 節點固定取 first()。\n//\n//  ⚠️ 這個檔案是唯一真相：改完請跑 `python3 workflow/build.py` 重新生成\n//     ShoppingListBot.json，不要直接編輯 JSON 裡的程式碼。\n// ============================================================\n\nconst STATUS_PENDING = '待下單';\nconst STATUS_ORDERED = '已下單';\n\nconst COL = {\n  item: '預購買商品',\n  spec: '商品型號規格',\n  url: '商品網址',\n  unit: '商品價格',\n  qty: '商品數量',\n  est: '預估價格',\n  actual: '實際價格',\n  buyer: '購買人',\n  status: '狀態',\n  batch: '批次',\n  orderedAt: '下單時間',\n  orderedBy: '下單人',\n};\n\nconst SHEETS = [\n  ['TB', '淘寶'],\n  ['JD', '京東'],\n];\n\nconst text = (v) => (v ?? '').toString().trim();\nconst norm = (v) => text(v).toLowerCase();\nconst num = (v) => {\n  const n = parseFloat(text(v).replace(/[^\\d.-]/g, ''));\n  return Number.isFinite(n) ? n : 0;\n};\nconst money = (n) => (Math.round(n * 100) / 100).toString();\n\n// 舊資料的狀態欄是空的 → 一律視為待下單，既有資料才能無痛接軌\nconst isPending = (r) => {\n  const s = text(r[COL.status]);\n  return s === '' || s === STATUS_PENDING;\n};\n\nconst qtyOf = (r) => {\n  const q = Math.round(num(r[COL.qty]));\n  return q > 0 ? q : 1;\n};\n\nfunction plan(req, rows) {\n  // 只回話、不動表格\n  const reply = (status, message) => [\n    { json: { _target: 'READ', _response: { status, message } } },\n  ];\n\n  // 要寫表格：每個 item 都帶同一份回應，Respond 取哪個都一樣\n  const writes = (list, status, message) =>\n    list.map((w) => ({ json: { ...w, _response: { status, message } } }));\n\n  // 找一列：網址優先，再用商品名稱（完全相同 → 互相包含）\n  const findRow = (scope) => {\n    const url = norm(req.url);\n    if (url) {\n      const hit = scope.find((r) => norm(r[COL.url]) === url);\n      if (hit) return hit;\n    }\n    const q = norm(req.itemName);\n    if (!q) return null;\n    return (\n      scope.find((r) => norm(r[COL.item]) === q) ||\n      scope.find((r) => norm(r[COL.item]).includes(q)) ||\n      scope.find((r) => {\n        const n = norm(r[COL.item]);\n        return n && q.includes(n);\n      }) ||\n      null\n    );\n  };\n\n  // 更新一列時，沒有要改的欄位一定要填回原值，否則 Sheets 會把它清空\n  const carry = (r, changes) => ({\n    _target: r._sheet + '_UPDATE',\n    row_number: r.row_number,\n    [COL.unit]: text(r[COL.unit]),\n    [COL.est]: text(r[COL.est]),\n    [COL.actual]: text(r[COL.actual]),\n    [COL.status]: text(r[COL.status]) || STATUS_PENDING,\n    [COL.batch]: text(r[COL.batch]),\n    [COL.orderedAt]: text(r[COL.orderedAt]),\n    [COL.orderedBy]: text(r[COL.orderedBy]),\n    ...changes,\n  });\n\n  const describe = (r) => {\n    const spec = text(r[COL.spec]);\n    return `${text(r[COL.item])}${spec ? `（${spec}）` : ''} ×${qtyOf(r)} — ${text(r[COL.buyer])}`;\n  };\n\n  // ---------------- add：加進清單 ----------------\n  if (req.action === 'add') {\n    const itemName = text(req.itemName);\n    if (!itemName) return reply('bad_request', '沒有商品名稱，沒辦法加入清單 QQ');\n\n    const qty = qtyOf({ [COL.qty]: req.quantity });\n    const spec = text(req.modelSpec);\n    const row = {\n      _target: req.platform === '京東' ? 'JD_APPEND' : 'TB_APPEND',\n      [COL.item]: itemName,\n      [COL.spec]: spec,\n      [COL.url]: text(req.url),\n      [COL.unit]: '',\n      [COL.qty]: qty,\n      [COL.est]: '',\n      [COL.actual]: '',\n      [COL.buyer]: text(req.senderName),\n      [COL.status]: STATUS_PENDING,\n      [COL.batch]: '',\n      [COL.orderedAt]: '',\n      [COL.orderedBy]: '',\n    };\n\n    const parts = [`${qty} 件`];\n    if (spec) parts.push(spec);\n    parts.push(`「${itemName}」`);\n    return writes([row], 'added', `已把 ${parts.join(' ')} 加入購物清單 🧾`);\n  }\n\n  // ---------------- delete：只能刪自己的、且還沒下單的 ----------------\n  if (req.action === 'delete') {\n    const mine = rows.filter((r) => norm(r[COL.buyer]) === norm(req.senderName));\n\n    const hit = findRow(mine.filter(isPending));\n    if (hit) {\n      return writes(\n        [{ _target: hit._sheet + '_DELETE', row_number: hit.row_number }],\n        'deleted',\n        `已把「${text(hit[COL.item])}」從購物清單刪掉 🗑️`\n      );\n    }\n\n    // 已經下單的不給刪，否則帳會對不起來\n    const ordered = findRow(mine.filter((r) => !isPending(r)));\n    if (ordered) {\n      const b = text(ordered[COL.batch]);\n      return reply(\n        'already_ordered',\n        `「${text(ordered[COL.item])}」已經在批次 ${b || '(未標記)'} 下單了，不能刪掉 🙅\\n` +\n          '要取消請直接跟結單的人說。'\n      );\n    }\n\n    return reply(\n      'not_found',\n      '在你的待下單清單裡找不到這筆商品 🙅\\n（只能刪自己加的，名稱也要對得上喔）'\n    );\n  }\n\n  // ---------------- list：看目前待下單的 ----------------\n  if (req.action === 'list') {\n    const pending = rows.filter(isPending);\n    if (!pending.length) return reply('empty', '目前待下單清單是空的 🧺');\n\n    const lines = [`🧺 待下單清單（共 ${pending.length} 項）`];\n    for (const [sheet, label] of SHEETS) {\n      const g = pending.filter((r) => r._sheet === sheet);\n      if (!g.length) continue;\n      lines.push('', `**${label}**（${g.length} 項）`);\n      for (const r of g) lines.push(`• ${describe(r)}`);\n    }\n    return reply('list', lines.join('\\n'));\n  }\n\n  // ---------------- close：結單，把待下單的整批凍結 ----------------\n  if (req.action === 'close') {\n    const pending = rows.filter(isPending);\n    if (!pending.length) return reply('empty', '目前沒有待下單的商品，不用結單 👌');\n\n    // 批次號 YYYYMMDD-N：日期由 bot 端給（時區才會對），N 是當天第幾批\n    const day = text(req.localDate) || '00000000';\n    let maxSeq = 0;\n    for (const r of rows) {\n      const m = text(r[COL.batch]).match(/^(\\d{8})-(\\d+)$/);\n      if (m && m[1] === day) maxSeq = Math.max(maxSeq, parseInt(m[2], 10));\n    }\n    const batch = `${day}-${maxSeq + 1}`;\n\n    const updates = pending.map((r) =>\n      carry(r, {\n        [COL.status]: STATUS_ORDERED,\n        [COL.batch]: batch,\n        [COL.orderedAt]: text(req.localTime),\n        [COL.orderedBy]: text(req.senderName),\n      })\n    );\n\n    const buyers = [...new Set(pending.map((r) => text(r[COL.buyer])).filter(Boolean))];\n    const lines = [\n      `✅ 結單完成，批次 **${batch}**`,\n      `共 ${pending.length} 項、${buyers.length} 人，由 ${text(req.senderName)} 結單`,\n    ];\n    for (const [sheet, label] of SHEETS) {\n      const g = pending.filter((r) => r._sheet === sheet);\n      if (!g.length) continue;\n      lines.push('', `**${label}**（${g.length} 項）`);\n      for (const r of g) {\n        lines.push(`• ${describe(r)}`);\n        const u = text(r[COL.url]);\n        if (u) lines.push(`  ${u}`);\n      }\n    }\n    lines.push(\n      '',\n      '下單後請回填價格，例如 `價格 電動牙刷 120`（單價）或 `電動牙刷總共 240`，之後打 `分帳` 就能算錢。'\n    );\n    return writes(updates, 'closed', lines.join('\\n'));\n  }\n\n  // ---------------- price：回填實際價格 ----------------\n  if (req.action === 'price') {\n    const unit = num(req.unitPrice);\n    const total = num(req.totalPrice);\n    if (unit <= 0 && total <= 0) {\n      return reply(\n        'bad_price',\n        '我看不出價格是多少 QQ\\n請試試：`價格 電動牙刷 120`（單價）或 `電動牙刷總共 240`。'\n      );\n    }\n\n    // 價格通常是下單後才知道，所以先在已下單的裡面找，找不到再退回待下單\n    const hit =\n      findRow(rows.filter((r) => !isPending(r))) || findRow(rows.filter(isPending));\n    if (!hit) {\n      return reply('not_found', '清單裡找不到這個商品 QQ\\n可以先打 `清單` 看看目前有什麼。');\n    }\n\n    const qty = qtyOf(hit);\n    const unitPrice = unit > 0 ? unit : total / qty;\n    const actual = unit > 0 ? unit * qty : total;\n\n    const update = carry(hit, {\n      [COL.unit]: money(unitPrice),\n      [COL.actual]: money(actual),\n    });\n\n    return writes(\n      [update],\n      'price_updated',\n      `已記錄「${text(hit[COL.item])}」單價 ${money(unitPrice)} × ${qty} = **${money(actual)}**` +\n        `（${text(hit[COL.buyer])}）`\n    );\n  }\n\n  // ---------------- bill：依人分帳 ----------------\n  if (req.action === 'bill') {\n    const ordered = rows.filter((r) => !isPending(r));\n    if (!ordered.length) return reply('empty', '還沒有任何已下單的商品，結單後再來對帳吧 👌');\n\n    const batches = [\n      ...new Set(ordered.map((r) => text(r[COL.batch])).filter(Boolean)),\n    ].sort();\n    const wanted = text(req.batch) || batches[batches.length - 1] || '';\n    const scope = wanted ? ordered.filter((r) => text(r[COL.batch]) === wanted) : ordered;\n\n    if (!scope.length) {\n      return reply(\n        'not_found',\n        `找不到批次 ${wanted} 的紀錄 QQ\\n目前有的批次：${batches.join('、') || '(無)'}`\n      );\n    }\n\n    const byBuyer = new Map();\n    const missing = [];\n    for (const r of scope) {\n      const buyer = text(r[COL.buyer]) || '(未填)';\n      const amount = num(r[COL.actual]);\n      if (amount <= 0) missing.push(`${text(r[COL.item])}（${buyer}）`);\n      byBuyer.set(buyer, (byBuyer.get(buyer) || 0) + amount);\n    }\n\n    const lines = [`💰 批次 **${wanted || '全部'}** 分帳（${scope.length} 項）`, ''];\n    let grand = 0;\n    for (const [buyer, amt] of [...byBuyer].sort((a, b) => b[1] - a[1])) {\n      grand += amt;\n      lines.push(`• **${buyer}**：${money(amt)}`);\n    }\n    lines.push('', `合計：**${money(grand)}**`);\n\n    // 沒填價格的一定要講，不然分帳金額是錯的卻看不出來\n    if (missing.length) {\n      lines.push('', `⚠️ 還有 ${missing.length} 項沒有價格，上面的金額不完整：`);\n      for (const m of missing) lines.push(`• ${m}`);\n      lines.push('補價格請用：`價格 <商品> <金額>`');\n    }\n    return reply('bill', lines.join('\\n'));\n  }\n\n  return reply('unknown_action', `我不知道要做什麼 QQ（action=${text(req.action) || '空'}）`);\n}\n\n// ==== N8N_ENTRY_BELOW ====\n\nfunction loadRows(nodeName, sheet) {\n  let items = [];\n  try {\n    items = $(nodeName).all();\n  } catch (e) {\n    return [];\n  }\n  const seen = new Set();\n  const out = [];\n  for (const it of items) {\n    const r = it.json || {};\n    if (r.row_number === undefined || r.row_number === null || r.row_number === '') continue;\n    if (seen.has(r.row_number)) continue; // executeOnce 的保險：去掉重複列\n    seen.add(r.row_number);\n    out.push({ ...r, _sheet: sheet });\n  }\n  return out;\n}\n\nconst req = $('Parse Request').first().json;\nconst rows = [...loadRows('Load TB', 'TB'), ...loadRows('Load JD', 'JD')];\nreturn plan(req, rows);\n"
+        "jsCode": "// ============================================================\n//  n8n Code 節點：Plan\n//  購物清單的全部決策邏輯都集中在這裡。\n//\n//  輸入：Parse Request 的請求 + Load TB / Load JD 撈出來的所有列\n//  輸出：每個 item 帶 _target，由 Switch Target 分流到對應的 Sheets 節點\n//        TB_APPEND / JD_APPEND / TB_UPDATE / JD_UPDATE / TB_DELETE / JD_DELETE / READ\n//        每個 item 都帶同一份 _response，Respond 節點固定取 first()。\n//\n//  ⚠️ 這個檔案是唯一真相：改完請跑 `python3 workflow/build.py` 重新生成\n//     ShoppingListBot.json，不要直接編輯 JSON 裡的程式碼。\n// ============================================================\n\nconst STATUS_PENDING = '待下單';\nconst STATUS_ORDERED = '已下單';\n\nconst COL = {\n  item: '預購買商品',\n  spec: '商品型號規格',\n  url: '商品網址',\n  unit: '商品價格',\n  qty: '商品數量',\n  est: '預估價格',\n  actual: '實際價格',\n  buyer: '購買人',\n  status: '狀態',\n  batch: '批次',\n  orderedAt: '下單時間',\n  orderedBy: '下單人',\n};\n\nconst SHEETS = [\n  ['TB', '淘寶'],\n  ['JD', '京東'],\n];\n\nconst text = (v) => (v ?? '').toString().trim();\nconst norm = (v) => text(v).toLowerCase();\nconst num = (v) => {\n  const n = parseFloat(text(v).replace(/[^\\d.-]/g, ''));\n  return Number.isFinite(n) ? n : 0;\n};\nconst money = (n) => (Math.round(n * 100) / 100).toString();\n\n// 舊資料的狀態欄是空的 → 一律視為待下單，既有資料才能無痛接軌\nconst isPending = (r) => {\n  const s = text(r[COL.status]);\n  return s === '' || s === STATUS_PENDING;\n};\n\nconst qtyOf = (r) => {\n  const q = Math.round(num(r[COL.qty]));\n  return q > 0 ? q : 1;\n};\n\n// 從商品網址取出一個穩定的比對用鍵。\n//\n// 淘寶／天貓／京東的網址帶一大堆會變的追蹤參數（spm / utparam / mi_id / scm /\n// pvid / abbucket…），同一個商品從搜尋頁複製和從首頁推薦複製就完全不一樣，\n// 所以整串網址不能拿來比對，只能認商品 ID。\n// 這也順便救了已經存成壞網址的舊資料——ID 還在裡面。\nfunction urlKey(raw) {\n  const u = text(raw);\n  if (!u) return '';\n\n  // 淘寶／天貓：?id= 或 &id=（注意不能誤中 skuId= / mi_id=）\n  const tb = u.match(/[?&]id=(\\d{6,})/);\n  if (tb) return 'item:' + tb[1];\n\n  // 京東：item.jd.com/<商品ID>.html\n  const jd = u.match(/item\\.jd\\.com\\/(\\d{6,})/);\n  if (jd) return 'item:' + jd[1];\n\n  // 抓不到 ID（例如 e.tb.cn / 3.cn 短連結）就退回去掉 query string 的網址\n  return u.split('?')[0].toLowerCase().replace(/\\/+$/, '');\n}\n\nfunction plan(req, rows) {\n  // 只回話、不動表格\n  const reply = (status, message) => [\n    { json: { _target: 'READ', _response: { status, message } } },\n  ];\n\n  // 要寫表格：每個 item 都帶同一份回應，Respond 取哪個都一樣\n  const writes = (list, status, message) =>\n    list.map((w) => ({ json: { ...w, _response: { status, message } } }));\n\n  // 找一列：網址優先，再用商品名稱（完全相同 → 互相包含）\n  const findRow = (scope) => {\n    const key = urlKey(req.url);\n    if (key) {\n      const hit = scope.find((r) => urlKey(r[COL.url]) === key);\n      if (hit) return hit;\n    }\n    const q = norm(req.itemName);\n    if (!q) return null;\n    return (\n      scope.find((r) => norm(r[COL.item]) === q) ||\n      scope.find((r) => norm(r[COL.item]).includes(q)) ||\n      scope.find((r) => {\n        const n = norm(r[COL.item]);\n        return n && q.includes(n);\n      }) ||\n      null\n    );\n  };\n\n  // 更新一列時，沒有要改的欄位一定要填回原值，否則 Sheets 會把它清空\n  const carry = (r, changes) => ({\n    _target: r._sheet + '_UPDATE',\n    row_number: r.row_number,\n    [COL.unit]: text(r[COL.unit]),\n    [COL.est]: text(r[COL.est]),\n    [COL.actual]: text(r[COL.actual]),\n    [COL.status]: text(r[COL.status]) || STATUS_PENDING,\n    [COL.batch]: text(r[COL.batch]),\n    [COL.orderedAt]: text(r[COL.orderedAt]),\n    [COL.orderedBy]: text(r[COL.orderedBy]),\n    ...changes,\n  });\n\n  const describe = (r) => {\n    const spec = text(r[COL.spec]);\n    return `${text(r[COL.item])}${spec ? `（${spec}）` : ''} ×${qtyOf(r)} — ${text(r[COL.buyer])}`;\n  };\n\n  // ---------------- add：加進清單 ----------------\n  if (req.action === 'add') {\n    const itemName = text(req.itemName);\n    if (!itemName) return reply('bad_request', '沒有商品名稱，沒辦法加入清單 QQ');\n\n    const qty = qtyOf({ [COL.qty]: req.quantity });\n    const spec = text(req.modelSpec);\n    const row = {\n      _target: req.platform === '京東' ? 'JD_APPEND' : 'TB_APPEND',\n      [COL.item]: itemName,\n      [COL.spec]: spec,\n      [COL.url]: text(req.url),\n      [COL.unit]: '',\n      [COL.qty]: qty,\n      [COL.est]: '',\n      [COL.actual]: '',\n      [COL.buyer]: text(req.senderName),\n      [COL.status]: STATUS_PENDING,\n      [COL.batch]: '',\n      [COL.orderedAt]: '',\n      [COL.orderedBy]: '',\n    };\n\n    const parts = [`${qty} 件`];\n    if (spec) parts.push(spec);\n    parts.push(`「${itemName}」`);\n    return writes([row], 'added', `已把 ${parts.join(' ')} 加入購物清單 🧾`);\n  }\n\n  // ---------------- delete：只能刪自己的、且還沒下單的 ----------------\n  if (req.action === 'delete') {\n    const mine = rows.filter((r) => norm(r[COL.buyer]) === norm(req.senderName));\n\n    const hit = findRow(mine.filter(isPending));\n    if (hit) {\n      return writes(\n        [{ _target: hit._sheet + '_DELETE', row_number: hit.row_number }],\n        'deleted',\n        `已把「${text(hit[COL.item])}」從購物清單刪掉 🗑️`\n      );\n    }\n\n    // 已經下單的不給刪，否則帳會對不起來\n    const ordered = findRow(mine.filter((r) => !isPending(r)));\n    if (ordered) {\n      const b = text(ordered[COL.batch]);\n      return reply(\n        'already_ordered',\n        `「${text(ordered[COL.item])}」已經在批次 ${b || '(未標記)'} 下單了，不能刪掉 🙅\\n` +\n          '要取消請直接跟結單的人說。'\n      );\n    }\n\n    return reply(\n      'not_found',\n      '在你的待下單清單裡找不到這筆商品 🙅\\n（只能刪自己加的，名稱也要對得上喔）'\n    );\n  }\n\n  // ---------------- list：看目前待下單的 ----------------\n  if (req.action === 'list') {\n    const pending = rows.filter(isPending);\n    if (!pending.length) return reply('empty', '目前待下單清單是空的 🧺');\n\n    const lines = [`🧺 待下單清單（共 ${pending.length} 項）`];\n    for (const [sheet, label] of SHEETS) {\n      const g = pending.filter((r) => r._sheet === sheet);\n      if (!g.length) continue;\n      lines.push('', `**${label}**（${g.length} 項）`);\n      for (const r of g) lines.push(`• ${describe(r)}`);\n    }\n    return reply('list', lines.join('\\n'));\n  }\n\n  // ---------------- close：結單，把待下單的整批凍結 ----------------\n  if (req.action === 'close') {\n    const pending = rows.filter(isPending);\n    if (!pending.length) return reply('empty', '目前沒有待下單的商品，不用結單 👌');\n\n    // 批次號 YYYYMMDD-N：日期由 bot 端給（時區才會對），N 是當天第幾批\n    const day = text(req.localDate) || '00000000';\n    let maxSeq = 0;\n    for (const r of rows) {\n      const m = text(r[COL.batch]).match(/^(\\d{8})-(\\d+)$/);\n      if (m && m[1] === day) maxSeq = Math.max(maxSeq, parseInt(m[2], 10));\n    }\n    const batch = `${day}-${maxSeq + 1}`;\n\n    const updates = pending.map((r) =>\n      carry(r, {\n        [COL.status]: STATUS_ORDERED,\n        [COL.batch]: batch,\n        [COL.orderedAt]: text(req.localTime),\n        [COL.orderedBy]: text(req.senderName),\n      })\n    );\n\n    const buyers = [...new Set(pending.map((r) => text(r[COL.buyer])).filter(Boolean))];\n    const lines = [\n      `✅ 結單完成，批次 **${batch}**`,\n      `共 ${pending.length} 項、${buyers.length} 人，由 ${text(req.senderName)} 結單`,\n    ];\n    for (const [sheet, label] of SHEETS) {\n      const g = pending.filter((r) => r._sheet === sheet);\n      if (!g.length) continue;\n      lines.push('', `**${label}**（${g.length} 項）`);\n      for (const r of g) {\n        lines.push(`• ${describe(r)}`);\n        const u = text(r[COL.url]);\n        if (u) lines.push(`  ${u}`);\n      }\n    }\n    lines.push(\n      '',\n      '下單後請回填價格，例如 `價格 電動牙刷 120`（單價）或 `電動牙刷總共 240`，之後打 `分帳` 就能算錢。'\n    );\n    return writes(updates, 'closed', lines.join('\\n'));\n  }\n\n  // ---------------- price：回填實際價格 ----------------\n  if (req.action === 'price') {\n    const unit = num(req.unitPrice);\n    const total = num(req.totalPrice);\n    if (unit <= 0 && total <= 0) {\n      return reply(\n        'bad_price',\n        '我看不出價格是多少 QQ\\n請試試：`價格 電動牙刷 120`（單價）或 `電動牙刷總共 240`。'\n      );\n    }\n\n    // 價格通常是下單後才知道，所以先在已下單的裡面找，找不到再退回待下單\n    const hit =\n      findRow(rows.filter((r) => !isPending(r))) || findRow(rows.filter(isPending));\n    if (!hit) {\n      return reply('not_found', '清單裡找不到這個商品 QQ\\n可以先打 `清單` 看看目前有什麼。');\n    }\n\n    const qty = qtyOf(hit);\n    const unitPrice = unit > 0 ? unit : total / qty;\n    const actual = unit > 0 ? unit * qty : total;\n\n    const update = carry(hit, {\n      [COL.unit]: money(unitPrice),\n      [COL.actual]: money(actual),\n    });\n\n    return writes(\n      [update],\n      'price_updated',\n      `已記錄「${text(hit[COL.item])}」單價 ${money(unitPrice)} × ${qty} = **${money(actual)}**` +\n        `（${text(hit[COL.buyer])}）`\n    );\n  }\n\n  // ---------------- bill：依人分帳 ----------------\n  if (req.action === 'bill') {\n    const ordered = rows.filter((r) => !isPending(r));\n    if (!ordered.length) return reply('empty', '還沒有任何已下單的商品，結單後再來對帳吧 👌');\n\n    const batches = [\n      ...new Set(ordered.map((r) => text(r[COL.batch])).filter(Boolean)),\n    ].sort();\n    const wanted = text(req.batch) || batches[batches.length - 1] || '';\n    const scope = wanted ? ordered.filter((r) => text(r[COL.batch]) === wanted) : ordered;\n\n    if (!scope.length) {\n      return reply(\n        'not_found',\n        `找不到批次 ${wanted} 的紀錄 QQ\\n目前有的批次：${batches.join('、') || '(無)'}`\n      );\n    }\n\n    const byBuyer = new Map();\n    const missing = [];\n    for (const r of scope) {\n      const buyer = text(r[COL.buyer]) || '(未填)';\n      const amount = num(r[COL.actual]);\n      if (amount <= 0) missing.push(`${text(r[COL.item])}（${buyer}）`);\n      byBuyer.set(buyer, (byBuyer.get(buyer) || 0) + amount);\n    }\n\n    const lines = [`💰 批次 **${wanted || '全部'}** 分帳（${scope.length} 項）`, ''];\n    let grand = 0;\n    for (const [buyer, amt] of [...byBuyer].sort((a, b) => b[1] - a[1])) {\n      grand += amt;\n      lines.push(`• **${buyer}**：${money(amt)}`);\n    }\n    lines.push('', `合計：**${money(grand)}**`);\n\n    // 沒填價格的一定要講，不然分帳金額是錯的卻看不出來\n    if (missing.length) {\n      lines.push('', `⚠️ 還有 ${missing.length} 項沒有價格，上面的金額不完整：`);\n      for (const m of missing) lines.push(`• ${m}`);\n      lines.push('補價格請用：`價格 <商品> <金額>`');\n    }\n    return reply('bill', lines.join('\\n'));\n  }\n\n  return reply('unknown_action', `我不知道要做什麼 QQ（action=${text(req.action) || '空'}）`);\n}\n\n// ==== N8N_ENTRY_BELOW ====\n\nfunction loadRows(nodeName, sheet) {\n  let items = [];\n  try {\n    items = $(nodeName).all();\n  } catch (e) {\n    return [];\n  }\n  const seen = new Set();\n  const out = [];\n  for (const it of items) {\n    const r = it.json || {};\n    if (r.row_number === undefined || r.row_number === null || r.row_number === '') continue;\n    if (seen.has(r.row_number)) continue; // executeOnce 的保險：去掉重複列\n    seen.add(r.row_number);\n    out.push({ ...r, _sheet: sheet });\n  }\n  return out;\n}\n\nconst req = $('Parse Request').first().json;\nconst rows = [...loadRows('Load TB', 'TB'), ...loadRows('Load JD', 'JD')];\nreturn plan(req, rows);\n"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -111,7 +111,7 @@
         0,
         220
       ],
-      "id": "3d95fda7-64e4-431f-8cd8-bebe81b62ab9",
+      "id": "d820d14a-8792-423b-a1d1-d06453993cb1",
       "name": "Plan"
     },
     {
@@ -128,7 +128,7 @@
                 },
                 "conditions": [
                   {
-                    "id": "90a28cb7-9a6b-4703-87e4-b240e66fbf57",
+                    "id": "0462b261-2359-46d0-9184-e2f921f34100",
                     "leftValue": "={{ $json._target }}",
                     "rightValue": "TB_APPEND",
                     "operator": {
@@ -152,7 +152,7 @@
                 },
                 "conditions": [
                   {
-                    "id": "6a9113c9-9d79-4894-81a0-246583dcc044",
+                    "id": "f8ceb0e2-7002-490d-aed9-2a2d40d4a999",
                     "leftValue": "={{ $json._target }}",
                     "rightValue": "JD_APPEND",
                     "operator": {
@@ -176,7 +176,7 @@
                 },
                 "conditions": [
                   {
-                    "id": "4de22751-be55-4007-9060-3f3a17ed1b6c",
+                    "id": "a9e575bc-e114-4df3-af40-d727cb61a9dc",
                     "leftValue": "={{ $json._target }}",
                     "rightValue": "TB_UPDATE",
                     "operator": {
@@ -200,7 +200,7 @@
                 },
                 "conditions": [
                   {
-                    "id": "61a7ce3f-1447-4f10-a0c0-526f8d37e456",
+                    "id": "9ebc0c39-6d4f-41e6-81d0-5053d35a9e97",
                     "leftValue": "={{ $json._target }}",
                     "rightValue": "JD_UPDATE",
                     "operator": {
@@ -224,7 +224,7 @@
                 },
                 "conditions": [
                   {
-                    "id": "b13e586f-f8a5-430b-aacd-25f7d6851156",
+                    "id": "3e1a8d4a-8b33-4a02-9b9c-53b34752b290",
                     "leftValue": "={{ $json._target }}",
                     "rightValue": "TB_DELETE",
                     "operator": {
@@ -248,7 +248,7 @@
                 },
                 "conditions": [
                   {
-                    "id": "6e56fd7a-773f-416c-9e42-ad853f856cd4",
+                    "id": "7dd33a1c-a301-4659-80b9-1b093b2d9d21",
                     "leftValue": "={{ $json._target }}",
                     "rightValue": "JD_DELETE",
                     "operator": {
@@ -275,7 +275,7 @@
         220,
         220
       ],
-      "id": "41d0bd63-7209-4c2e-96cc-420c2eb5cfec",
+      "id": "d692b84d-edd8-4bb3-80f0-1c925952547f",
       "name": "Switch Target"
     },
     {
@@ -433,7 +433,7 @@
         460,
         -140
       ],
-      "id": "eb649211-9005-4542-8cf5-6d9eb1fdb607",
+      "id": "7786db69-90ac-4d5f-8dd0-c09c5229dfe8",
       "name": "Append TB",
       "credentials": {
         "googleSheetsOAuth2Api": {
@@ -597,7 +597,7 @@
         460,
         -20
       ],
-      "id": "3184f6f1-f999-4ea8-bb87-2eed0e6dbca9",
+      "id": "c4a7286c-fdf3-40ea-8f89-250a8d459d36",
       "name": "Append JD",
       "credentials": {
         "googleSheetsOAuth2Api": {
@@ -768,7 +768,7 @@
         460,
         100
       ],
-      "id": "2a28a506-a688-4144-ac55-0113968b2852",
+      "id": "f85d8c0b-2664-42c3-a79c-f12480f12b92",
       "name": "Update TB",
       "credentials": {
         "googleSheetsOAuth2Api": {
@@ -939,7 +939,7 @@
         460,
         220
       ],
-      "id": "e579b8a3-2ead-41e7-97dd-390f34ddb8c8",
+      "id": "41d50141-603a-4454-b45e-c05fe9cf8b78",
       "name": "Update JD",
       "credentials": {
         "googleSheetsOAuth2Api": {
@@ -973,7 +973,7 @@
         460,
         340
       ],
-      "id": "64a0d99c-2e2d-4904-b8ef-0ef566d50084",
+      "id": "b9c9947c-0ff7-4f10-b0c7-b6a9b288070f",
       "name": "Delete TB",
       "credentials": {
         "googleSheetsOAuth2Api": {
@@ -1007,7 +1007,7 @@
         460,
         460
       ],
-      "id": "31c07496-ec55-438b-b410-bdac5041431b",
+      "id": "15844a93-af4e-40da-850f-b816e2b2cfbd",
       "name": "Delete JD",
       "credentials": {
         "googleSheetsOAuth2Api": {
@@ -1030,7 +1030,7 @@
         720,
         220
       ],
-      "id": "372183ca-ab74-4627-9f59-ccaae6232dd9",
+      "id": "2356645b-324f-45d0-baef-d321cfbd8f3c",
       "name": "Respond"
     }
   ],
@@ -1215,7 +1215,7 @@
   "settings": {
     "executionOrder": "v1"
   },
-  "versionId": "f8128c05-0ce4-4cd6-8478-4e3e35ca0eec",
+  "versionId": "5d49b24b-a532-45f9-80d2-3195857ec9a2",
   "meta": {
     "templateCredsSetupCompleted": true,
     "instanceId": "447b28fc540fbb52c629a13ba71be9946705860cbc08a149e0f9d0b24f2d2015"

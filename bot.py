@@ -52,6 +52,10 @@ URL_REGEX = re.compile(r"https?://[^\s　-〿一-鿿＀-￯「-』]+")
 # 網址結尾常見的標點（regex 可能把它們一起吃進來，要剝掉）
 URL_TRAILING_PUNCT = ".,;:!?)]>\"'"
 
+# Discord 會把貼上的長連結顯示成 [顯示文字](真實網址)。淘寶那種帶 utparam=%7B...%7D
+# 的網址貼進來就會變成這樣，括號裡才是真正能點的網址。
+MD_LINK_RE = re.compile(r"\]\((https?://[^\s()]+)\)")
+
 # Discord 單則訊息上限 2000 字，留一點餘裕
 DISCORD_CHUNK_LIMIT = 1900
 
@@ -62,11 +66,21 @@ CLOSE_CONFIRM_TIMEOUT = 60
 
 
 def extract_first_url(text: str) -> str | None:
-    """從文字中抓出第一個網址，並剝掉結尾誤吃的標點符號。"""
+    """從文字中抓出第一個網址，並剝掉結尾誤吃的標點符號。
+
+    刻意不靠 LLM 抽網址：LLM 會把淘寶的長網址截斷（實測 507 字被剪成 256 字），
+    存進表格就變成點不開的連結，而且每次截的位置不一定一樣。
+    """
+    # markdown 包裝優先，括號裡才是真正可以點的網址
+    md = MD_LINK_RE.search(text)
+    if md:
+        return md.group(1).rstrip(URL_TRAILING_PUNCT)
+
     match = URL_REGEX.search(text)
     if not match:
         return None
-    return match.group(0).rstrip(URL_TRAILING_PUNCT)
+    # 保險：真的吃到 markdown 的分隔時只留前半段
+    return match.group(0).split("](")[0].rstrip(URL_TRAILING_PUNCT)
 
 
 def safe_quantity(value) -> int:
@@ -418,7 +432,9 @@ async def on_message(message: discord.Message):
         return
 
     action = parsed["action"]
-    url = parsed["url"] or extract_first_url(text) or ""
+    # regex 優先、LLM 只當備援：LLM 抽的網址會被截斷，而且新增和刪除兩次抽的
+    # 結果不一定一樣，那樣就永遠對不上同一筆
+    url = extract_first_url(text) or parsed["url"]
 
     # ---- 結單 ----
     if action == "close":

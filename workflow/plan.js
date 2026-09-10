@@ -53,6 +53,28 @@ const qtyOf = (r) => {
   return q > 0 ? q : 1;
 };
 
+// 從商品網址取出一個穩定的比對用鍵。
+//
+// 淘寶／天貓／京東的網址帶一大堆會變的追蹤參數（spm / utparam / mi_id / scm /
+// pvid / abbucket…），同一個商品從搜尋頁複製和從首頁推薦複製就完全不一樣，
+// 所以整串網址不能拿來比對，只能認商品 ID。
+// 這也順便救了已經存成壞網址的舊資料——ID 還在裡面。
+function urlKey(raw) {
+  const u = text(raw);
+  if (!u) return '';
+
+  // 淘寶／天貓：?id= 或 &id=（注意不能誤中 skuId= / mi_id=）
+  const tb = u.match(/[?&]id=(\d{6,})/);
+  if (tb) return 'item:' + tb[1];
+
+  // 京東：item.jd.com/<商品ID>.html
+  const jd = u.match(/item\.jd\.com\/(\d{6,})/);
+  if (jd) return 'item:' + jd[1];
+
+  // 抓不到 ID（例如 e.tb.cn / 3.cn 短連結）就退回去掉 query string 的網址
+  return u.split('?')[0].toLowerCase().replace(/\/+$/, '');
+}
+
 function plan(req, rows) {
   // 只回話、不動表格
   const reply = (status, message) => [
@@ -65,9 +87,9 @@ function plan(req, rows) {
 
   // 找一列：網址優先，再用商品名稱（完全相同 → 互相包含）
   const findRow = (scope) => {
-    const url = norm(req.url);
-    if (url) {
-      const hit = scope.find((r) => norm(r[COL.url]) === url);
+    const key = urlKey(req.url);
+    if (key) {
+      const hit = scope.find((r) => urlKey(r[COL.url]) === key);
       if (hit) return hit;
     }
     const q = norm(req.itemName);

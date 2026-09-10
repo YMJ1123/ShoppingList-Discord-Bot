@@ -10,13 +10,17 @@ from openai import AsyncOpenAI, RateLimitError
 
 # -------------------------------------------------
 #  載入環境變數 (.env)
+#  測試時可以用另一份設定：ENV_FILE=.env.test python3 bot.py
 # -------------------------------------------------
-load_dotenv()
+ENV_FILE = os.getenv("ENV_FILE", ".env")
+load_dotenv(ENV_FILE)
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
 ALLOWED_CHANNEL_IDS_RAW = os.getenv("ALLOWED_CHANNEL_IDS", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# 選填：只有這些人能結單。留空＝任何人都能結單（靠 ✅ 二次確認防誤觸）
+ORDER_MANAGER_IDS_RAW = os.getenv("ORDER_MANAGER_IDS", "")
 
 if not DISCORD_TOKEN or not N8N_WEBHOOK_URL:
     raise RuntimeError("缺少必要的環境變數：DISCORD_TOKEN 或 N8N_WEBHOOK_URL")
@@ -24,22 +28,37 @@ if not DISCORD_TOKEN or not N8N_WEBHOOK_URL:
 if not GROQ_API_KEY:
     raise RuntimeError("缺少必要的環境變數：GROQ_API_KEY")
 
-# 將 ALLOWED_CHANNEL_IDS 解析成一組 int set（空字串代表不限制）
-ALLOWED_CHANNEL_IDS = set()
-for part in ALLOWED_CHANNEL_IDS_RAW.split(","):
-    part = part.strip()
-    if not part:
-        continue
-    try:
-        ALLOWED_CHANNEL_IDS.add(int(part))
-    except ValueError:
-        print(f"[WARN] 無法解析頻道 ID：{part!r}（已略過）")
+
+def parse_id_set(raw: str, label: str) -> set[int]:
+    """把逗號分隔的 ID 字串解析成 int set（空字串代表不限制）。"""
+    ids = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            print(f"[WARN] 無法解析{label}：{part!r}（已略過）")
+    return ids
+
+
+ALLOWED_CHANNEL_IDS = parse_id_set(ALLOWED_CHANNEL_IDS_RAW, "頻道 ID")
+ORDER_MANAGER_IDS = parse_id_set(ORDER_MANAGER_IDS_RAW, "結單負責人 ID")
 
 # 抓第一個網址用的 regex（不吃空白、CJK 字元與全形標點——淘寶/京東分享文常把網址和中文擠在一起）
 URL_REGEX = re.compile(r"https?://[^\s　-〿一-鿿＀-￯「-』]+")
 
 # 網址結尾常見的標點（regex 可能把它們一起吃進來，要剝掉）
 URL_TRAILING_PUNCT = ".,;:!?)]>\"'"
+
+# Discord 單則訊息上限 2000 字，留一點餘裕
+DISCORD_CHUNK_LIMIT = 1900
+
+# 結單確認用
+CONFIRM_YES = "✅"
+CONFIRM_NO = "❌"
+CLOSE_CONFIRM_TIMEOUT = 60
 
 
 def extract_first_url(text: str) -> str | None:
@@ -59,10 +78,44 @@ def safe_quantity(value) -> int:
     return qty if qty > 0 else 1
 
 
+def safe_price(value) -> float:
+    """把 LLM 回傳的價格安全轉成正數，失敗或非正數一律回 0。"""
+    try:
+        price = float(str(value).replace(",", "").strip() or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return price if price > 0 else 0.0
+
+
+def split_message(content: str, limit: int = DISCORD_CHUNK_LIMIT) -> list[str]:
+    """把長訊息按行切成多段，避免超過 Discord 的字數上限。"""
+    chunks: list[str] = []
+    current = ""
+
+    for line in content.split("\n"):
+        # 單一行就超長時只能硬切
+        while len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+
+        if current and len(current) + len(line) + 1 > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+
+    if current:
+        chunks.append(current)
+    return chunks or [""]
+
+
 async def post_to_n8n(payload: dict):
     """在 thread 裡送 webhook，避免卡住 Discord 的 event loop。"""
     return await asyncio.to_thread(
-        requests.post, N8N_WEBHOOK_URL, json=payload, timeout=8
+        requests.post, N8N_WEBHOOK_URL, json=payload, timeout=15
     )
 
 # -------------------------------------------------
@@ -72,31 +125,50 @@ groq_client = AsyncOpenAI(
     base_url="https://api.groq.com/openai/v1",
     api_key=GROQ_API_KEY,
 )
-GROQ_MODEL = "llama-3.3-70b-versatile"
+# Llama 3.3 70B 已於 2026-08-16 對免費／Developer 方案下線。
+# 官方替代：openai/gpt-oss-120b（正式版）或 qwen/qwen3.6-27b（預覽，中文較強）
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_MAX_RETRIES = 3
 
 SYSTEM_PROMPT = (
-    "你是一個購物清單助手。使用者會在 Discord 傳購物相關訊息，你要判斷意圖並提取資訊。\n"
+    "你是一個團購購物清單助手。使用者會在 Discord 傳訊息，你要判斷意圖並提取資訊。\n"
     "請嚴格回傳以下 JSON 格式：\n"
-    '{"action": "add", "itemName": "商品名稱", "quantity": 1, "modelSpec": "型號規格", "url": "網址"}\n\n'
-    "規則：\n"
-    '- action：判斷使用者意圖，只能是 "add"、"delete" 或 "other"。\n'
-    '  - "add"：想購買/新增商品（例如：買 兩台白色的小米風扇 https://...）\n'
-    '  - "delete"：想刪除/取消已加入清單的商品（例如：刪除電動牙刷、幫我把風扇刪掉、電動牙刷不用買了）\n'
-    '  - "other"：跟購物清單無關，或無法判斷。\n'
-    "- itemName：商品名稱。add 時是要購買的商品；delete 時是要刪除的商品。"
+    '{"action": "add", "itemName": "", "quantity": 1, "modelSpec": "", "url": "", '
+    '"unitPrice": 0, "totalPrice": 0, "batch": ""}\n\n'
+    "action 只能是這幾種：\n"
+    '- "add"：想買、要加進清單（例如：買 兩台白色的小米風扇 https://...）\n'
+    '- "delete"：想把還沒下單的商品從清單移除（例如：刪除電動牙刷、風扇不用買了）\n'
+    '- "close"：結單，把目前整份清單拿去下單（例如：結單、可以下單了、我要去下單了）\n'
+    '- "price"：回報某商品實際多少錢（例如：價格 電動牙刷 120、牙刷一個 120、牙刷總共 240）\n'
+    '- "list"：想看目前清單（例如：清單、目前有什麼、還有什麼要買）\n'
+    '- "bill"：想算錢、分帳（例如：分帳、帳單、大家要付多少、對帳）\n'
+    '- "other"：跟購物清單無關，或無法判斷\n\n'
+    "欄位規則：\n"
+    "- itemName：商品名稱，add / delete / price 會用到。"
     "如果訊息包含「...」格式的商品名，優先使用。沒有就留空字串。\n"
-    "- quantity：數量，必須是整數。如果使用者用中文數字（如 兩台、三個），請轉換為阿拉伯數字。預設為 1。\n"
-    "- modelSpec：型號、規格、顏色等描述（如 白色、256GB）。如果沒有就留空字串。\n"
-    "- url：訊息中的網址（https:// 開頭）。如果沒有就留空字串，要注意不該有空格。\n"
-    "- 如果資訊缺失請留空字串，數量預設為 1。\n"
+    "- quantity：數量，必須是整數。中文數字要轉成阿拉伯數字（兩台 → 2）。預設 1。\n"
+    "- modelSpec：型號、規格、顏色等描述（如 白色、256GB）。沒有就留空字串。\n"
+    "- url：訊息中的網址（https:// 開頭）。沒有就留空字串，要注意不該有空格。\n"
+    "- unitPrice：price 時的「單價」，也就是一個多少錢。沒有明說單價就填 0。\n"
+    "- totalPrice：price 時的「總價」，也就是總共多少錢。沒有明說總價就填 0。\n"
+    "  例：「牙刷一個 120」→ unitPrice=120、totalPrice=0；\n"
+    "      「牙刷總共 240」→ unitPrice=0、totalPrice=240；\n"
+    "      「價格 牙刷 120」→ 當成單價，unitPrice=120、totalPrice=0。\n"
+    "- batch：bill 時如果使用者指定了批次（例如 20260910-1）就填，否則留空字串。\n"
+    "- 資訊缺失請留空字串，數量預設 1、價格預設 0。\n"
     "- 只輸出 JSON，不要有其他解釋文字。"
 )
 
-VALID_ACTIONS = {"add", "delete", "other"}
+VALID_ACTIONS = {"add", "delete", "close", "price", "list", "bill", "other"}
 
-# 帶有「刪除意圖」的關鍵字：訊息不是「買」開頭時，符合這個才會送 LLM 判斷
-DELETE_INTENT_RE = re.compile(r"刪除|刪掉|移除|取消|不用買|不想買|不買了|別買|退掉")
+# 訊息不是「買」開頭時，要命中這些關鍵字才會送 LLM 判斷（省 API 額度、也避免誤觸）
+INTENT_RE = re.compile(
+    r"刪除|刪掉|移除|取消|不用買|不想買|不買了|別買|退掉"  # delete
+    r"|結單|關單|下單了|可以下單|要下單|開始下單"  # close
+    r"|價格|價錢|單價|總價|多少錢|花了|付了"  # price
+    r"|清單|列表|還有什麼|目前有什麼"  # list
+    r"|分帳|帳單|對帳|算錢|付多少|收錢"  # bill
+)
 
 
 async def parse_with_llm(message_content: str) -> dict | None:
@@ -113,7 +185,8 @@ async def parse_with_llm(message_content: str) -> dict | None:
                 ],
                 response_format={"type": "json_object"},
                 temperature=0.1,
-                max_tokens=512,
+                max_tokens=1024,
+                extra_body={"reasoning_effort": "low"},
             )
             raw_text = response.choices[0].message.content.strip()
             parsed = json.loads(raw_text)
@@ -124,10 +197,13 @@ async def parse_with_llm(message_content: str) -> dict | None:
 
             return {
                 "action": action,
-                "itemName": str(parsed.get("itemName", "")),
+                "itemName": str(parsed.get("itemName", "")).strip(),
                 "quantity": safe_quantity(parsed.get("quantity")),
-                "modelSpec": str(parsed.get("modelSpec", "")),
-                "url": str(parsed.get("url", "")),
+                "modelSpec": str(parsed.get("modelSpec", "")).strip(),
+                "url": str(parsed.get("url", "")).strip(),
+                "unitPrice": safe_price(parsed.get("unitPrice")),
+                "totalPrice": safe_price(parsed.get("totalPrice")),
+                "batch": str(parsed.get("batch", "")).strip(),
             }
 
         except json.JSONDecodeError as e:
@@ -171,57 +247,124 @@ async def safe_react(message: discord.Message, emoji: str, remove: bool = False)
         print(f"[WARN] 無法{'移除' if remove else '加上'}反應 {emoji}: {e}")
 
 
-async def send_delete(message: discord.Message, url: str, item_name: str, full_text: str):
-    """送刪除請求到 n8n 並回覆結果。可用網址或商品名稱其中之一辨識。"""
-    payload = {
-        "action": "delete",
-        "url": url,
-        "itemName": item_name,
-        "fullText": full_text,
+async def reply_long(message: discord.Message, content: str) -> discord.Message:
+    """回覆可能很長的內容（清單／結單摘要會超過 2000 字），回傳最後送出的訊息。"""
+    content = (content or "").strip() or "（n8n 沒有回內容，請看一下 log）"
+    sent = message
+    for i, chunk in enumerate(split_message(content)):
+        if i == 0:
+            sent = await message.reply(chunk)
+        else:
+            sent = await message.channel.send(chunk)
+    return sent
+
+
+def base_payload(message: discord.Message) -> dict:
+    """所有 action 共用的欄位。日期時間用本地時區，批次號才不會跨日錯亂。"""
+    local = message.created_at.astimezone()
+    return {
         "senderId": str(message.author.id),
         "senderName": message.author.name,
         "channelId": str(message.channel.id),
         "createdAt": message.created_at.isoformat(),
+        "localDate": local.strftime("%Y%m%d"),
+        "localTime": local.strftime("%Y-%m-%d %H:%M"),
     }
 
+
+async def call_n8n(message: discord.Message, extra: dict) -> dict | None:
+    """送一個 action 給 n8n，回傳 {status, message}；失敗回 None。"""
+    payload = {**base_payload(message), **extra}
     try:
         resp = await post_to_n8n(payload)
-        print("Sent DELETE to n8n:", resp.status_code, resp.text[:200])
-
-        if resp.status_code == 200:
-            deleted_name = ""
-            try:
-                deleted_name = str(resp.json().get("itemName", ""))
-            except Exception:
-                pass
-            if deleted_name:
-                await message.reply(f"已把「{deleted_name}」從購物清單刪掉 🗑️")
-            else:
-                await message.reply("已刪除你加進清單的那筆商品 🗑️")
-        elif resp.status_code in (403, 404):
-            await message.reply(
-                "在你加入的清單裡找不到這筆商品 🙅\n"
-                "（只能刪自己加的，名稱也要對得上喔）"
-            )
-        else:
-            await message.reply("刪除請求傳到 n8n 失敗 QQ")
+        print(f"Sent {payload.get('action')} to n8n:", resp.status_code, resp.text[:200])
+        if not resp.ok:
+            return None
+        data = resp.json()
+        if not isinstance(data, dict):
+            return None
+        return data
     except Exception as e:
-        print("Error sending delete to n8n:", e)
-        await message.reply("刪除時我撞牆了 QQ 請幫我看一下 log")
+        print(f"Error sending {payload.get('action')} to n8n:", e)
+        return None
+
+
+async def run_action(message: discord.Message, extra: dict, fallback: str = "完成 ✓"):
+    """送 action 到 n8n 並把回覆貼回頻道。"""
+    data = await call_n8n(message, extra)
+    if data is None:
+        await message.reply("跟 n8n 溝通時我撞牆了 QQ 請幫我看一下 log")
+        return None
+    await reply_long(message, data.get("message") or fallback)
+    return data
+
+
+async def handle_close(message: discord.Message):
+    """結單：先給預覽，等發話者按 ✅ 才真的凍結整批。"""
+    if ORDER_MANAGER_IDS and message.author.id not in ORDER_MANAGER_IDS:
+        await message.reply("只有下單負責人可以結單喔 🙅")
+        return
+
+    # 先撈一次待下單清單當預覽，讓大家看清楚這批要結什麼
+    preview = await call_n8n(message, {"action": "list"})
+    if preview is None:
+        await message.reply("跟 n8n 溝通時我撞牆了 QQ 請幫我看一下 log")
+        return
+
+    if preview.get("status") == "empty":
+        await reply_long(message, preview.get("message") or "目前沒有待下單的商品 👌")
+        return
+
+    prompt = await reply_long(
+        message,
+        f"{preview.get('message', '')}\n\n"
+        f"以上是這批要下單的內容。\n"
+        f"確認結單請按 {CONFIRM_YES}，取消按 {CONFIRM_NO}（{CLOSE_CONFIRM_TIMEOUT} 秒內有效）。\n"
+        f"⚠️ 結單後這批就不能再自己刪除了。",
+    )
+
+    await safe_react(prompt, CONFIRM_YES)
+    await safe_react(prompt, CONFIRM_NO)
+
+    def check(reaction: discord.Reaction, user: discord.abc.User) -> bool:
+        return (
+            user.id == message.author.id
+            and reaction.message.id == prompt.id
+            and str(reaction.emoji) in (CONFIRM_YES, CONFIRM_NO)
+        )
+
+    try:
+        reaction, _ = await bot.wait_for(
+            "reaction_add", timeout=CLOSE_CONFIRM_TIMEOUT, check=check
+        )
+    except asyncio.TimeoutError:
+        await prompt.reply("等太久了，這次沒有結單 ⏱️（要結單請再打一次「結單」）")
+        return
+
+    if str(reaction.emoji) == CONFIRM_NO:
+        await prompt.reply("好，這次不結單 👌")
+        return
+
+    await run_action(message, {"action": "close"}, fallback="結單完成 ✅")
 
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"設定檔: {ENV_FILE}　webhook: {N8N_WEBHOOK_URL}")
     if ALLOWED_CHANNEL_IDS:
         print(f"Allowed channel IDs: {sorted(ALLOWED_CHANNEL_IDS)}")
     else:
         print("Allowed channel IDs: 不限制（所有頻道都會處理）")
+    if ORDER_MANAGER_IDS:
+        print(f"結單負責人: {sorted(ORDER_MANAGER_IDS)}")
+    else:
+        print("結單負責人: 不限制（任何人都能結單，靠 ✅ 二次確認）")
     print(f"LLM: Groq {GROQ_MODEL} ✓")
 
 
 # -------------------------------------------------
-#  主訊息處理：買 / ~刪除
+#  主訊息處理
 # -------------------------------------------------
 @bot.event
 async def on_message(message: discord.Message):
@@ -248,25 +391,25 @@ async def on_message(message: discord.Message):
                 "或直接用自然語言，例如：`刪除電動牙刷`。"
             )
         else:
-            await send_delete(message, url_to_delete, "", text)
+            await run_action(
+                message,
+                {"action": "delete", "url": url_to_delete, "itemName": "", "fullText": text},
+            )
         await bot.process_commands(message)
         return
 
     # ============================================
-    # 2) 自然語言：「買」開頭 → 新增；帶刪除意圖 → 刪除
-    #    其他訊息不送 LLM，直接略過
+    # 2) 自然語言：「買」開頭，或命中意圖關鍵字才送 LLM
     # ============================================
-    if not (text.startswith("買") or DELETE_INTENT_RE.search(text)):
+    if not (text.startswith("買") or INTENT_RE.search(text)):
         await bot.process_commands(message)
         return
 
-    # 先給使用者一個「處理中」的反應
     await safe_react(message, "⏳")
-
     parsed = await parse_with_llm(text)
+    await safe_react(message, "⏳", remove=True)
 
     if parsed is None:
-        await safe_react(message, "⏳", remove=True)
         await message.reply(
             "AI 解析服務暫時忙碌，請稍後再試一次 🔄\n"
             "（如果持續失敗，可能是 API 額度用完了）"
@@ -274,88 +417,97 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    # ---- 刪除 ----
-    if parsed["action"] == "delete":
-        url = parsed["url"] or extract_first_url(text) or ""
-        item_name = parsed["itemName"]
+    action = parsed["action"]
+    url = parsed["url"] or extract_first_url(text) or ""
 
-        if not url and not item_name:
-            await safe_react(message, "⏳", remove=True)
+    # ---- 結單 ----
+    if action == "close":
+        await handle_close(message)
+
+    # ---- 刪除 ----
+    elif action == "delete":
+        if not url and not parsed["itemName"]:
             await message.reply(
                 "我看不出來你要刪掉哪個商品 QQ\n"
                 "請試試：`刪除電動牙刷` 或 `~刪除 https://...`"
             )
         else:
-            await send_delete(message, url, item_name, text)
-            await safe_react(message, "⏳", remove=True)
-        await bot.process_commands(message)
-        return
-
-    # ---- 非購物訊息 ----
-    if parsed["action"] != "add" or not parsed["itemName"]:
-        await safe_react(message, "⏳", remove=True)
-        # 只有明確用「買」開頭的訊息才回覆格式提示，其他默默略過
-        if text.startswith("買"):
-            await message.reply(
-                "我沒辦法從訊息中提取到商品名稱 QQ\n"
-                "請試試類似這樣的格式：\n"
-                "`買 兩台白色的小米風扇 https://...`\n"
-                "`買 【淘宝】... https://e.tb.cn/h.xxx 「電動牙刷」`"
+            await run_action(
+                message,
+                {
+                    "action": "delete",
+                    "url": url,
+                    "itemName": parsed["itemName"],
+                    "fullText": text,
+                },
             )
-        await bot.process_commands(message)
-        return
 
-    item_name = parsed["itemName"]
-    quantity = parsed["quantity"]
-    model_spec = parsed["modelSpec"]
-    url = parsed["url"]
-
-    # 如果 LLM 沒抓到 URL，從原始訊息中再嘗試 regex 撈一次
-    if not url:
-        url = extract_first_url(text) or ""
-
-    if not url:
-        await safe_react(message, "⏳", remove=True)
-        await message.reply(
-            "我在訊息裡找不到購物網址 QQ\n"
-            "請確認有貼上 https:// 開頭的購物連結。"
-        )
-        await bot.process_commands(message)
-        return
-
-    payload = {
-        "action": "add",
-        "fullText": text,
-        "shareText": text,
-        "itemName": item_name,
-        "quantity": quantity,
-        "modelSpec": model_spec,
-        "url": url,
-        "senderId": str(message.author.id),
-        "senderName": message.author.name,
-        "channelId": str(message.channel.id),
-        "createdAt": message.created_at.isoformat(),
-    }
-
-    try:
-        resp = await post_to_n8n(payload)
-        print("Sent ADD to n8n:", resp.status_code, resp.text[:200])
-
-        await safe_react(message, "⏳", remove=True)
-
-        if resp.ok:
-            summary_parts = [f"{quantity} 件"]
-            if model_spec:
-                summary_parts.append(model_spec)
-            summary_parts.append(f"「{item_name}」")
-            summary = " ".join(summary_parts)
-            await message.reply(f"已把 {summary} 加入購物清單 🧾")
+    # ---- 回填價格 ----
+    elif action == "price":
+        if not parsed["itemName"] and not url:
+            await message.reply(
+                "我看不出來這是哪個商品的價格 QQ\n"
+                "請試試：`價格 電動牙刷 120`（單價）或 `電動牙刷總共 240`。"
+            )
         else:
-            await message.reply("新增請求傳到 n8n 失敗 QQ")
-    except Exception as e:
-        print("Error sending add to n8n:", e)
-        await safe_react(message, "⏳", remove=True)
-        await message.reply("新增時我撞牆了 QQ 請幫我看一下 log")
+            await run_action(
+                message,
+                {
+                    "action": "price",
+                    "itemName": parsed["itemName"],
+                    "url": url,
+                    "unitPrice": parsed["unitPrice"],
+                    "totalPrice": parsed["totalPrice"],
+                    "fullText": text,
+                },
+            )
+
+    # ---- 看清單 ----
+    elif action == "list":
+        await run_action(message, {"action": "list"})
+
+    # ---- 分帳 ----
+    elif action == "bill":
+        await run_action(message, {"action": "bill", "batch": parsed["batch"]})
+
+    # ---- 新增 ----
+    elif action == "add":
+        if not parsed["itemName"]:
+            # 只有明確用「買」開頭的訊息才提示格式，其他默默略過
+            if text.startswith("買"):
+                await message.reply(
+                    "我沒辦法從訊息中提取到商品名稱 QQ\n"
+                    "請試試類似這樣的格式：\n"
+                    "`買 兩台白色的小米風扇 https://...`\n"
+                    "`買 【淘宝】... https://e.tb.cn/h.xxx 「電動牙刷」`"
+                )
+        elif not url:
+            await message.reply(
+                "我在訊息裡找不到購物網址 QQ\n"
+                "請確認有貼上 https:// 開頭的購物連結。"
+            )
+        else:
+            await run_action(
+                message,
+                {
+                    "action": "add",
+                    "fullText": text,
+                    "shareText": text,
+                    "itemName": parsed["itemName"],
+                    "quantity": parsed["quantity"],
+                    "modelSpec": parsed["modelSpec"],
+                    "url": url,
+                },
+            )
+
+    # ---- 其他：默默略過，只有「買」開頭才提示 ----
+    elif text.startswith("買"):
+        await message.reply(
+            "我沒辦法從訊息中提取到商品名稱 QQ\n"
+            "請試試類似這樣的格式：\n"
+            "`買 兩台白色的小米風扇 https://...`\n"
+            "`買 【淘宝】... https://e.tb.cn/h.xxx 「電動牙刷」`"
+        )
 
     await bot.process_commands(message)
 

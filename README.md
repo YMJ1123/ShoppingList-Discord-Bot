@@ -1,31 +1,38 @@
 
 # Shopping List Discord Bot
 
-Discord 購物清單 bot，使用 **AI（Groq / Llama 3.3 70B）** 自然語言解析 `買` 指令，將商品資訊送到 n8n Webhook，再由 n8n 寫入 Google 試算表。  
-A Discord bot that uses **AI-powered natural language processing (Groq / Llama 3.3 70B)** to parse `買` commands and forward structured data to an n8n webhook, which appends rows to a Google Sheet.
+團購用的 Discord 購物清單 bot，用 **AI（Groq）** 解析自然語言指令——加商品、刪商品、結單、回填價格、分帳——再透過 n8n Webhook 寫入 Google 試算表。  
+A Discord bot for group buying that uses **AI-powered natural language processing (Groq)** to handle adding, removing, order closing, price reporting and bill splitting, forwarding structured data to an n8n webhook that reads and writes a Google Sheet.
 
 ---
 
 ## Features / 功能簡介
 
 - 在指定的 Discord 頻道監聽指令（不用 @ bot，直接打指令即可）
-- **AI 自然語言解析**（透過 Groq API + Llama 3.3 70B）：
-  - 不需要嚴格格式，用自然語言即可
-  - `買 兩台白色的小米風扇 https://...`
-  - `買 【淘宝】... https://e.tb.cn/h.xxx 「電動牙刷」`
-  - `買1個型號:深空灰 的【淘宝】... https://e.tb.cn/h.xxx 「手機掛繩」`
+- **AI 意圖判斷**：一句自然語言就判斷你想做什麼，不需要記指令格式
+
+  | 意圖 | 例子 |
+  |------|------|
+  | 加入清單 | `買 兩台白色的小米風扇 https://...` |
+  | 刪除 | `刪除電動牙刷`、`風扇不用買了` |
+  | 結單 | `結單`、`可以下單了` |
+  | 回填價格 | `價格 電動牙刷 120`、`牙刷總共 240` |
+  | 看清單 | `清單`、`目前有什麼要買的` |
+  | 分帳 | `分帳`、`大家要付多少` |
+
 - AI 自動從訊息中提取：
   - **商品名稱**：從「...」格式或自然語言中辨識
   - **商品型號規格**：顏色、型號、規格等描述
-  - **商品網址**：`https://` 開頭的購物連結
   - **商品數量**：支援中文數字（兩台 → 2、三個 → 3）
-  - **購買人**：Discord username
+  - **價格**：分得出「單價」和「總價」（牙刷一個 120 / 牙刷總共 240）
+  - **商品網址**：`https://` 開頭的購物連結
   - **平台**：依分享文字／網址自動辨識「淘寶 / 京東」
-- 透過 n8n：
-  - 使用 `Code` 節點解析 payload（優先使用 AI 預解析的欄位）
-  - 使用 `Switch` 節點依 `platform` 分流
-  - 將 **淘寶訂單寫入 Sheet「淘寶」**、**京東訂單寫入 Sheet「京東」**
-- 支援 `~刪除` 指令：貼上商品連結或原分享文字，bot 會依第一個 URL 尋找並刪除對應的清單紀錄
+- **結單流程**：把清單上所有待下單的項目整批凍結、蓋上批次號（`YYYYMMDD-N`）、記下下單人與時間
+  - 結單前會先列出這批的完整內容，要按 ✅ 二次確認才會執行（不可逆的批次操作）
+  - 結單後那批就不能再自己刪除，帳才不會對不起來
+  - 選填 `ORDER_MANAGER_IDS` 可以限制只有下單負責人能結單
+- **分帳**：依購買人加總實際價格，並明確列出還沒填價格的項目（否則金額看起來對、其實不完整）
+- 只有「買」開頭或命中意圖關鍵字的訊息才會送 LLM，其他訊息完全不理，省 API 額度
 - 429 rate limit 自動重試機制（最多 3 次）
 
 ---
@@ -67,6 +74,9 @@ DISCORD_TOKEN=YOUR_DISCORD_BOT_TOKEN
 N8N_WEBHOOK_URL=http://localhost:5678/webhook/discord-shopping
 ALLOWED_CHANNEL_IDS=123456789012345678,987654321098765432
 GROQ_API_KEY=gsk_your_groq_api_key
+# 選填
+GROQ_MODEL=openai/gpt-oss-120b
+ORDER_MANAGER_IDS=
 ```
 
 * `DISCORD_TOKEN`
@@ -86,6 +96,14 @@ GROQ_API_KEY=gsk_your_groq_api_key
 
   * 到 [console.groq.com](https://console.groq.com) 註冊後，在 API Keys 頁面建立
   * 免費方案：每分鐘 1,000 請求、每日約 14,000 請求，不需信用卡
+* `GROQ_MODEL`（選填）
+
+  * 預設 `openai/gpt-oss-120b`。Llama 3.3 70B 已於 2026-08-16 對免費／Developer 方案下線
+  * 中文想更強可以試 `qwen/qwen3.6-27b`（預覽版）
+* `ORDER_MANAGER_IDS`（選填）
+
+  * 逗號分隔的 Discord **user ID**，設了之後只有這些人能結單
+  * 留空＝任何人都能結單，仍然需要按 ✅ 二次確認才會執行
 
 ### 2. 安裝相依套件
 
@@ -124,16 +142,53 @@ AI 會自動辨識：
 
 唯一的硬性要求：**訊息中必須包含至少一個 `https://` 開頭的購物網址**。
 
-### ~刪除（Regex 解析，不使用 AI）
+### 刪除（自然語言）
 
 ```text
-~刪除 https://e.tb.cn/h.xxx
-~刪除 【淘宝】7天无理由退货 https://e.tb.cn/h.xxx 「電動牙刷」
+刪除電動牙刷
+幫我把小米風扇刪掉
+電動牙刷不用買了
+取消 https://e.tb.cn/h.xxx
 ```
 
-- 只要在分享文字最前面加上 `~刪除`，bot 會抓取第一個 URL 並刪除對應的訂單。
-- 若僅有連結也可行：`~刪除 <URL>`。
-- 找不到符合 URL 的紀錄或格式錯誤時，bot 會回覆失敗提示。
+- 只能刪**自己加的、而且還沒下單**的項目。
+- 有網址就用網址精確比對，沒有就用商品名稱（完全相同優先，其次模糊包含）。
+- 已經結單的項目不給刪，bot 會告訴你它在哪個批次。
+
+`~刪除 <URL>` 的舊格式仍然支援，走 regex 快速通道、不經過 AI。
+
+### 結單
+
+```text
+結單
+可以下單了
+```
+
+1. bot 先把這批待下單的完整內容列出來（依平台分組、含網址，方便照著買）。
+2. 按 ✅ 才會真的結單，按 ❌ 或 60 秒沒反應就取消。
+3. 結單後那批被蓋上批次號 `YYYYMMDD-N`，狀態變 `已下單`，並記下下單人與時間。
+
+### 回填價格
+
+```text
+價格 電動牙刷 120      # 單價
+牙刷一個 120           # 單價
+電動牙刷總共 240       # 總價，會自己反算單價
+```
+
+- 單價會寫進「商品價格」，並自動算出「實際價格」＝單價 × 數量。
+- 只給總價時反過來推算單價。
+- 優先找已下單的項目（價格通常是下單後才知道），找不到才回頭找待下單的。
+
+### 看清單 / 分帳
+
+```text
+清單                  # 目前待下單的項目
+分帳                  # 最新批次，依人加總
+分帳 20260910-1        # 指定批次
+```
+
+分帳會列出每個人的小計與總計，並把**還沒填價格的項目單獨標出來**——否則金額看起來對、其實少算。
 
 ---
 
@@ -142,9 +197,9 @@ AI 會自動辨識：
 整體流程示意：
 
 ```text
-Discord Bot (AI 解析) → n8n Webhook → Code → Switch(platform)
-                                                 ├─ 淘寶 → Google Sheets (Sheet: 淘寶)
-                                                 └─ 京東 → Google Sheets (Sheet: 京東)
+Discord Bot (AI 判斷意圖) → n8n Webhook → 撈出兩張表 → Plan（決定要做什麼）
+                                                        ├─ 寫入／更新／刪除 淘寶 或 京東 Sheet
+                                                        └─ 只回話（清單／分帳）
 ```
 
 ### ⚡ Quick Start：從 repo 匯入現成 workflow / Import the pre-built workflow from the repo
@@ -174,10 +229,21 @@ Discord Bot (AI 解析) → n8n Webhook → Code → Switch(platform)
    * `京東`
 3. 每個 sheet 建立欄位（標題列）：
 
-   | 預購買商品 | 商品型號規格 | 商品網址 | 商品價格 | 商品數量 | 預估價格 | 實際價格 | 購買人 |
-   | ----- | ------ | ---- | ---- | ---- | ---- | ---- | --- |
+   | 預購買商品 | 商品型號規格 | 商品網址 | 商品價格 | 商品數量 | 預估價格 | 實際價格 | 購買人 | 狀態 | 批次 | 下單時間 | 下單人 |
+   | ----- | ------ | ---- | ---- | ---- | ---- | ---- | --- | -- | -- | ---- | --- |
 
-> 註：目前範例程式會自動填：預購買商品、商品型號規格、商品網址、商品數量、購買人，其餘價格欄位先留白。
+各欄位由誰填：
+
+| 欄位 | 誰填 | 說明 |
+|------|------|------|
+| 預購買商品／商品型號規格／商品網址／商品數量／購買人 | `買` 指令 | AI 從訊息解析 |
+| 狀態 | 系統 | `待下單` → 結單後變 `已下單` |
+| 批次 | 結單 | `YYYYMMDD-N`，同一天第幾批 |
+| 下單時間／下單人 | 結單 | 誰在什麼時候結的 |
+| 商品價格（單價）／實際價格 | `價格` 指令 | 實際價格＝單價 × 數量，分帳用這欄 |
+| 預估價格 | 手動 | 程式不會動它 |
+
+> **狀態欄留空會被視為 `待下單`**，所以舊資料不用回填也能正常運作。
 
 ---
 
@@ -204,221 +270,88 @@ Discord Bot (AI 解析) → n8n Webhook → Code → Switch(platform)
 
 ---
 
-### 2. 建立 Code Node（解析 Discord payload）
+### 2. Workflow 架構 / Workflow architecture
 
-1. 新增節點：`Code`。
-
-2. 將 `Webhook → Code` 接起來。
-
-3. 設定：
-
-   * **Mode**：`Run Once for All Items`
-   * **Language**：`JavaScript`
-
-4. 填入下面這段程式（`ShoppingListBot.json` 即採用此邏輯，會同時處理新增 / 刪除）。
-   注意：Python 端已透過 AI 預解析好 `itemName` / `quantity` / `modelSpec` / `url`，此節點優先使用這些現成欄位：
-
-   ```js
-   // === ShoppingListBot 用 Code 節點 ===
-   // 同時處理 action = "add" / "delete"
-   // Python 端已透過 AI 解析好 itemName / quantity / modelSpec / url
-   // 此節點優先使用這些現成欄位，減少二度 Regex 解析
-
-   const items = $input.all();
-   const out = [];
-   const urlRegex = /https?:\/\/\S+/;
-
-   for (const item of items) {
-     const payload = item.json.body || item.json || {};
-     const action = payload.action || 'add';
-     const senderId = payload.senderId || '';
-     const senderName = payload.senderName || '';
-     const createdAt = payload.createdAt || new Date().toISOString();
-
-     // 決定 URL：優先用 payload.url（Python 端已解析好）
-     let shareText = payload.shareText || payload.fullText || '';
-     let url = payload.url || '';
-     if (!url) {
-       const m = shareText.match(urlRegex);
-       if (m) url = m[0];
-     }
-
-     // 預設平台：淘寶
-     let platform = '淘寶';
-     if (
-       /京东/.test(shareText) ||
-       (url && (url.includes('jd.com') || url.includes('3.cn')))
-     ) {
-       platform = '京東';
-     }
-
-     if (action === 'add') {
-       const quantity = parseInt(payload.quantity, 10) || 1;
-
-       // 優先使用 AI 預解析的 itemName
-       let itemName = payload.itemName || '';
-       if (!itemName) {
-         const titleMatch = shareText.match(/「([^」]+)」/);
-         if (titleMatch) {
-           itemName = titleMatch[1].trim();
-         } else {
-           itemName = shareText;
-         }
-       }
-
-       out.push({
-         json: {
-           action: 'add',
-           platform, itemName,
-           modelSpec: payload.modelSpec || '',
-           url, unitPrice: '',
-           quantity, estimatedPrice: '', actualPrice: '',
-           buyer: senderName, senderId, createdAt,
-         },
-       });
-       continue;
-     }
-
-     if (action === 'delete') {
-       out.push({
-         json: { action: 'delete', platform, url, senderName, senderId, createdAt },
-       });
-       continue;
-     }
-
-     out.push({ json: payload });
-   }
-
-   return out;
-   ```
-
----
-
-### 3. 建立 Switch Node（依 action 分流）
-
-1. 新增節點：`Switch`（命名為 `Switch Action` 以利辨識）。
-2. 將 `Code → Switch Action` 接起來。
-3. 設定：
-
-   * **Value / Property to evaluate**：`{{$json["action"]}}`
-   * **Data Type**：`String`
-   * **Rules**：
-     1. Equals `add`
-     2. Equals `delete`
-
-這樣就能讓後續流程分成兩條路徑：
-
-* Output 0（`add`）→ 寫入 Google Sheet
-* Output 1（`delete`）→ 依 URL + 購買人刪除對應列
-
----
-
-### 4. 建立 Switch Node（依平台分流：Add Flow）
-
-1. 新增節點：`Switch`（建議命名為 `Switch Platform`）。
-2. 將 `Switch Action (0: add)` 接到這個 Switch。
-3. 設定：
-
-   * **Value / Property to evaluate**：
-     點 **Add Expression**，填入：
-
-     ```js
-     {{$json["platform"]}}
-     ```
-
-   * **Data Type**：`String`
-
-   * **Rules**：
-
-     1. Equals `淘寶`
-     2. Equals `京東`
-
-輸出結果：
-
-* Output 0 → 淘寶
-* Output 1 → 京東
-
-之後要擴充其他平台（例如蝦皮），只要在 Code 中增加 `platform` 判斷，並在這個 Switch 中再加 Rule 即可。
-
----
-
-### 5. Google Sheets Nodes（寫入試算表：Add Flow）
-
-#### 5.1 淘寶 Sheet
-
-1. 新增 Google Sheets node（例如命名為 `Append 淘寶`）。
-2. 接在 Switch Output 0：`Switch (0) → Append 淘寶`。
-3. 設定：
-
-   * **Operation**：`Append row`
-   * **Spreadsheet**：選擇剛剛建立的購物清單試算表
-   * **Sheet**：`淘寶`
-   * **Value Input Mode**：User entered 或 RAW 皆可
-   * **Map Each Column Manually**：
-
-     * 預購買商品 → Expression：`{{$json["itemName"]}}`
-     * 商品型號規格 → `{{$json["modelSpec"]}}`
-     * 商品網址 → `{{$json["url"]}}`
-     * 商品價格 → `{{$json["unitPrice"]}}`
-     * 商品數量 → `{{$json["quantity"]}}`
-     * 預估價格 → `{{$json["estimatedPrice"]}}`
-     * 實際價格 → `{{$json["actualPrice"]}}`
-     * 購買人 → `{{$json["buyer"]}}`
-
-> 注意：一定要用「Expression」模式，否則字串 `{{$json["itemName"]}}` 會被直接寫入表格。
-
-#### 5.2 京東 Sheet
-
-1. 複製上一個 node（右鍵 `Append 淘寶` → Duplicate），改名為 `Append 京東`。
-2. 接在 Switch Output 1：`Switch (1) → Append 京東`。
-3. 修改：
-
-   * **Sheet**：改為 `京東`
-   * 其餘 Expression mapping 保持相同
-
----
-
-### 6. 刪除流程：查詢並刪除指定列
-
-1. 新增第二個 `Switch`（命名為 `Switch Platform (delete)`），把 `Switch Action (1: delete)` 接進來，判斷邏輯與 add 流程相同（`platform === 淘寶` / `京東`）。
-2. 針對兩個平台各自放一個 **Google Sheets → Lookup** 節點（在介面裡叫 `Get rows in sheet`）：
-   * **Filters**：`商品網址 = {{$json["url"]}}`、`購買人 = {{$json["senderName"]}}`
-   * **Options → Return First Match**：啟用
-   * 勾選 **Always Output Data**，即便找不到列也會輸出空物件，方便後續判斷。
-3. 在每個 lookup 節點後面加一個 `If`：
-   * 條件：`{{$json["row_number"]}}` **is not empty**
-   * **True** → 代表找到同一個人貼的同一個連結。
-   * **False** → 代表連結不存在或不是同一位購買人，直接回覆 403。
-4. `If (True)` 連到 `Google Sheets → Delete rows or columns`：
-   * **Operation**：`Delete rows`
-   * **Start Index**：`{{$json["row_number"]}}`（Google Sheets node 會自動附帶的欄位）
-5. 刪除節點後方加 `Respond to Webhook`，回傳：
-   ```json
-   { "status": "deleted" }
-   ```
-6. `If (False)` 以及刪除節點拋錯時，改回傳：
-   ```json
-   { "status": "not_owner_or_not_found" }
-   ```
-   並把 **Response Code** 設為 `403`，提醒使用者要由原貼文人刪除。
-
----
-
-### 7. 啟用 Workflow
-
-確認連線為：
+目前的 workflow 共 13 個節點。所有判斷邏輯集中在一個 `Plan` Code 節點，Google Sheets 節點只負責讀寫：
 
 ```text
-Webhook → Code (AI 已預解析) → Switch(action)
-                                     ├─ add → Switch(platform) → Append 淘寶/京東 → Respond {"status":"added"}
-                                     └─ delete → Switch(platform) → Get rows → If row exists?
-                                                                    ├─ delete row → Respond {"status":"deleted"}
-                                                                    └─ Respond 403 {"status":"not_owner_or_not_found"}
+Webhook → Parse Request → Load TB → Load JD → Plan → Switch Target ┬→ Append TB ┐
+                                                                   ├→ Append JD │
+                                                                   ├→ Update TB │
+                                                                   ├→ Update JD ├→ Respond
+                                                                   ├→ Delete TB │
+                                                                   ├→ Delete JD │
+                                                                   └→ (READ) ───┘
 ```
 
-然後在 n8n 右上角將 workflow 切換為 **Active**。
+* **Parse Request**：正規化 webhook payload、判斷平台（淘寶／京東）。
+* **Load TB / Load JD**：一次撈出兩張表的所有列，供全部 action 共用。兩個節點都要開
+  **Always Output Data**（空表也得往下走，不然流程會斷）與 **Execute Once**（避免被上游 items 重複觸發）。
+* **Plan**：唯一有邏輯的地方。依 `action` 決定要回什麼話、要對哪些列做什麼，輸出的每個 item
+  帶一個 `_target`（`TB_APPEND` / `JD_UPDATE` / `TB_DELETE` / `READ`…）。
+* **Switch Target**：照 `_target` 把 item 分流到對應的 Sheets 節點；fallback 輸出 `READ`
+  代表這次只回話、不動表格。
+* **Respond**：所有分支都連到這裡，回應固定取 `$('Plan').first().json._response`，
+  所以不管哪條路線先到，回覆內容都一樣。
+
+更新一列時要注意：`Plan` 會把**沒有要改的欄位填回原值**再送進 Update 節點，
+否則 Google Sheets 會把 mapping 裡的空值寫回去、把原本的資料清掉。
+
+#### 改邏輯的方式 / How to edit the logic
+
+Code 節點的程式碼以 `workflow/` 下的 JS 檔為**唯一真相**，`ShoppingListBot.json` 由 script 生成
+（JSON 裡的程式碼字串既不能 review 也不能測試）：
+
+```bash
+node workflow/test_plan.js     # Plan 的單元測試
+node workflow/test_parse.js    # Parse Request 的單元測試
+python3 workflow/build.py      # 重新生成 ShoppingListBot.json
+```
+
+`build.py` 會沿用現有 JSON 裡的 documentId、sheetName、credentials 與 webhookId，
+所以重新生成不會弄壞你在 n8n 裡設好的憑證；生成後仍需要在 n8n 重新匯入一次。
+
+#### 測試 / Testing
+
+**1. 離線驗證邏輯**（不碰 Google Sheet，也不需要 n8n）：
+
+```bash
+node workflow/mock_n8n.js &                                        # 假 n8n，記憶體模擬兩張表
+python3 workflow/smoke_test.py --url http://localhost:5999/webhook/test
+pkill -f mock_n8n                                                  # 收工
+```
+
+`mock_n8n.js` 跑的是真正的 `parse_request.js` + `plan.js`，只把 Google Sheet 換成記憶體陣列
+（連刪列後 `row_number` 往前遞補都照樣模擬）。`GET` 同一個位址可以看表格內容。
+測不到的是 n8n 節點本身的行為（Sheets 欄位對應、憑證、Switch 分流）。
+
+**2. 對真的 n8n 測**，但寫進測試分頁而不是團員在看的正式分頁：
+
+```bash
+# 在同一份試算表複製出「淘寶TEST」「京東TEST」兩個分頁，記下它們的 gid
+python3 workflow/build.py --out ShoppingListBot.test.json \
+    --tb-gid <淘寶TEST的gid> --jd-gid <京東TEST的gid> \
+    --webhook-path discord-shopping-test
+# 匯入 ShoppingListBot.test.json（獨立 workflow，不會蓋掉正式版）並 Active
+python3 workflow/smoke_test.py --url http://localhost:5678/webhook/discord-shopping-test
+```
+
+測試版會自動拿掉 workflow id、換掉 webhookId、名稱加上 `(TEST)`，所以不會跟正式版衝突。
+`smoke_test.py` 的 URL 不含 `test` 時會擋下來要求 `--yes`，避免手滑寫進正式表。
+
+**3. Discord 端到端**：`ENV_FILE=.env.test python3 bot.py` 可以用另一份設定跑
+（測試頻道 ID ＋ 測試 webhook URL）。`✅` 結單確認流程只有在 Discord 才測得到。
+
+> 舊版架構（Switch Action / Switch Platform / 每個 action 各一組 Get rows）的逐步建置教學
+> 已隨改版移除，需要的話可以在 git 歷史裡找回舊的 `README.md`。
 
 ---
+
+### 3. 啟用 Workflow / Activate
+
+匯入後在 n8n 右上角把 workflow 切成 **Active**，並確認 Webhook 的 Production URL 與 `.env` 的
+`N8N_WEBHOOK_URL` 一致（要是 `/webhook/...`，不是 `/webhook-test/...`）。
+
 
 ## n8n Google Sheets Credential Setup / n8n Google 憑證設定
 

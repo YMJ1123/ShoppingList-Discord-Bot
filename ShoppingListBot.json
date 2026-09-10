@@ -11,8 +11,8 @@
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2.1,
       "position": [
-        -624,
-        80
+        -880,
+        220
       ],
       "id": "1195d652-cc92-4ba0-8562-3046757f9b88",
       "name": "Webhook",
@@ -20,20 +20,19 @@
     },
     {
       "parameters": {
-        "jsCode": "// === ShoppingListBot 用 Code 節點 ===\n// 同時處理 action = \"add\" / \"delete\"\n// Python 端已透過 Gemini AI 解析好 itemName / quantity / modelSpec / url\n// 此節點優先使用這些現成欄位，減少二度 Regex 解析\n\nconst items = $input.all();\nconst out = [];\n\nconst urlRegex = /https?:\\/\\/\\S+/;\n\nfor (const item of items) {\n  // Webhook 來的 JSON 可能在 item.json 或 item.json.body\n  const payload = item.json.body || item.json || {};\n\n  const action = payload.action || 'add';\n  const senderId = payload.senderId || '';\n  const senderName = payload.senderName || '';\n  const createdAt = payload.createdAt || new Date().toISOString();\n\n  // ------------------------------------------------\n  // 決定 URL：優先用 payload.url（Python 端已解析好）\n  // ------------------------------------------------\n  let shareText = payload.shareText || payload.fullText || '';\n  let url = payload.url || '';\n\n  // 如果 payload.url 為空，再嘗試從 shareText 裡抓\n  if (!url) {\n    const m = shareText.match(urlRegex);\n    if (m) {\n      url = m[0];\n    }\n  }\n\n  // 預設平台：淘寶\n  let platform = '淘寶';\n  // 如果文字或網址裡看得到京東關鍵字，就視為京東\n  if (\n    /京东/.test(shareText) ||\n    (url && (url.includes('jd.com') || url.includes('3.cn')))\n  ) {\n    platform = '京東';\n  }\n\n  // ------------------------------------------------\n  // action = \"add\"：新增一筆到清單\n  // ------------------------------------------------\n  if (action === 'add') {\n    const quantity = parseInt(payload.quantity, 10) || 1;\n\n    // 商品名稱：優先使用 Python/Gemini 預解析的 itemName\n    let itemName = payload.itemName || '';\n\n    // 備援：如果 Python 端沒提供 itemName，才用舊的 Regex 邏輯\n    if (!itemName) {\n      const titleMatch = shareText.match(/「([^」]+)」/);\n      if (titleMatch) {\n        itemName = titleMatch[1].trim();\n      } else if (url) {\n        const idx = shareText.indexOf(url);\n        if (idx >= 0) {\n          const afterUrl = shareText.slice(idx + url.length).trim();\n          itemName = afterUrl || shareText;\n        } else {\n          itemName = shareText;\n        }\n      } else {\n        itemName = shareText;\n      }\n    }\n\n    const modelSpec = payload.modelSpec || '';\n    const unitPrice = '';\n    const estimatedPrice = '';\n    const actualPrice = '';\n\n    out.push({\n      json: {\n        action: 'add',\n        platform,        // 淘寶 / 京東\n        itemName,        // 預購買商品\n        modelSpec,       // 商品型號規格\n        url,             // 商品網址\n        unitPrice,       // 商品價格（暫空）\n        quantity,        // 商品數量\n        estimatedPrice,  // 預估價格（暫空）\n        actualPrice,     // 實際價格（暫空）\n        buyer: senderName,\n        senderId,\n        createdAt,\n      },\n    });\n\n    continue;\n  }\n\n  // ------------------------------------------------\n  // action = \"delete\"：刪除指定網址那一筆\n  // ------------------------------------------------\n  if (action === 'delete') {\n    out.push({\n      json: {\n        action: 'delete',\n        platform,\n        url,\n        itemName: (payload.itemName || '').toString().trim(),\n        senderName,\n        senderId,\n        createdAt,\n      },\n    });\n\n    continue;\n  }\n\n  // ------------------------------------------------\n  // 其他未知 action，原樣丟出（方便偵錯）\n  // ------------------------------------------------\n  out.push({ json: payload });\n}\n\nreturn out;\n"
+        "jsCode": "// ============================================================\n//  n8n Code 節點：Parse Request\n//  把 Discord bot 送來的 webhook payload 正規化，並判斷平台。\n//  bot 端已用 LLM 解析好 action / itemName / quantity / 價格，這裡只做整理。\n//\n//  ⚠️ 改完請跑 `python3 workflow/build.py` 重新生成 ShoppingListBot.json。\n// ============================================================\n\nconst text = (v) => (v ?? '').toString().trim();\nconst urlRegex = /https?:\\/\\/\\S+/;\n\nconst out = [];\n\nfor (const item of $input.all()) {\n  // Webhook 來的 JSON 可能在 item.json 或 item.json.body\n  const p = item.json.body || item.json || {};\n\n  const shareText = text(p.shareText || p.fullText);\n\n  let url = text(p.url);\n  if (!url) {\n    const m = shareText.match(urlRegex);\n    if (m) url = m[0];\n  }\n\n  // 平台預設淘寶；文字或網址看得到京東特徵才算京東\n  let platform = '淘寶';\n  if (/京东|京東/.test(shareText) || (url && (url.includes('jd.com') || url.includes('3.cn')))) {\n    platform = '京東';\n  }\n\n  out.push({\n    json: {\n      action: text(p.action || 'add').toLowerCase(),\n      platform,\n      url,\n      itemName: text(p.itemName),\n      modelSpec: text(p.modelSpec),\n      quantity: p.quantity,\n      unitPrice: p.unitPrice,\n      totalPrice: p.totalPrice,\n      batch: text(p.batch),\n      senderId: text(p.senderId),\n      senderName: text(p.senderName),\n      channelId: text(p.channelId),\n      // 日期／時間由 bot 端給，時區才會對（n8n 容器時區不一定是本地）\n      localDate: text(p.localDate),\n      localTime: text(p.localTime),\n      createdAt: p.createdAt || new Date().toISOString(),\n    },\n  });\n}\n\nreturn out;\n"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        -416,
-        80
+        -660,
+        220
       ],
-      "id": "70b879e5-b81b-4168-83ca-c4f90b2ea6eb",
-      "name": "Code"
+      "id": "9601151a-e26e-4e60-b6e7-3ca1353d72e5",
+      "name": "Parse Request"
     },
     {
       "parameters": {
-        "operation": "append",
         "documentId": {
           "__rl": true,
           "value": "1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM",
@@ -48,116 +47,27 @@
           "cachedResultName": "淘寶",
           "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit#gid=927580131"
         },
-        "columns": {
-          "mappingMode": "defineBelow",
-          "value": {
-            "預購買商品": "={{$json[\"itemName\"]}}",
-            "商品型號規格": "={{$json[\"modelSpec\"]}}",
-            "商品網址": "={{$json[\"url\"]}}",
-            "商品價格": "={{$json[\"unitPrice\"]}}",
-            "商品數量": "={{$json[\"quantity\"]}}",
-            "預估價格": "={{$json[\"estimatedPrice\"]}}",
-            "實際價格": "={{$json[\"actualPrice\"]}}",
-            "購買人": "={{$json[\"buyer\"]}}"
-          },
-          "matchingColumns": [],
-          "schema": [
-            {
-              "id": "預購買商品",
-              "displayName": "預購買商品",
-              "required": false,
-              "defaultMatch": false,
-              "display": true,
-              "type": "string",
-              "canBeUsedToMatch": true
-            },
-            {
-              "id": "商品型號規格",
-              "displayName": "商品型號規格",
-              "required": false,
-              "defaultMatch": false,
-              "display": true,
-              "type": "string",
-              "canBeUsedToMatch": true
-            },
-            {
-              "id": "商品網址",
-              "displayName": "商品網址",
-              "required": false,
-              "defaultMatch": false,
-              "display": true,
-              "type": "string",
-              "canBeUsedToMatch": true
-            },
-            {
-              "id": "商品價格",
-              "displayName": "商品價格",
-              "required": false,
-              "defaultMatch": false,
-              "display": true,
-              "type": "string",
-              "canBeUsedToMatch": true
-            },
-            {
-              "id": "商品數量",
-              "displayName": "商品數量",
-              "required": false,
-              "defaultMatch": false,
-              "display": true,
-              "type": "string",
-              "canBeUsedToMatch": true
-            },
-            {
-              "id": "預估價格",
-              "displayName": "預估價格",
-              "required": false,
-              "defaultMatch": false,
-              "display": true,
-              "type": "string",
-              "canBeUsedToMatch": true
-            },
-            {
-              "id": "實際價格",
-              "displayName": "實際價格",
-              "required": false,
-              "defaultMatch": false,
-              "display": true,
-              "type": "string",
-              "canBeUsedToMatch": true
-            },
-            {
-              "id": "購買人",
-              "displayName": "購買人",
-              "required": false,
-              "defaultMatch": false,
-              "display": true,
-              "type": "string",
-              "canBeUsedToMatch": true
-            }
-          ],
-          "attemptToConvertTypes": false,
-          "convertFieldsToString": false
-        },
         "options": {}
       },
       "type": "n8n-nodes-base.googleSheets",
       "typeVersion": 4.7,
       "position": [
-        208,
-        0
+        -440,
+        220
       ],
-      "id": "1b01f356-3130-490d-9648-7dad3650eb4f",
-      "name": "Append row in sheet TB",
+      "id": "9dfb28ec-109f-4277-a3ba-cf6703f71d6f",
+      "name": "Load TB",
       "credentials": {
         "googleSheetsOAuth2Api": {
           "id": "TGwFp295v7gk3RIt",
           "name": "Google Sheets account"
         }
-      }
+      },
+      "alwaysOutputData": true,
+      "executeOnce": true
     },
     {
       "parameters": {
-        "operation": "append",
         "documentId": {
           "__rl": true,
           "value": "1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM",
@@ -172,521 +82,37 @@
           "cachedResultName": "京東",
           "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit#gid=0"
         },
-        "columns": {
-          "mappingMode": "defineBelow",
-          "value": {
-            "預購買商品": "={{$json[\"itemName\"]}}",
-            "商品型號規格": "={{$json[\"modelSpec\"]}}",
-            "商品網址": "={{$json[\"url\"]}}",
-            "商品價格": "={{$json[\"unitPrice\"]}}",
-            "商品數量": "={{$json[\"quantity\"]}}",
-            "預估價格": "={{$json[\"estimatedPrice\"]}}",
-            "實際價格": "={{$json[\"actualPrice\"]}}",
-            "購買人": "={{$json[\"buyer\"]}}"
-          },
-          "matchingColumns": [],
-          "schema": [
-            {
-              "id": "預購買商品",
-              "displayName": "預購買商品",
-              "required": false,
-              "defaultMatch": false,
-              "display": true,
-              "type": "string",
-              "canBeUsedToMatch": true
-            },
-            {
-              "id": "商品型號規格",
-              "displayName": "商品型號規格",
-              "required": false,
-              "defaultMatch": false,
-              "display": true,
-              "type": "string",
-              "canBeUsedToMatch": true
-            },
-            {
-              "id": "商品網址",
-              "displayName": "商品網址",
-              "required": false,
-              "defaultMatch": false,
-              "display": true,
-              "type": "string",
-              "canBeUsedToMatch": true
-            },
-            {
-              "id": "商品價格",
-              "displayName": "商品價格",
-              "required": false,
-              "defaultMatch": false,
-              "display": true,
-              "type": "string",
-              "canBeUsedToMatch": true
-            },
-            {
-              "id": "商品數量",
-              "displayName": "商品數量",
-              "required": false,
-              "defaultMatch": false,
-              "display": true,
-              "type": "string",
-              "canBeUsedToMatch": true
-            },
-            {
-              "id": "預估價格",
-              "displayName": "預估價格",
-              "required": false,
-              "defaultMatch": false,
-              "display": true,
-              "type": "string",
-              "canBeUsedToMatch": true
-            },
-            {
-              "id": "實際價格",
-              "displayName": "實際價格",
-              "required": false,
-              "defaultMatch": false,
-              "display": true,
-              "type": "string",
-              "canBeUsedToMatch": true
-            },
-            {
-              "id": "購買人",
-              "displayName": "購買人",
-              "required": false,
-              "defaultMatch": false,
-              "display": true,
-              "type": "string",
-              "canBeUsedToMatch": true
-            }
-          ],
-          "attemptToConvertTypes": false,
-          "convertFieldsToString": false
-        },
         "options": {}
       },
       "type": "n8n-nodes-base.googleSheets",
       "typeVersion": 4.7,
       "position": [
-        208,
-        160
+        -220,
+        220
       ],
-      "id": "87c41a1d-5570-46e4-a8e3-17e8f283a7c5",
-      "name": "Append row in sheet JD",
+      "id": "eac25a88-f875-4aaa-b229-371c09a56368",
+      "name": "Load JD",
       "credentials": {
         "googleSheetsOAuth2Api": {
           "id": "TGwFp295v7gk3RIt",
           "name": "Google Sheets account"
         }
-      }
+      },
+      "alwaysOutputData": true,
+      "executeOnce": true
     },
     {
       "parameters": {
-        "rules": {
-          "values": [
-            {
-              "conditions": {
-                "options": {
-                  "caseSensitive": true,
-                  "leftValue": "",
-                  "typeValidation": "strict",
-                  "version": 2
-                },
-                "conditions": [
-                  {
-                    "leftValue": "={{$json[\"action\"]}}",
-                    "rightValue": "add",
-                    "operator": {
-                      "type": "string",
-                      "operation": "equals"
-                    },
-                    "id": "cd2247ef-6d34-447c-a60e-37121f2b39e7"
-                  }
-                ],
-                "combinator": "and"
-              }
-            },
-            {
-              "conditions": {
-                "options": {
-                  "caseSensitive": true,
-                  "leftValue": "",
-                  "typeValidation": "strict",
-                  "version": 2
-                },
-                "conditions": [
-                  {
-                    "id": "ab1f3d0e-9a81-47b0-8a8e-73b4f8614db2",
-                    "leftValue": "={{$json[\"action\"]}}",
-                    "rightValue": "delete",
-                    "operator": {
-                      "type": "string",
-                      "operation": "equals",
-                      "name": "filter.operator.equals"
-                    }
-                  }
-                ],
-                "combinator": "and"
-              }
-            }
-          ]
-        },
-        "options": {}
+        "jsCode": "// ============================================================\n//  n8n Code 節點：Plan\n//  購物清單的全部決策邏輯都集中在這裡。\n//\n//  輸入：Parse Request 的請求 + Load TB / Load JD 撈出來的所有列\n//  輸出：每個 item 帶 _target，由 Switch Target 分流到對應的 Sheets 節點\n//        TB_APPEND / JD_APPEND / TB_UPDATE / JD_UPDATE / TB_DELETE / JD_DELETE / READ\n//        每個 item 都帶同一份 _response，Respond 節點固定取 first()。\n//\n//  ⚠️ 這個檔案是唯一真相：改完請跑 `python3 workflow/build.py` 重新生成\n//     ShoppingListBot.json，不要直接編輯 JSON 裡的程式碼。\n// ============================================================\n\nconst STATUS_PENDING = '待下單';\nconst STATUS_ORDERED = '已下單';\n\nconst COL = {\n  item: '預購買商品',\n  spec: '商品型號規格',\n  url: '商品網址',\n  unit: '商品價格',\n  qty: '商品數量',\n  est: '預估價格',\n  actual: '實際價格',\n  buyer: '購買人',\n  status: '狀態',\n  batch: '批次',\n  orderedAt: '下單時間',\n  orderedBy: '下單人',\n};\n\nconst SHEETS = [\n  ['TB', '淘寶'],\n  ['JD', '京東'],\n];\n\nconst text = (v) => (v ?? '').toString().trim();\nconst norm = (v) => text(v).toLowerCase();\nconst num = (v) => {\n  const n = parseFloat(text(v).replace(/[^\\d.-]/g, ''));\n  return Number.isFinite(n) ? n : 0;\n};\nconst money = (n) => (Math.round(n * 100) / 100).toString();\n\n// 舊資料的狀態欄是空的 → 一律視為待下單，既有資料才能無痛接軌\nconst isPending = (r) => {\n  const s = text(r[COL.status]);\n  return s === '' || s === STATUS_PENDING;\n};\n\nconst qtyOf = (r) => {\n  const q = Math.round(num(r[COL.qty]));\n  return q > 0 ? q : 1;\n};\n\nfunction plan(req, rows) {\n  // 只回話、不動表格\n  const reply = (status, message) => [\n    { json: { _target: 'READ', _response: { status, message } } },\n  ];\n\n  // 要寫表格：每個 item 都帶同一份回應，Respond 取哪個都一樣\n  const writes = (list, status, message) =>\n    list.map((w) => ({ json: { ...w, _response: { status, message } } }));\n\n  // 找一列：網址優先，再用商品名稱（完全相同 → 互相包含）\n  const findRow = (scope) => {\n    const url = norm(req.url);\n    if (url) {\n      const hit = scope.find((r) => norm(r[COL.url]) === url);\n      if (hit) return hit;\n    }\n    const q = norm(req.itemName);\n    if (!q) return null;\n    return (\n      scope.find((r) => norm(r[COL.item]) === q) ||\n      scope.find((r) => norm(r[COL.item]).includes(q)) ||\n      scope.find((r) => {\n        const n = norm(r[COL.item]);\n        return n && q.includes(n);\n      }) ||\n      null\n    );\n  };\n\n  // 更新一列時，沒有要改的欄位一定要填回原值，否則 Sheets 會把它清空\n  const carry = (r, changes) => ({\n    _target: r._sheet + '_UPDATE',\n    row_number: r.row_number,\n    [COL.unit]: text(r[COL.unit]),\n    [COL.est]: text(r[COL.est]),\n    [COL.actual]: text(r[COL.actual]),\n    [COL.status]: text(r[COL.status]) || STATUS_PENDING,\n    [COL.batch]: text(r[COL.batch]),\n    [COL.orderedAt]: text(r[COL.orderedAt]),\n    [COL.orderedBy]: text(r[COL.orderedBy]),\n    ...changes,\n  });\n\n  const describe = (r) => {\n    const spec = text(r[COL.spec]);\n    return `${text(r[COL.item])}${spec ? `（${spec}）` : ''} ×${qtyOf(r)} — ${text(r[COL.buyer])}`;\n  };\n\n  // ---------------- add：加進清單 ----------------\n  if (req.action === 'add') {\n    const itemName = text(req.itemName);\n    if (!itemName) return reply('bad_request', '沒有商品名稱，沒辦法加入清單 QQ');\n\n    const qty = qtyOf({ [COL.qty]: req.quantity });\n    const spec = text(req.modelSpec);\n    const row = {\n      _target: req.platform === '京東' ? 'JD_APPEND' : 'TB_APPEND',\n      [COL.item]: itemName,\n      [COL.spec]: spec,\n      [COL.url]: text(req.url),\n      [COL.unit]: '',\n      [COL.qty]: qty,\n      [COL.est]: '',\n      [COL.actual]: '',\n      [COL.buyer]: text(req.senderName),\n      [COL.status]: STATUS_PENDING,\n      [COL.batch]: '',\n      [COL.orderedAt]: '',\n      [COL.orderedBy]: '',\n    };\n\n    const parts = [`${qty} 件`];\n    if (spec) parts.push(spec);\n    parts.push(`「${itemName}」`);\n    return writes([row], 'added', `已把 ${parts.join(' ')} 加入購物清單 🧾`);\n  }\n\n  // ---------------- delete：只能刪自己的、且還沒下單的 ----------------\n  if (req.action === 'delete') {\n    const mine = rows.filter((r) => norm(r[COL.buyer]) === norm(req.senderName));\n\n    const hit = findRow(mine.filter(isPending));\n    if (hit) {\n      return writes(\n        [{ _target: hit._sheet + '_DELETE', row_number: hit.row_number }],\n        'deleted',\n        `已把「${text(hit[COL.item])}」從購物清單刪掉 🗑️`\n      );\n    }\n\n    // 已經下單的不給刪，否則帳會對不起來\n    const ordered = findRow(mine.filter((r) => !isPending(r)));\n    if (ordered) {\n      const b = text(ordered[COL.batch]);\n      return reply(\n        'already_ordered',\n        `「${text(ordered[COL.item])}」已經在批次 ${b || '(未標記)'} 下單了，不能刪掉 🙅\\n` +\n          '要取消請直接跟結單的人說。'\n      );\n    }\n\n    return reply(\n      'not_found',\n      '在你的待下單清單裡找不到這筆商品 🙅\\n（只能刪自己加的，名稱也要對得上喔）'\n    );\n  }\n\n  // ---------------- list：看目前待下單的 ----------------\n  if (req.action === 'list') {\n    const pending = rows.filter(isPending);\n    if (!pending.length) return reply('empty', '目前待下單清單是空的 🧺');\n\n    const lines = [`🧺 待下單清單（共 ${pending.length} 項）`];\n    for (const [sheet, label] of SHEETS) {\n      const g = pending.filter((r) => r._sheet === sheet);\n      if (!g.length) continue;\n      lines.push('', `**${label}**（${g.length} 項）`);\n      for (const r of g) lines.push(`• ${describe(r)}`);\n    }\n    return reply('list', lines.join('\\n'));\n  }\n\n  // ---------------- close：結單，把待下單的整批凍結 ----------------\n  if (req.action === 'close') {\n    const pending = rows.filter(isPending);\n    if (!pending.length) return reply('empty', '目前沒有待下單的商品，不用結單 👌');\n\n    // 批次號 YYYYMMDD-N：日期由 bot 端給（時區才會對），N 是當天第幾批\n    const day = text(req.localDate) || '00000000';\n    let maxSeq = 0;\n    for (const r of rows) {\n      const m = text(r[COL.batch]).match(/^(\\d{8})-(\\d+)$/);\n      if (m && m[1] === day) maxSeq = Math.max(maxSeq, parseInt(m[2], 10));\n    }\n    const batch = `${day}-${maxSeq + 1}`;\n\n    const updates = pending.map((r) =>\n      carry(r, {\n        [COL.status]: STATUS_ORDERED,\n        [COL.batch]: batch,\n        [COL.orderedAt]: text(req.localTime),\n        [COL.orderedBy]: text(req.senderName),\n      })\n    );\n\n    const buyers = [...new Set(pending.map((r) => text(r[COL.buyer])).filter(Boolean))];\n    const lines = [\n      `✅ 結單完成，批次 **${batch}**`,\n      `共 ${pending.length} 項、${buyers.length} 人，由 ${text(req.senderName)} 結單`,\n    ];\n    for (const [sheet, label] of SHEETS) {\n      const g = pending.filter((r) => r._sheet === sheet);\n      if (!g.length) continue;\n      lines.push('', `**${label}**（${g.length} 項）`);\n      for (const r of g) {\n        lines.push(`• ${describe(r)}`);\n        const u = text(r[COL.url]);\n        if (u) lines.push(`  ${u}`);\n      }\n    }\n    lines.push(\n      '',\n      '下單後請回填價格，例如 `價格 電動牙刷 120`（單價）或 `電動牙刷總共 240`，之後打 `分帳` 就能算錢。'\n    );\n    return writes(updates, 'closed', lines.join('\\n'));\n  }\n\n  // ---------------- price：回填實際價格 ----------------\n  if (req.action === 'price') {\n    const unit = num(req.unitPrice);\n    const total = num(req.totalPrice);\n    if (unit <= 0 && total <= 0) {\n      return reply(\n        'bad_price',\n        '我看不出價格是多少 QQ\\n請試試：`價格 電動牙刷 120`（單價）或 `電動牙刷總共 240`。'\n      );\n    }\n\n    // 價格通常是下單後才知道，所以先在已下單的裡面找，找不到再退回待下單\n    const hit =\n      findRow(rows.filter((r) => !isPending(r))) || findRow(rows.filter(isPending));\n    if (!hit) {\n      return reply('not_found', '清單裡找不到這個商品 QQ\\n可以先打 `清單` 看看目前有什麼。');\n    }\n\n    const qty = qtyOf(hit);\n    const unitPrice = unit > 0 ? unit : total / qty;\n    const actual = unit > 0 ? unit * qty : total;\n\n    const update = carry(hit, {\n      [COL.unit]: money(unitPrice),\n      [COL.actual]: money(actual),\n    });\n\n    return writes(\n      [update],\n      'price_updated',\n      `已記錄「${text(hit[COL.item])}」單價 ${money(unitPrice)} × ${qty} = **${money(actual)}**` +\n        `（${text(hit[COL.buyer])}）`\n    );\n  }\n\n  // ---------------- bill：依人分帳 ----------------\n  if (req.action === 'bill') {\n    const ordered = rows.filter((r) => !isPending(r));\n    if (!ordered.length) return reply('empty', '還沒有任何已下單的商品，結單後再來對帳吧 👌');\n\n    const batches = [\n      ...new Set(ordered.map((r) => text(r[COL.batch])).filter(Boolean)),\n    ].sort();\n    const wanted = text(req.batch) || batches[batches.length - 1] || '';\n    const scope = wanted ? ordered.filter((r) => text(r[COL.batch]) === wanted) : ordered;\n\n    if (!scope.length) {\n      return reply(\n        'not_found',\n        `找不到批次 ${wanted} 的紀錄 QQ\\n目前有的批次：${batches.join('、') || '(無)'}`\n      );\n    }\n\n    const byBuyer = new Map();\n    const missing = [];\n    for (const r of scope) {\n      const buyer = text(r[COL.buyer]) || '(未填)';\n      const amount = num(r[COL.actual]);\n      if (amount <= 0) missing.push(`${text(r[COL.item])}（${buyer}）`);\n      byBuyer.set(buyer, (byBuyer.get(buyer) || 0) + amount);\n    }\n\n    const lines = [`💰 批次 **${wanted || '全部'}** 分帳（${scope.length} 項）`, ''];\n    let grand = 0;\n    for (const [buyer, amt] of [...byBuyer].sort((a, b) => b[1] - a[1])) {\n      grand += amt;\n      lines.push(`• **${buyer}**：${money(amt)}`);\n    }\n    lines.push('', `合計：**${money(grand)}**`);\n\n    // 沒填價格的一定要講，不然分帳金額是錯的卻看不出來\n    if (missing.length) {\n      lines.push('', `⚠️ 還有 ${missing.length} 項沒有價格，上面的金額不完整：`);\n      for (const m of missing) lines.push(`• ${m}`);\n      lines.push('補價格請用：`價格 <商品> <金額>`');\n    }\n    return reply('bill', lines.join('\\n'));\n  }\n\n  return reply('unknown_action', `我不知道要做什麼 QQ（action=${text(req.action) || '空'}）`);\n}\n\n// ==== N8N_ENTRY_BELOW ====\n\nfunction loadRows(nodeName, sheet) {\n  let items = [];\n  try {\n    items = $(nodeName).all();\n  } catch (e) {\n    return [];\n  }\n  const seen = new Set();\n  const out = [];\n  for (const it of items) {\n    const r = it.json || {};\n    if (r.row_number === undefined || r.row_number === null || r.row_number === '') continue;\n    if (seen.has(r.row_number)) continue; // executeOnce 的保險：去掉重複列\n    seen.add(r.row_number);\n    out.push({ ...r, _sheet: sheet });\n  }\n  return out;\n}\n\nconst req = $('Parse Request').first().json;\nconst rows = [...loadRows('Load TB', 'TB'), ...loadRows('Load JD', 'JD')];\nreturn plan(req, rows);\n"
       },
-      "type": "n8n-nodes-base.switch",
-      "typeVersion": 3.3,
-      "position": [
-        -208,
-        80
-      ],
-      "id": "0c3279fa-a6d2-479d-b5a3-7e71d986c47d",
-      "name": "Switch Action"
-    },
-    {
-      "parameters": {
-        "rules": {
-          "values": [
-            {
-              "conditions": {
-                "options": {
-                  "caseSensitive": true,
-                  "leftValue": "",
-                  "typeValidation": "strict",
-                  "version": 2
-                },
-                "conditions": [
-                  {
-                    "leftValue": "={{$json[\"platform\"]}}",
-                    "rightValue": "淘寶",
-                    "operator": {
-                      "type": "string",
-                      "operation": "equals"
-                    },
-                    "id": "16633856-70ab-4eec-a667-a8651c6e408b"
-                  }
-                ],
-                "combinator": "and"
-              }
-            },
-            {
-              "conditions": {
-                "options": {
-                  "caseSensitive": true,
-                  "leftValue": "",
-                  "typeValidation": "strict",
-                  "version": 2
-                },
-                "conditions": [
-                  {
-                    "id": "f891a2eb-2ac7-4cfe-afd7-cf2ab322041e",
-                    "leftValue": "={{$json[\"platform\"]}}",
-                    "rightValue": "京東",
-                    "operator": {
-                      "type": "string",
-                      "operation": "equals"
-                    }
-                  }
-                ],
-                "combinator": "and"
-              }
-            }
-          ]
-        },
-        "options": {}
-      },
-      "type": "n8n-nodes-base.switch",
-      "typeVersion": 3.2,
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [
         0,
-        48
+        220
       ],
-      "id": "cdccdae5-f09f-4329-8629-397cab227e69",
-      "name": "Switch Platform"
-    },
-    {
-      "parameters": {
-        "documentId": {
-          "__rl": true,
-          "value": "1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM",
-          "mode": "list",
-          "cachedResultName": "淘寶/京東購物清單",
-          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit?usp=drivesdk"
-        },
-        "sheetName": {
-          "__rl": true,
-          "value": 927580131,
-          "mode": "list",
-          "cachedResultName": "淘寶",
-          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit#gid=927580131"
-        },
-        "filtersUI": {
-          "values": [
-            {
-              "lookupColumn": "購買人",
-              "lookupValue": "={{ $('Code').first().json.senderName }}"
-            }
-          ]
-        },
-        "options": {}
-      },
-      "type": "n8n-nodes-base.googleSheets",
-      "typeVersion": 4.7,
-      "position": [
-        256,
-        336
-      ],
-      "id": "d92f5181-ee6b-4aec-8f0b-12c268750fdb",
-      "name": "Get rows in sheet TB",
-      "alwaysOutputData": true,
-      "credentials": {
-        "googleSheetsOAuth2Api": {
-          "id": "TGwFp295v7gk3RIt",
-          "name": "Google Sheets account"
-        }
-      },
-      "executeOnce": true
-    },
-    {
-      "parameters": {
-        "operation": "delete",
-        "documentId": {
-          "__rl": true,
-          "value": "1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM",
-          "mode": "list",
-          "cachedResultName": "淘寶/京東購物清單",
-          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit?usp=drivesdk"
-        },
-        "sheetName": {
-          "__rl": true,
-          "value": 927580131,
-          "mode": "list",
-          "cachedResultName": "淘寶",
-          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit#gid=927580131"
-        },
-        "startIndex": "={{$json[\"row_number\"]}}"
-      },
-      "type": "n8n-nodes-base.googleSheets",
-      "typeVersion": 4.7,
-      "position": [
-        976,
-        304
-      ],
-      "id": "8d16c765-b37c-4691-9ecf-4be4e8ab64e6",
-      "name": "Delete rows or columns from sheet TB",
-      "credentials": {
-        "googleSheetsOAuth2Api": {
-          "id": "TGwFp295v7gk3RIt",
-          "name": "Google Sheets account"
-        }
-      }
-    },
-    {
-      "parameters": {
-        "documentId": {
-          "__rl": true,
-          "value": "1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM",
-          "mode": "list",
-          "cachedResultName": "淘寶/京東購物清單",
-          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit?usp=drivesdk"
-        },
-        "sheetName": {
-          "__rl": true,
-          "value": "gid=0",
-          "mode": "list",
-          "cachedResultName": "京東",
-          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit#gid=0"
-        },
-        "filtersUI": {
-          "values": [
-            {
-              "lookupColumn": "購買人",
-              "lookupValue": "={{ $('Code').first().json.senderName }}"
-            }
-          ]
-        },
-        "options": {}
-      },
-      "type": "n8n-nodes-base.googleSheets",
-      "typeVersion": 4.7,
-      "position": [
-        256,
-        512
-      ],
-      "id": "0bf7e7b7-397d-4aac-94c7-0922e6f18193",
-      "name": "Get rows in sheet JD",
-      "alwaysOutputData": true,
-      "credentials": {
-        "googleSheetsOAuth2Api": {
-          "id": "TGwFp295v7gk3RIt",
-          "name": "Google Sheets account"
-        }
-      },
-      "executeOnce": true
-    },
-    {
-      "parameters": {
-        "operation": "delete",
-        "documentId": {
-          "__rl": true,
-          "value": "1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM",
-          "mode": "list",
-          "cachedResultName": "淘寶/京東購物清單",
-          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit?usp=drivesdk"
-        },
-        "sheetName": {
-          "__rl": true,
-          "value": "gid=0",
-          "mode": "list",
-          "cachedResultName": "京東",
-          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit#gid=0"
-        },
-        "startIndex": "={{$json[\"row_number\"]}}"
-      },
-      "type": "n8n-nodes-base.googleSheets",
-      "typeVersion": 4.7,
-      "position": [
-        976,
-        464
-      ],
-      "id": "1410c87f-0752-474c-b2ee-ae04d19dacb0",
-      "name": "Delete rows or columns from sheet JD",
-      "credentials": {
-        "googleSheetsOAuth2Api": {
-          "id": "TGwFp295v7gk3RIt",
-          "name": "Google Sheets account"
-        }
-      }
-    },
-    {
-      "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "leftValue": "",
-            "typeValidation": "strict",
-            "version": 2
-          },
-          "conditions": [
-            {
-              "id": "9b54f349-06f0-4ff6-9beb-17ee63c1f5f1",
-              "leftValue": "={{ $json.found }}",
-              "rightValue": "",
-              "operator": {
-                "type": "boolean",
-                "operation": "true",
-                "singleValue": true
-              }
-            }
-          ],
-          "combinator": "and"
-        },
-        "options": {}
-      },
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2.2,
-      "position": [
-        624,
-        416
-      ],
-      "id": "fb89e0bc-b723-45bd-8b78-3d1af454e177",
-      "name": "If"
-    },
-    {
-      "parameters": {
-        "respondWith": "json",
-        "responseBody": "={{ JSON.stringify({status: 'deleted', itemName: $('Find Delete Target').first().json.itemName || ''}) }}",
-        "options": {
-          "responseCode": 200
-        }
-      },
-      "type": "n8n-nodes-base.respondToWebhook",
-      "typeVersion": 1.4,
-      "position": [
-        1152,
-        304
-      ],
-      "id": "45e4cd3d-60cd-47bc-97a9-79d128e44613",
-      "name": "Respond to Webhook1"
-    },
-    {
-      "parameters": {
-        "respondWith": "json",
-        "responseBody": "={{ JSON.stringify({status: 'deleted', itemName: $('Find Delete Target').first().json.itemName || ''}) }}",
-        "options": {
-          "responseCode": 200
-        }
-      },
-      "type": "n8n-nodes-base.respondToWebhook",
-      "typeVersion": 1.4,
-      "position": [
-        1152,
-        464
-      ],
-      "id": "9faa854a-d5ea-47cd-b72f-b5807fb8b46e",
-      "name": "Respond to Webhook"
-    },
-    {
-      "parameters": {
-        "respondWith": "json",
-        "responseBody": "{\"status\":\"not_found\"}\n",
-        "options": {
-          "responseCode": 404
-        }
-      },
-      "type": "n8n-nodes-base.respondToWebhook",
-      "typeVersion": 1.4,
-      "position": [
-        800,
-        544
-      ],
-      "id": "999aab93-cc4f-41c1-8b9d-905f3a312f3e",
-      "name": "Respond(404)"
-    },
-    {
-      "parameters": {
-        "respondWith": "json",
-        "responseBody": "{\"status\":\"added\"}",
-        "options": {
-          "responseCode": 200
-        }
-      },
-      "type": "n8n-nodes-base.respondToWebhook",
-      "typeVersion": 1.4,
-      "position": [
-        384,
-        0
-      ],
-      "id": "5c7190c0-1257-4158-ae13-a594bc5761ba",
-      "name": "Respond (added)"
-    },
-    {
-      "parameters": {
-        "respondWith": "json",
-        "responseBody": "{\"status\":\"added\"}",
-        "options": {
-          "responseCode": 200
-        }
-      },
-      "type": "n8n-nodes-base.respondToWebhook",
-      "typeVersion": 1.4,
-      "position": [
-        384,
-        160
-      ],
-      "id": "d6f3407c-dc80-4e31-bbc8-a2ed573edfa9",
-      "name": "Respond (added)1"
-    },
-    {
-      "parameters": {
-        "jsCode": "// 在使用者自己加入的列中，用網址或商品名稱找出要刪除的那一筆\nconst req = $('Code').first().json;\nconst norm = (s) => (s ?? '').toString().trim().toLowerCase();\n\nconst collect = (nodeName, sheet) => {\n  let items = [];\n  try {\n    items = $(nodeName).all();\n  } catch (e) {\n    return [];\n  }\n  const seen = new Set();\n  const out = [];\n  for (const it of items) {\n    const r = it.json || {};\n    if (r.row_number === undefined || r.row_number === null || r.row_number === '') continue;\n    if (seen.has(r.row_number)) continue; // executeOnce 保險用：去除重複列\n    seen.add(r.row_number);\n    out.push({ ...r, _sheet: sheet });\n  }\n  return out;\n};\n\nconst candidates = [\n  ...collect('Get rows in sheet TB', 'TB'),\n  ...collect('Get rows in sheet JD', 'JD'),\n];\n\nlet match = null;\n\n// 1) 有網址就先用網址精確比對\nconst url = norm(req.url);\nif (url) {\n  match = candidates.find((r) => norm(r['商品網址']) === url) || null;\n}\n\n// 2) 沒中再用商品名稱：先完全相同，再互相包含（模糊比對）\nif (!match && req.itemName) {\n  const q = norm(req.itemName);\n  match =\n    candidates.find((r) => norm(r['預購買商品']) === q) ||\n    candidates.find((r) => norm(r['預購買商品']).includes(q)) ||\n    candidates.find((r) => {\n      const name = norm(r['預購買商品']);\n      return name && q.includes(name);\n    }) ||\n    null;\n}\n\nif (!match) {\n  return [{ json: { found: false } }];\n}\n\nreturn [\n  {\n    json: {\n      found: true,\n      sheet: match._sheet,\n      row_number: match.row_number,\n      itemName: match['預購買商品'] || '',\n    },\n  },\n];\n"
-      },
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        464,
-        416
-      ],
-      "id": "267e288d-b4d6-47a1-b8d4-0791b94ae4a9",
-      "name": "Find Delete Target"
+      "id": "3d95fda7-64e4-431f-8cd8-bebe81b62ab9",
+      "name": "Plan"
     },
     {
       "parameters": {
@@ -702,9 +128,9 @@
                 },
                 "conditions": [
                   {
-                    "id": "8143aa0f-0bdb-4a5f-b96f-a4595e4a3ed4",
-                    "leftValue": "={{ $json[\"sheet\"] }}",
-                    "rightValue": "TB",
+                    "id": "90a28cb7-9a6b-4703-87e4-b240e66fbf57",
+                    "leftValue": "={{ $json._target }}",
+                    "rightValue": "TB_APPEND",
                     "operator": {
                       "type": "string",
                       "operation": "equals"
@@ -712,7 +138,9 @@
                   }
                 ],
                 "combinator": "and"
-              }
+              },
+              "renameOutput": true,
+              "outputKey": "TB_APPEND"
             },
             {
               "conditions": {
@@ -724,9 +152,9 @@
                 },
                 "conditions": [
                   {
-                    "id": "9e68d96a-abd1-432d-996e-83f932cc9698",
-                    "leftValue": "={{ $json[\"sheet\"] }}",
-                    "rightValue": "JD",
+                    "id": "6a9113c9-9d79-4894-81a0-246583dcc044",
+                    "leftValue": "={{ $json._target }}",
+                    "rightValue": "JD_APPEND",
                     "operator": {
                       "type": "string",
                       "operation": "equals"
@@ -734,20 +162,876 @@
                   }
                 ],
                 "combinator": "and"
-              }
+              },
+              "renameOutput": true,
+              "outputKey": "JD_APPEND"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "4de22751-be55-4007-9060-3f3a17ed1b6c",
+                    "leftValue": "={{ $json._target }}",
+                    "rightValue": "TB_UPDATE",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "TB_UPDATE"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "61a7ce3f-1447-4f10-a0c0-526f8d37e456",
+                    "leftValue": "={{ $json._target }}",
+                    "rightValue": "JD_UPDATE",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "JD_UPDATE"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "b13e586f-f8a5-430b-aacd-25f7d6851156",
+                    "leftValue": "={{ $json._target }}",
+                    "rightValue": "TB_DELETE",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "TB_DELETE"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "6e56fd7a-773f-416c-9e42-ad853f856cd4",
+                    "leftValue": "={{ $json._target }}",
+                    "rightValue": "JD_DELETE",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "JD_DELETE"
             }
           ]
         },
-        "options": {}
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "READ"
+        }
       },
       "type": "n8n-nodes-base.switch",
       "typeVersion": 3.2,
       "position": [
-        800,
-        384
+        220,
+        220
       ],
-      "id": "f8383c0d-9ddc-48e2-ac8e-fcf6c186ce7d",
-      "name": "Switch Sheet"
+      "id": "41d0bd63-7209-4c2e-96cc-420c2eb5cfec",
+      "name": "Switch Target"
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM",
+          "mode": "list",
+          "cachedResultName": "淘寶/京東購物清單",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 927580131,
+          "mode": "list",
+          "cachedResultName": "淘寶",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit#gid=927580131"
+        },
+        "operation": "append",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "預購買商品": "={{ $json[\"預購買商品\"] }}",
+            "商品型號規格": "={{ $json[\"商品型號規格\"] }}",
+            "商品網址": "={{ $json[\"商品網址\"] }}",
+            "商品價格": "={{ $json[\"商品價格\"] }}",
+            "商品數量": "={{ $json[\"商品數量\"] }}",
+            "預估價格": "={{ $json[\"預估價格\"] }}",
+            "實際價格": "={{ $json[\"實際價格\"] }}",
+            "購買人": "={{ $json[\"購買人\"] }}",
+            "狀態": "={{ $json[\"狀態\"] }}",
+            "批次": "={{ $json[\"批次\"] }}",
+            "下單時間": "={{ $json[\"下單時間\"] }}",
+            "下單人": "={{ $json[\"下單人\"] }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "預購買商品",
+              "displayName": "預購買商品",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "商品型號規格",
+              "displayName": "商品型號規格",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "商品網址",
+              "displayName": "商品網址",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "商品價格",
+              "displayName": "商品價格",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "商品數量",
+              "displayName": "商品數量",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "預估價格",
+              "displayName": "預估價格",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "實際價格",
+              "displayName": "實際價格",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "購買人",
+              "displayName": "購買人",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "狀態",
+              "displayName": "狀態",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "批次",
+              "displayName": "批次",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "下單時間",
+              "displayName": "下單時間",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "下單人",
+              "displayName": "下單人",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        460,
+        -140
+      ],
+      "id": "eb649211-9005-4542-8cf5-6d9eb1fdb607",
+      "name": "Append TB",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "TGwFp295v7gk3RIt",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM",
+          "mode": "list",
+          "cachedResultName": "淘寶/京東購物清單",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "京東",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit#gid=0"
+        },
+        "operation": "append",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "預購買商品": "={{ $json[\"預購買商品\"] }}",
+            "商品型號規格": "={{ $json[\"商品型號規格\"] }}",
+            "商品網址": "={{ $json[\"商品網址\"] }}",
+            "商品價格": "={{ $json[\"商品價格\"] }}",
+            "商品數量": "={{ $json[\"商品數量\"] }}",
+            "預估價格": "={{ $json[\"預估價格\"] }}",
+            "實際價格": "={{ $json[\"實際價格\"] }}",
+            "購買人": "={{ $json[\"購買人\"] }}",
+            "狀態": "={{ $json[\"狀態\"] }}",
+            "批次": "={{ $json[\"批次\"] }}",
+            "下單時間": "={{ $json[\"下單時間\"] }}",
+            "下單人": "={{ $json[\"下單人\"] }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "預購買商品",
+              "displayName": "預購買商品",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "商品型號規格",
+              "displayName": "商品型號規格",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "商品網址",
+              "displayName": "商品網址",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "商品價格",
+              "displayName": "商品價格",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "商品數量",
+              "displayName": "商品數量",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "預估價格",
+              "displayName": "預估價格",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "實際價格",
+              "displayName": "實際價格",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "購買人",
+              "displayName": "購買人",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "狀態",
+              "displayName": "狀態",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "批次",
+              "displayName": "批次",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "下單時間",
+              "displayName": "下單時間",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "下單人",
+              "displayName": "下單人",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        460,
+        -20
+      ],
+      "id": "3184f6f1-f999-4ea8-bb87-2eed0e6dbca9",
+      "name": "Append JD",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "TGwFp295v7gk3RIt",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM",
+          "mode": "list",
+          "cachedResultName": "淘寶/京東購物清單",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 927580131,
+          "mode": "list",
+          "cachedResultName": "淘寶",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit#gid=927580131"
+        },
+        "operation": "update",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "row_number": "={{ $json.row_number }}",
+            "商品價格": "={{ $json[\"商品價格\"] }}",
+            "預估價格": "={{ $json[\"預估價格\"] }}",
+            "實際價格": "={{ $json[\"實際價格\"] }}",
+            "狀態": "={{ $json[\"狀態\"] }}",
+            "批次": "={{ $json[\"批次\"] }}",
+            "下單時間": "={{ $json[\"下單時間\"] }}",
+            "下單人": "={{ $json[\"下單人\"] }}"
+          },
+          "matchingColumns": [
+            "row_number"
+          ],
+          "schema": [
+            {
+              "id": "row_number",
+              "displayName": "row_number",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "預購買商品",
+              "displayName": "預購買商品",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "商品型號規格",
+              "displayName": "商品型號規格",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "商品網址",
+              "displayName": "商品網址",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "商品價格",
+              "displayName": "商品價格",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "商品數量",
+              "displayName": "商品數量",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "預估價格",
+              "displayName": "預估價格",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "實際價格",
+              "displayName": "實際價格",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "購買人",
+              "displayName": "購買人",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "狀態",
+              "displayName": "狀態",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "批次",
+              "displayName": "批次",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "下單時間",
+              "displayName": "下單時間",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "下單人",
+              "displayName": "下單人",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        460,
+        100
+      ],
+      "id": "2a28a506-a688-4144-ac55-0113968b2852",
+      "name": "Update TB",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "TGwFp295v7gk3RIt",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM",
+          "mode": "list",
+          "cachedResultName": "淘寶/京東購物清單",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "京東",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit#gid=0"
+        },
+        "operation": "update",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "row_number": "={{ $json.row_number }}",
+            "商品價格": "={{ $json[\"商品價格\"] }}",
+            "預估價格": "={{ $json[\"預估價格\"] }}",
+            "實際價格": "={{ $json[\"實際價格\"] }}",
+            "狀態": "={{ $json[\"狀態\"] }}",
+            "批次": "={{ $json[\"批次\"] }}",
+            "下單時間": "={{ $json[\"下單時間\"] }}",
+            "下單人": "={{ $json[\"下單人\"] }}"
+          },
+          "matchingColumns": [
+            "row_number"
+          ],
+          "schema": [
+            {
+              "id": "row_number",
+              "displayName": "row_number",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "預購買商品",
+              "displayName": "預購買商品",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "商品型號規格",
+              "displayName": "商品型號規格",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "商品網址",
+              "displayName": "商品網址",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "商品價格",
+              "displayName": "商品價格",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "商品數量",
+              "displayName": "商品數量",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "預估價格",
+              "displayName": "預估價格",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "實際價格",
+              "displayName": "實際價格",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "購買人",
+              "displayName": "購買人",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "狀態",
+              "displayName": "狀態",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "批次",
+              "displayName": "批次",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "下單時間",
+              "displayName": "下單時間",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "下單人",
+              "displayName": "下單人",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        460,
+        220
+      ],
+      "id": "e579b8a3-2ead-41e7-97dd-390f34ddb8c8",
+      "name": "Update JD",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "TGwFp295v7gk3RIt",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM",
+          "mode": "list",
+          "cachedResultName": "淘寶/京東購物清單",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 927580131,
+          "mode": "list",
+          "cachedResultName": "淘寶",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit#gid=927580131"
+        },
+        "operation": "delete",
+        "startIndex": "={{ $json.row_number }}"
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        460,
+        340
+      ],
+      "id": "64a0d99c-2e2d-4904-b8ef-0ef566d50084",
+      "name": "Delete TB",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "TGwFp295v7gk3RIt",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM",
+          "mode": "list",
+          "cachedResultName": "淘寶/京東購物清單",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "京東",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit#gid=0"
+        },
+        "operation": "delete",
+        "startIndex": "={{ $json.row_number }}"
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        460,
+        460
+      ],
+      "id": "31c07496-ec55-438b-b410-bdac5041431b",
+      "name": "Delete JD",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "TGwFp295v7gk3RIt",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($('Plan').first().json._response) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        720,
+        220
+      ],
+      "id": "372183ca-ab74-4627-9f59-ccaae6232dd9",
+      "name": "Respond"
     }
   ],
   "pinData": {},
@@ -756,167 +1040,170 @@
       "main": [
         [
           {
-            "node": "Code",
+            "node": "Parse Request",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Code": {
+    "Parse Request": {
       "main": [
         [
           {
-            "node": "Switch Action",
+            "node": "Load TB",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Switch Action": {
+    "Load TB": {
       "main": [
         [
           {
-            "node": "Switch Platform",
+            "node": "Load JD",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load JD": {
+      "main": [
+        [
+          {
+            "node": "Plan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan": {
+      "main": [
+        [
+          {
+            "node": "Switch Target",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch Target": {
+      "main": [
+        [
+          {
+            "node": "Append TB",
             "type": "main",
             "index": 0
           }
         ],
         [
           {
-            "node": "Get rows in sheet TB",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Switch Platform": {
-      "main": [
-        [
-          {
-            "node": "Append row in sheet TB",
+            "node": "Append JD",
             "type": "main",
             "index": 0
           }
         ],
         [
           {
-            "node": "Append row in sheet JD",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Get rows in sheet TB": {
-      "main": [
-        [
-          {
-            "node": "Get rows in sheet JD",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Get rows in sheet JD": {
-      "main": [
-        [
-          {
-            "node": "Find Delete Target",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "If": {
-      "main": [
-        [
-          {
-            "node": "Switch Sheet",
+            "node": "Update TB",
             "type": "main",
             "index": 0
           }
         ],
         [
           {
-            "node": "Respond(404)",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Delete rows or columns from sheet TB": {
-      "main": [
-        [
-          {
-            "node": "Respond to Webhook1",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Delete rows or columns from sheet JD": {
-      "main": [
-        [
-          {
-            "node": "Respond to Webhook",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Append row in sheet TB": {
-      "main": [
-        [
-          {
-            "node": "Respond (added)",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Append row in sheet JD": {
-      "main": [
-        [
-          {
-            "node": "Respond (added)1",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Find Delete Target": {
-      "main": [
-        [
-          {
-            "node": "If",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Switch Sheet": {
-      "main": [
-        [
-          {
-            "node": "Delete rows or columns from sheet TB",
+            "node": "Update JD",
             "type": "main",
             "index": 0
           }
         ],
         [
           {
-            "node": "Delete rows or columns from sheet JD",
+            "node": "Delete TB",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Delete JD",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append TB": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append JD": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update TB": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update JD": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete TB": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete JD": {
+      "main": [
+        [
+          {
+            "node": "Respond",
             "type": "main",
             "index": 0
           }
@@ -928,11 +1215,11 @@
   "settings": {
     "executionOrder": "v1"
   },
-  "versionId": "89954763-9985-4691-8049-b8a55e5ed1e9",
+  "versionId": "f8128c05-0ce4-4cd6-8478-4e3e35ca0eec",
   "meta": {
     "templateCredsSetupCompleted": true,
     "instanceId": "447b28fc540fbb52c629a13ba71be9946705860cbc08a149e0f9d0b24f2d2015"
   },
-  "id": "w0j4snoLqb4IuF5a",
-  "tags": []
+  "tags": [],
+  "id": "w0j4snoLqb4IuF5a"
 }

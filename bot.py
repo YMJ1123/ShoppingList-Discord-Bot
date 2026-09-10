@@ -72,7 +72,9 @@ groq_client = AsyncOpenAI(
     base_url="https://api.groq.com/openai/v1",
     api_key=GROQ_API_KEY,
 )
-GROQ_MODEL = "llama-3.3-70b-versatile"
+# Llama 3.3 70B 已於 2026-08-16 對免費／Developer 方案下線（打了會回 404）。
+# 官方替代：openai/gpt-oss-120b（正式版）或 qwen/qwen3.6-27b（預覽，中文較強）
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_MAX_RETRIES = 3
 
 SYSTEM_PROMPT = (

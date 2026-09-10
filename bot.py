@@ -129,7 +129,14 @@ async def parse_with_llm(message_content: str) -> dict | None:
                 ],
                 response_format={"type": "json_object"},
                 temperature=0.1,
-                max_tokens=512,
+                # gpt-oss 是 reasoning model，會先產生推理 token 再輸出 JSON。
+                # 上限太小的話推理就把額度用完，JSON 還沒生成完 Groq 就回
+                # 400 json_validate_failed（512 遇到長分享文必炸，實測要 ~700）。
+                # 上限只是安全網，不影響實際用量。
+                max_tokens=2048,
+                # 刻意不設 reasoning_effort="low"：省 6 成 token，但遇到網址緊貼
+                # 中文的長分享文會抽不出商品名（實測 3 次有 2 次回空字串），
+                # 品質比那點額度重要。
             )
             raw_text = response.choices[0].message.content.strip()
             parsed = json.loads(raw_text)

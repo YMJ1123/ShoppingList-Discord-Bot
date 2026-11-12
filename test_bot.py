@@ -3,7 +3,14 @@
 
     python3 test_bot.py
 """
+import asyncio
 import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import aiohttp
+import requests
 
 import bot
 
@@ -96,5 +103,104 @@ for label, text, should_match in [
     ("閒聊不該命中", "今天天氣真好", False),
 ]:
     check(label, bool(bot.DELETE_INTENT_RE.search(text)), should_match)
+
+# ============================================================
+# 2026-10-01 15:34：n8n 的 Sheets 節點寫了 10.8 秒，舊的 8 秒逾時就誤報「新增失敗」，
+# 但那筆其實已經寫進表格。15:35 重送時 DNS 剛好解析失敗，safe_react 沒接住就整個中斷。
+print("\nsafe_react：網路錯誤不能讓整個訊息處理中斷")
+
+
+class FakeMessage:
+    def __init__(self, exc):
+        self.exc = exc
+
+    async def add_reaction(self, emoji):
+        raise self.exc
+
+    async def remove_reaction(self, emoji, user):
+        raise self.exc
+
+
+def run_safe_react(exc, remove=False):
+    try:
+        asyncio.run(bot.safe_react(FakeMessage(exc), "⏳", remove=remove))
+    except Exception as e:
+        return e
+    return None
+
+
+check(
+    "加反應遇到 DNS 解析失敗 → 不丟例外",
+    run_safe_react(aiohttp.ClientConnectionError("Temporary failure in name resolution")),
+    None,
+)
+check("加反應遇到等待逾時 → 不丟例外", run_safe_react(asyncio.TimeoutError()), None)
+check("移除反應遇到網路錯誤 → 不丟例外", run_safe_react(aiohttp.ClientConnectionError("x"), remove=True), None)
+
+print("\nn8n 逾時：慢不等於失敗")
+
+
+class SlowN8n(BaseHTTPRequestHandler):
+    delay = 0.0
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("content-length", 0)))
+        time.sleep(self.delay)
+        body = b'{"status":"added"}'
+        try:
+            self.send_response(200)
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except OSError:
+            pass
+
+    def log_message(self, *args):
+        pass
+
+
+def post_to_slow_n8n(delay: float):
+    SlowN8n.delay = delay
+    try:
+        return asyncio.run(bot.post_to_n8n({"action": "add"}))
+    except requests.exceptions.RequestException as e:
+        return e
+
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), SlowN8n)
+server.daemon_threads = True
+threading.Thread(target=server.serve_forever, daemon=True).start()
+prod_url, prod_timeout = bot.N8N_WEBHOOK_URL, bot.N8N_READ_TIMEOUT
+bot.N8N_WEBHOOK_URL = f"http://127.0.0.1:{server.server_port}/"
+bot.N8N_READ_TIMEOUT = 1
+try:
+    slow_ok = post_to_slow_n8n(0.4)
+    check("慢但在時限內 → 照常拿到 200", getattr(slow_ok, "status_code", slow_ok), 200)
+
+    timed_out = post_to_slow_n8n(2.0)
+    check("超過時限 → ReadTimeout", type(timed_out).__name__, "ReadTimeout")
+    msg = bot.n8n_failure_reply("新增", "寫進表格", timed_out)
+    check("新增逾時 → 告知請求已送出、可能已寫入", "可能已經寫進表格" in msg, True)
+    check("逾時訊息帶的秒數 = 實際設定值", "超過 1 秒" in msg, True)
+finally:
+    bot.N8N_WEBHOOK_URL, bot.N8N_READ_TIMEOUT = prod_url, prod_timeout
+    server.shutdown()
+
+check("正式的讀取逾時比實測最慢的 10.8 秒寬鬆", bot.N8N_READ_TIMEOUT > 10.8, True)
+check(
+    "刪除逾時 → 講的是「可能已經刪掉」",
+    "可能已經從表格刪掉" in bot.n8n_failure_reply("刪除", "從表格刪掉", requests.exceptions.ReadTimeout()),
+    True,
+)
+check(
+    "連不上 n8n → 維持原本的訊息",
+    bot.n8n_failure_reply("新增", "寫進表格", requests.exceptions.ConnectionError()),
+    "新增時我撞牆了 QQ 請幫我看一下 log",
+)
+check(
+    "連線逾時（請求根本沒送出）→ 不能說「可能已經」",
+    "可能已經" in bot.n8n_failure_reply("新增", "寫進表格", requests.exceptions.ConnectTimeout()),
+    False,
+)
 
 print(f"\n全部 {PASSED} 項測試通過 ✓\n")

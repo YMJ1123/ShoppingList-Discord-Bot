@@ -73,11 +73,25 @@ def safe_quantity(value) -> int:
     return qty if qty > 0 else 1
 
 
+# n8n 要等 Google Sheets 寫完才回應，實測單次 4.5~10.8 秒
+N8N_READ_TIMEOUT = 30
+
+
 async def post_to_n8n(payload: dict):
     """在 thread 裡送 webhook，避免卡住 Discord 的 event loop。"""
     return await asyncio.to_thread(
-        requests.post, N8N_WEBHOOK_URL, json=payload, timeout=8
+        requests.post, N8N_WEBHOOK_URL, json=payload, timeout=(5, N8N_READ_TIMEOUT)
     )
+
+
+def n8n_failure_reply(verb: str, done: str, err: Exception) -> str:
+    """讀取逾時不等於失敗：請求已送達 n8n，Sheets 通常還是會寫完。"""
+    if isinstance(err, requests.exceptions.ReadTimeout):
+        return (
+            f"{verb}請求已送出，但 n8n 超過 {N8N_READ_TIMEOUT} 秒沒回應 ⏱️\n"
+            f"這筆**可能已經{done}**，請先看一下清單，沒有再重送一次。"
+        )
+    return f"{verb}時我撞牆了 QQ 請幫我看一下 log"
 
 # -------------------------------------------------
 #  初始化 Groq（OpenAI 相容 API）
@@ -184,13 +198,13 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 
 async def safe_react(message: discord.Message, emoji: str, remove: bool = False):
-    """加/移除反應失敗（例如缺權限）時不要讓整個訊息處理中斷。"""
+    """加/移除反應失敗（缺權限、網路暫時不通…）時不要讓整個訊息處理中斷。"""
     try:
         if remove:
             await message.remove_reaction(emoji, bot.user)
         else:
             await message.add_reaction(emoji)
-    except discord.HTTPException as e:
+    except Exception as e:
         print(f"[WARN] 無法{'移除' if remove else '加上'}反應 {emoji}: {e}")
 
 
@@ -230,7 +244,7 @@ async def send_delete(message: discord.Message, url: str, item_name: str, full_t
             await message.reply("刪除請求傳到 n8n 失敗 QQ")
     except Exception as e:
         print("Error sending delete to n8n:", e)
-        await message.reply("刪除時我撞牆了 QQ 請幫我看一下 log")
+        await message.reply(n8n_failure_reply("刪除", "從表格刪掉", e))
 
 
 @bot.event
@@ -378,7 +392,7 @@ async def on_message(message: discord.Message):
     except Exception as e:
         print("Error sending add to n8n:", e)
         await safe_react(message, "⏳", remove=True)
-        await message.reply("新增時我撞牆了 QQ 請幫我看一下 log")
+        await message.reply(n8n_failure_reply("新增", "寫進表格", e))
 
     await bot.process_commands(message)
 

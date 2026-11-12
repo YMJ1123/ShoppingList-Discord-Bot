@@ -328,7 +328,9 @@ def render(state: dict, final: bool, mentions: dict | None = None) -> str:
         lines += item_lines(owner)
 
     if UNCLASSIFIED in t["twd"]:
-        lines += ["", f"❓ **{UNCLASSIFIED}　TWD {t['twd'][UNCLASSIFIED]:,}**（¥{t['cny'][UNCLASSIFIED]:.2f}）沒對到登記的人"]
+        if lines[-1]:
+            lines.append("")
+        lines += [f"❓ **{UNCLASSIFIED}　TWD {t['twd'][UNCLASSIFIED]:,}**（¥{t['cny'][UNCLASSIFIED]:.2f}）沒對到登記的人"]
         lines += item_lines(UNCLASSIFIED)
         if final:
             lines.append("　→ 是你的就回覆 `認領 編號`；幫別人認領用 `認領 編號 @某人`")
@@ -340,8 +342,8 @@ def render(state: dict, final: bool, mentions: dict | None = None) -> str:
         lines += ["", "⚠️ 請確認："] + [f"　{x}" for x in notes]
 
     if not final:
-        who_confirms = f"{payer} 或 {poster}" if poster else "下單人"
-        lines += ["", f"{who_confirms} 按 ✅ 確認並寫入表格，按 ❌ 取消（10 分鐘內有效）"]
+        who_confirms = f"{payer} 或 {poster} " if poster else "下單人"
+        lines += ["", f"{who_confirms}按 ✅ 確認並寫入表格，按 ❌ 取消（10 分鐘內有效）"]
     return "\n".join(lines)
 
 

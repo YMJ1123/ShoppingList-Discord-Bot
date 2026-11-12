@@ -217,6 +217,12 @@ check("代傳：正式版請大家轉給下單人，不是代傳的人",
       settle.render(proxy, final=True, mentions={"ymj1123": "<@1>"}).split("\n")[0], "🧾 **結算 20261112-1510**｜請轉帳給 <@1>（amy 代傳）")
 check("代傳：下單人自己的份仍標不用轉", "**<@1>　TWD 1,876**（¥352.33）（下單人自己的，不用轉）" in settle.render(proxy, final=True, mentions={"ymj1123": "<@1>"}), True)
 check("沒有代傳時不顯示", "代傳" in settle.render(state, final=False), False)
+check("沒有代傳時寫「下單人按 ✅」", settle.render(state, final=False).split("\n")[-1], "下單人按 ✅ 確認並寫入表格，按 ❌ 取消（10 分鐘內有效）")
+nobody = copy.deepcopy(state)
+for u in nobody["units"]:
+    for it in u["items"]:
+        it["shares"] = [{"owner": UNCLASSIFIED, "cny": it["line"]}]
+check("全部沒對到人時不會出現連續空行", any("\n\n\n" in settle.render(nobody, final=f) for f in (True, False)), False)
 check("正式版有 🏁 說明", "　→ ymj1123 按 🏁 結束認領，到時還沒人認領的算 ymj1123 自己的" in final, True)
 check("代傳時兩個人都能按 🏁", "　→ ymj1123 或 amy 按 🏁 結束認領" in settle.render(proxy, final=True), True)
 check("草稿沒有 🏁 說明", "🏁" in settle.render(state, final=False), False)

@@ -282,6 +282,12 @@ class SettleError(Exception):
     """可以直接回給使用者看的錯誤。"""
 
 
+def named_user(message: discord.Message):
+    """內文裡 @ 的第一個真人。回覆別人時 Discord 會把對方也放進 mentions，所以要以內文為準。"""
+    people = {u.id: u for u in message.mentions if not u.bot}
+    return next((people[i] for i in message.raw_mentions if i in people), None)
+
+
 def load_settlements():
     if STATE_DIR and (Path(STATE_DIR) / "settlements.json").exists():
         SETTLEMENTS.update(json.loads((Path(STATE_DIR) / "settlements.json").read_text(encoding="utf-8")))
@@ -357,7 +363,7 @@ async def market_rate() -> float | None:
         return None
 
 
-async def build_settlement(message: discord.Message, images: list) -> tuple[dict, list[dict]]:
+async def build_settlement(message: discord.Message, images: list, payer) -> tuple[dict, list[dict]]:
     shots = []
     for i, att in enumerate(images, 1):
         if att.size > MAX_IMAGE_BYTES:
@@ -382,8 +388,9 @@ async def build_settlement(message: discord.Message, images: list) -> tuple[dict
     writes, more = settle.assign(units, rows, payload, await match_rows(payload))
     state = {
         "batch": datetime.now().strftime("%Y%m%d-%H%M%S"),
-        "payer": message.author.name,
-        "payer_id": message.author.id,
+        "payer": payer.name,
+        "payer_id": payer.id,
+        "poster": "" if payer.id == message.author.id else message.author.name,
         "channel_id": message.channel.id,
         "units": units,
         "notes": notes + more,
@@ -428,9 +435,10 @@ async def handle_settle(message: discord.Message):
         await message.reply("要結算的話，請把下單截圖和「結算」放在同一則訊息裡傳上來 🧾")
         return
 
+    payer = named_user(message) or message.author  # 「結算 @B」＝幫 B 結算，大家要轉帳給 B
     await safe_react(message, "⏳")
     try:
-        state, writes = await build_settlement(message, images)
+        state, writes = await build_settlement(message, images, payer)
     except SettleError as e:
         await message.reply(str(e))
         return
@@ -445,15 +453,15 @@ async def handle_settle(message: discord.Message):
     await safe_react(prompt, "✅")
     await safe_react(prompt, "❌")
 
-    def by_payer(reaction, user):
+    def can_confirm(reaction, user):
         return (
             reaction.message.id == prompt.id
-            and user.id == message.author.id
+            and user.id in (message.author.id, payer.id)
             and str(reaction.emoji) in ("✅", "❌")
         )
 
     try:
-        reaction, _ = await bot.wait_for("reaction_add", timeout=SETTLE_CONFIRM_SECONDS, check=by_payer)
+        reaction, _ = await bot.wait_for("reaction_add", timeout=SETTLE_CONFIRM_SECONDS, check=can_confirm)
     except asyncio.TimeoutError:
         await prompt.reply("⌛ 太久沒有確認，這次結算已取消，表格沒有變動。")
         return
@@ -502,7 +510,7 @@ async def handle_claim(message: discord.Message, no: int):
         await message.reply(f"找不到還沒人認領的 #{no} 🙅\n要認領的話，請直接回覆在那則結算訊息底下。")
         return
 
-    target = next((u for u in message.mentions if not u.bot), message.author)
+    target = named_user(message) or message.author
     error = settle.claim(state, no, target.name)
     if error:
         await message.reply(error)

@@ -5,6 +5,7 @@
 """
 import asyncio
 import itertools
+import re
 import sys
 import tempfile
 import threading
@@ -238,6 +239,7 @@ class FakeMsg:
     def __init__(self, author, channel, text="", attachments=(), mentions=(), reference=None, kw=None, record=False):
         self.id, self.author, self.channel, self.content = next(_ids), author, channel, text
         self.attachments, self.mentions, self.reference, self.guild, self.kw = list(attachments), list(mentions), reference, None, kw or {}
+        self.raw_mentions = [int(i) for i in re.findall(r"<@!?(\d+)>", text)]
         if record:
             SENT.append(self)
 
@@ -273,7 +275,7 @@ SHOT = {"items": [{"name": "小米風扇", "spec": "白色", "qty": 1, "price": 
 SHEET = [{"tab": "淘寶", "row": 2, "name": "小米風扇落地扇", "spec": "白色", "url": "", "qty": 1, "buyer": "bob"}]
 
 
-def run_settle(emoji="✅", settle_status=200, attachments=None, timeout=False):
+def run_settle(emoji="✅", settle_status=200, attachments=None, timeout=False, text="結算", mentions=(), confirmer=None):
     """跑一次 handle_settle，回傳 (n8n 收到的請求, bot 送出的訊息)。"""
     SENT.clear()
     bot.SETTLEMENTS.clear()
@@ -299,13 +301,13 @@ def run_settle(emoji="✅", settle_status=200, attachments=None, timeout=False):
         if timeout_flag:
             raise asyncio.TimeoutError()
         reaction = SimpleNamespace(message=SENT[-1], emoji=emoji)
-        seen["other_user_ok"] = check(reaction, BOB)
-        seen["payer_ok"] = check(reaction, AMY)
-        return reaction, AMY
+        seen.update({u.name: check(reaction, u) for u in (AMY, BOB, CAROL)})
+        seen["other_user_ok"], seen["payer_ok"] = seen["bob"], seen["amy"]
+        return reaction, confirmer or AMY
 
     timeout_flag = timeout
     bot.read_screenshot, bot.post_to_n8n, bot.match_rows, bot.market_rate, bot.bot.wait_for = fake_read, fake_n8n, fake_match, fake_rate, fake_wait
-    msg = FakeMsg(AMY, FakeChannel(), "結算", attachments=[FakeAtt()] if attachments is None else attachments)
+    msg = FakeMsg(AMY, FakeChannel(), text, mentions=mentions, attachments=[FakeAtt()] if attachments is None else attachments)
     asyncio.run(bot.handle_settle(msg))
     return calls, list(SENT), seen
 
@@ -345,8 +347,30 @@ check("被認領走的不能再認領", run_claim(BOB, "認領 2", reply_to=fina
 check("已經對到人的商品不能認領", run_claim(CAROL, "認領 1", reply_to=final_id), "#1 已經算在 bob 名下了")
 
 calls, sent, _ = run_settle("✅")
-out = run_claim(AMY, "認領 2 @bob", mentions=[BOT_USER, BOB], reply_to=sent[-1].id)
+out = run_claim(AMY, "認領 2 <@200>", mentions=[BOT_USER, BOB], reply_to=sent[-1].id)
 check("可以幫別人認領（略過被回覆的 bot 本身）", bot.settle.totals(next(iter(bot.SETTLEMENTS.values())))["twd"], {"bob": 990})
+
+calls, sent, _ = run_settle("✅")
+out = run_claim(CAROL, "認領 2", mentions=[BOB], reply_to=sent[-1].id)
+check("回覆 bob 的訊息打「認領 2」→ 算給自己，不是被回覆的 bob", bot.settle.totals(next(iter(bot.SETTLEMENTS.values())))["twd"], {"bob": 495, "carol": 495})
+
+print("\n幫別人結算：「結算 @B」")
+calls, sent, seen = run_settle("✅", text="結算 <@300>", mentions=[CAROL], confirmer=CAROL)
+final = sent[-1].content
+check("下單人和代傳的人都能確認，其他人不行", (seen["amy"], seen["carol"], seen["bob"]), (True, True, False))
+check("草稿標出代傳", sent[0].content.split("\n")[0], "🧾 **結算草稿**｜下單人 carol（amy 代傳）")
+check("正式結果請大家轉給 carol", final.split("\n")[0], f"🧾 **結算 {calls[1][0]['batch']}**｜請轉帳給 <@300>（amy 代傳）")
+check("代傳的人不會被當成下單人", "不用轉" in final, False)
+state = next(iter(bot.SETTLEMENTS.values()))
+check("結算紀錄裡的下單人是 carol", (state["payer"], state["payer_id"], state["poster"]), ("carol", 300, "amy"))
+
+calls, sent, seen = run_settle("✅", text="結算 <@200>", mentions=[BOB])
+check("被幫忙的人自己有買 → 他那份標不用轉", "**<@200>　TWD 495**（¥100.00）（下單人自己的，不用轉）" in sent[-1].content, True)
+
+calls, sent, seen = run_settle("✅", text="結算", mentions=[CAROL])
+check("沒在內文 @ 人（例如回覆別人時被帶進來的）→ 維持傳圖的人", (sent[0].content.split("\n")[0], seen["carol"]), ("🧾 **結算草稿**｜下單人 amy", False))
+calls, sent, seen = run_settle("✅", text="結算 <@1>", mentions=[BOT_USER])
+check("@ 的是 bot → 不算", sent[0].content.split("\n")[0], "🧾 **結算草稿**｜下單人 amy")
 
 print("\n結算：不寫入的情況")
 calls, sent, _ = run_settle("❌")

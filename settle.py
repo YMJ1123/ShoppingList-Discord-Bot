@@ -280,7 +280,10 @@ def render(state: dict, final: bool, mentions: dict | None = None) -> str:
     who = lambda name: mentions.get(name, name)
 
     n = len(state["units"])
+    poster = state.get("poster") or ""
     head = f"🧾 **結算 {state['batch']}**｜請轉帳給 {who(payer)}" if final else f"🧾 **結算草稿**｜下單人 {payer}"
+    if poster:
+        head += f"（{poster} 代傳）"
     paid = f"{n} 筆訂單，實付合計" if n > 1 else "實付"
     lines = [head, f"{paid} **TWD {t['total_twd']:,}**｜商品合計 ¥{t['total_cny']:.2f}｜1 CNY ≈ {t['rate']:.3f} TWD", ""]
 
@@ -315,7 +318,8 @@ def render(state: dict, final: bool, mentions: dict | None = None) -> str:
         lines += ["", "⚠️ 請確認："] + [f"　{x}" for x in notes]
 
     if not final:
-        lines += ["", "下單人按 ✅ 確認並寫入表格，按 ❌ 取消（10 分鐘內有效）"]
+        who_confirms = f"{payer} 或 {poster}" if poster else "下單人"
+        lines += ["", f"{who_confirms} 按 ✅ 確認並寫入表格，按 ❌ 取消（10 分鐘內有效）"]
     return "\n".join(lines)
 
 

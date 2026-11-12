@@ -191,6 +191,14 @@ check("正式版 @ 應付的人", "**<@2>　TWD 821**" in final, True)
 check("下單人自己的份標明不用轉", "**<@1>　TWD 1,876**（¥352.33）（下單人自己的，不用轉）" in final, True)
 check("unclassified 有認領說明", "回覆 `認領 編號`" in final, True)
 check("unclassified 的商品附上大約台幣", "#1 轻奢钛架男士高清防蓝光眼镜 ×1　¥284.66 ≈ TWD 1,515\n" in final, True)
+proxy = dict(state, poster="amy")
+check("代傳：草稿標出代傳的人，兩個人都能確認",
+      settle.render(proxy, final=False).split("\n")[0] + " / " + settle.render(proxy, final=False).split("\n")[-1],
+      "🧾 **結算草稿**｜下單人 ymj1123（amy 代傳） / ymj1123 或 amy 按 ✅ 確認並寫入表格，按 ❌ 取消（10 分鐘內有效）")
+check("代傳：正式版請大家轉給下單人，不是代傳的人",
+      settle.render(proxy, final=True, mentions={"ymj1123": "<@1>"}).split("\n")[0], "🧾 **結算 20261112-1510**｜請轉帳給 <@1>（amy 代傳）")
+check("代傳：下單人自己的份仍標不用轉", "**<@1>　TWD 1,876**（¥352.33）（下單人自己的，不用轉）" in settle.render(proxy, final=True, mentions={"ymj1123": "<@1>"}), True)
+check("沒有代傳時不顯示", "代傳" in settle.render(state, final=False), False)
 check("認領後的簡表", settle.render_totals(state), "chezz1025　TWD 821\nwakaru_0216　TWD 328\nymj1123　TWD 1,876\n❓ 還沒人認領　TWD 1,515（#1）")
 
 print("\nsplit_message")

@@ -216,6 +216,7 @@ check("「結算」開頭才觸發", [bool(bot.SETTLE_RE.match(t)) for t in ("�
 check("認領抓得到編號", [bot.CLAIM_RE.match(t).group(2) for t in ("認領 3", "認領#12", "认领 7 @人")], ["3", "12", "7"])
 check("不是認領開頭不觸發", bot.CLAIM_RE.match("我想認領 3"), None)
 
+bot.STATE_DIR = None  # 測試不可以寫到正式的結算紀錄（容器裡 STATE_DIR 有設）
 _ids = itertools.count(1000)
 SENT = []  # bot 送出的每則訊息
 

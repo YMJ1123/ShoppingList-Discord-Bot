@@ -174,6 +174,24 @@ check("已經有主的不能再認領", settle.claim(state, 2, "erictw13")[:9], 
 check("對到表格的商品不能被認領", settle.claim(state, 4, "erictw13")[:5], "#4 已經")
 check("沒有這個編號", settle.claim(state, 99, "erictw13"), "這次結算沒有 #99 這個商品")
 
+print("\nclose：結束認領")
+closing = copy.deepcopy(state)   # 此時 #2 已被 wakaru_0216 認領，#1 還沒人領
+check("結束前還有沒人領的", settle.has_unclassified(closing), True)
+check("回傳被算給下單人的編號", settle.close(closing), [1])
+t = settle.totals(closing)
+check("沒人領的算給下單人，總額不變", (t["twd"].get(UNCLASSIFIED), t["twd"]["ymj1123"], sum(t["twd"].values())), (None, 1876 + 1515, 4540))
+check("其他人的金額不變", (t["twd"]["chezz1025"], t["twd"]["wakaru_0216"]), (821, 328))
+check("結束後沒有沒人領的", settle.has_unclassified(closing), False)
+check("結束後不能再認領", settle.claim(closing, 1, "erictw13"), "結算 20261112-1510 已經結束認領了，有問題請直接找下單的人")
+check("最終訊息", settle.render_closed(closing, {"ymj1123": "<@1>", "chezz1025": "<@2>"}),
+      "🏁 **結算 20261112-1510 結束認領**｜請轉帳給 <@1>\n\n**<@2>　TWD 821**\n**wakaru_0216　TWD 328**\n\n下單人自己的 TWD 3,391 不用轉，含沒人認領的 #1")
+nothing_left = copy.deepcopy(closing); nothing_left["leftover"] = []
+check("沒有剩下的就不寫「含沒人認領」", settle.render_closed(nothing_left).split("\n")[-1], "下單人自己的 TWD 3,391 不用轉")
+solo = {"batch": "B", "payer": "p", "units": [{"order_no": "", "total_twd": 50, "cny": 10.0, "rate": 5.0, "items": [
+    {"no": 1, "name": "n", "qty": 1, "line": 10.0, "shares": [{"owner": UNCLASSIFIED, "cny": 10.0}]}]}]}
+settle.close(solo)
+check("全部都是下單人自己的", settle.render_closed(solo), "🏁 **結算 B 結束認領**｜請轉帳給 p\n\n沒有人需要轉帳。\n\n下單人自己的 TWD 50 不用轉，含沒人認領的 #1")
+
 print("\nrate_notes：回算匯率檢查")
 check("比市場匯率高 8% → 提醒可能漏截圖", [n[:28] for n in settle.rate_notes(state["units"], 4.93)], ["TWD 4,540 這筆付款的回算匯率 5.323 比今"])
 check("和市場匯率差不多 → 不提醒", settle.rate_notes(multi["units"], 4.93), [])
@@ -199,6 +217,9 @@ check("代傳：正式版請大家轉給下單人，不是代傳的人",
       settle.render(proxy, final=True, mentions={"ymj1123": "<@1>"}).split("\n")[0], "🧾 **結算 20261112-1510**｜請轉帳給 <@1>（amy 代傳）")
 check("代傳：下單人自己的份仍標不用轉", "**<@1>　TWD 1,876**（¥352.33）（下單人自己的，不用轉）" in settle.render(proxy, final=True, mentions={"ymj1123": "<@1>"}), True)
 check("沒有代傳時不顯示", "代傳" in settle.render(state, final=False), False)
+check("正式版有 🏁 說明", "　→ ymj1123 按 🏁 結束認領，到時還沒人認領的算 ymj1123 自己的" in final, True)
+check("代傳時兩個人都能按 🏁", "　→ ymj1123 或 amy 按 🏁 結束認領" in settle.render(proxy, final=True), True)
+check("草稿沒有 🏁 說明", "🏁" in settle.render(state, final=False), False)
 check("認領後的簡表", settle.render_totals(state), "chezz1025　TWD 821\nwakaru_0216　TWD 328\nymj1123　TWD 1,876\n❓ 還沒人認領　TWD 1,515（#1）")
 
 print("\nsplit_message")

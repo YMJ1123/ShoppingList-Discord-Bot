@@ -240,6 +240,7 @@ class FakeMsg:
         self.id, self.author, self.channel, self.content = next(_ids), author, channel, text
         self.attachments, self.mentions, self.reference, self.guild, self.kw = list(attachments), list(mentions), reference, None, kw or {}
         self.raw_mentions = [int(i) for i in re.findall(r"<@!?(\d+)>", text)]
+        self.reactions = []
         if record:
             SENT.append(self)
 
@@ -247,7 +248,7 @@ class FakeMsg:
         return FakeMsg(BOT_USER, self.channel, text=text, kw=kw, record=True)
 
     async def add_reaction(self, emoji):
-        pass
+        self.reactions.append(emoji)
 
     async def remove_reaction(self, emoji, user):
         pass
@@ -275,14 +276,15 @@ SHOT = {"items": [{"name": "小米風扇", "spec": "白色", "qty": 1, "price": 
 SHEET = [{"tab": "淘寶", "row": 2, "name": "小米風扇落地扇", "spec": "白色", "url": "", "qty": 1, "buyer": "bob"}]
 
 
-def run_settle(emoji="✅", settle_status=200, attachments=None, timeout=False, text="結算", mentions=(), confirmer=None):
+def run_settle(emoji="✅", settle_status=200, attachments=None, timeout=False, text="結算", mentions=(), confirmer=None, shot=None):
     """跑一次 handle_settle，回傳 (n8n 收到的請求, bot 送出的訊息)。"""
     SENT.clear()
     bot.SETTLEMENTS.clear()
     calls, seen = [], {}
 
     async def fake_read(data, mime):
-        return bot.settle.clean_shot({"items": [dict(i, paid_price=i["price"]) for i in SHOT["items"]], "total_twd": SHOT["total_twd"]})
+        src = shot or SHOT
+        return bot.settle.clean_shot({"items": [dict(i, paid_price=i["price"]) for i in src["items"]], "total_twd": src["total_twd"]})
 
     async def fake_n8n(payload, url=None):
         calls.append((payload, url))
@@ -341,7 +343,7 @@ def run_claim(author, text, channel=None, mentions=(), reply_to=None):
 
 check("別的頻道認領不到", run_claim(CAROL, "認領 2", channel=FakeChannel(2))[:14], "找不到還沒人認領的 #2 🙅")
 out = run_claim(CAROL, "認領 2")
-check("認領後回覆更新的金額", out, f"#2 神秘商品 算在 <@300> 名下 ✅\n\n**結算 {batch} 更新後：**\nbob　TWD 495\n<@300>　TWD 495")
+check("認領後回覆更新的金額", out, f"#2 神秘商品 算在 <@300> 名下 ✅\n\n**結算 {batch} 更新後：**\nbob　TWD 495\n<@300>　TWD 495\n\n全部都有人認領了，amy 按 🏁 公布最終金額並通知大家")
 check("認領後算在認領的人名下", (bot.settle.totals(state)["twd"], "算在 <@300> 名下" in out), ({"bob": 495, "carol": 495}, True))
 check("被認領走的不能再認領", run_claim(BOB, "認領 2", reply_to=final_id), "#2 已經算在 carol 名下了")
 check("已經對到人的商品不能認領", run_claim(CAROL, "認領 1", reply_to=final_id), "#1 已經算在 bob 名下了")
@@ -371,6 +373,66 @@ calls, sent, seen = run_settle("✅", text="結算", mentions=[CAROL])
 check("沒在內文 @ 人（例如回覆別人時被帶進來的）→ 維持傳圖的人", (sent[0].content.split("\n")[0], seen["carol"]), ("🧾 **結算草稿**｜下單人 amy", False))
 calls, sent, seen = run_settle("✅", text="結算 <@1>", mentions=[BOT_USER])
 check("@ 的是 bot → 不算", sent[0].content.split("\n")[0], "🧾 **結算草稿**｜下單人 amy")
+
+print("\n🏁 結束認領")
+
+
+def press(emoji, user, message_id):
+    """模擬有人在某則訊息上按反應，回傳 bot 因此送出的訊息。"""
+    SENT.clear()
+    bot.bot.get_channel = lambda cid: FakeChannel(cid)
+    asyncio.run(bot.on_raw_reaction_add(SimpleNamespace(emoji=emoji, user_id=user.id, message_id=message_id, channel_id=1)))
+    return list(SENT)
+
+
+calls, sent, _ = run_settle("✅")
+final_id, batch = sent[-1].id, calls[1][0]["batch"]
+state = bot.SETTLEMENTS[batch]
+check("有沒人認領的商品 → 正式結果上有 🏁", sent[-1].reactions, ["🏁"])
+check("草稿上沒有 🏁", "🏁" in sent[0].reactions, False)
+check("別人按 🏁 → 沒反應", (press("🏁", BOB, final_id), state.get("closed")), ([], None))
+check("下單人按別的表情 → 沒反應", (press("👍", AMY, final_id), state.get("closed")), ([], None))
+check("在不相干的訊息按 🏁 → 沒反應", (press("🏁", AMY, 424242), state.get("closed")), ([], None))
+out = press("🏁", AMY, final_id)
+check("下單人按 🏁 → 公布最終金額", [m.content for m in out],
+      [f"🏁 **結算 {batch} 結束認領**｜請轉帳給 <@100>\n\n**bob　TWD 495**\n\n下單人自己的 TWD 495 不用轉，含沒人認領的 #2"])
+check("回覆在被按的那則訊息底下，而且只 ping 人", (out[0].kw["reference"].message_id, out[0].kw["allowed_mentions"].to_dict()["parse"]), (final_id, ["users"]))
+check("沒人領的算給下單人，總額不變", bot.settle.totals(state)["twd"], {"bob": 495, "amy": 495})
+check("再按一次不會重發", press("🏁", AMY, final_id), [])
+check("結束後回覆那則訊息認領 → 拒絕", run_claim(CAROL, "認領 2", reply_to=final_id), f"結算 {batch} 已經結束認領了，有問題請直接找下單的人")
+check("結束後不回覆直接認領 → 找不到", run_claim(CAROL, "認領 2")[:14], "找不到還沒人認領的 #2 🙅")
+
+calls, sent, _ = run_settle("✅")
+batch = calls[1][0]["batch"]
+run_claim(CAROL, "認領 2")
+claim_reply = SENT[-1]
+check("認領的回覆上也有 🏁，而且記進這次結算", (claim_reply.reactions, claim_reply.id in bot.SETTLEMENTS[batch]["message_ids"]), (["🏁"], True))
+out = press("🏁", AMY, claim_reply.id)
+check("全部認領完，在認領回覆上按 🏁 → 公布並 ping 每個要付錢的人", out[0].content,
+      f"🏁 **結算 {batch} 結束認領**｜請轉帳給 <@100>\n\n**bob　TWD 495**\n**<@300>　TWD 495**")
+
+calls, sent, _ = run_settle("✅", shot={"items": [{"name": "小米風扇", "spec": "白色", "qty": 1, "price": 100.0}], "total_twd": 495})
+check("全部都對到人 → 不放 🏁", sent[-1].reactions, [])
+
+calls, sent, _ = run_settle("✅", text="結算 <@300>", mentions=[CAROL], confirmer=CAROL)
+out = press("🏁", AMY, sent[-1].id)
+lines = out[0].content.split("\n") if out else ["（沒有送出任何訊息）"]
+check("代傳：代傳的人也能按 🏁，剩下的算給被幫忙的人", (lines[0], lines[-1]),
+      (f"🏁 **結算 {calls[1][0]['batch']} 結束認領**｜請轉帳給 <@300>", "下單人自己的 TWD 495 不用轉，含沒人認領的 #2"))
+
+with tempfile.TemporaryDirectory() as d:
+    bot.STATE_DIR = d
+    calls, sent, _ = run_settle("✅")
+    final_id, batch = sent[-1].id, calls[1][0]["batch"]
+    bot.SETTLEMENTS.clear()
+    bot.load_settlements()
+    bot.SETTLEMENTS[batch].pop("poster_id")           # 舊版存的紀錄沒有這個欄位
+    check("重啟後、舊紀錄：別人按還是沒反應", press("🏁", CAROL, final_id), [])
+    check("重啟後、舊紀錄：下單人按 🏁 照樣有效", len(press("🏁", AMY, final_id)), 1)
+    bot.SETTLEMENTS.clear()
+    bot.load_settlements()
+    check("結束狀態有存檔，重啟後不會被重開", (bot.SETTLEMENTS[batch]["closed"], press("🏁", AMY, final_id)), (True, []))
+    bot.STATE_DIR = None
 
 print("\n結算：不寫入的情況")
 calls, sent, _ = run_settle("❌")

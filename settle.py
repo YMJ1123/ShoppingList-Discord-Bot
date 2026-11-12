@@ -237,6 +237,8 @@ def is_unclassified(item: dict) -> bool:
 
 def claim(state: dict, no: int, owner: str) -> str:
     """把 unclassified 的商品歸給 owner。成功回空字串，失敗回原因。"""
+    if state.get("closed"):
+        return f"結算 {state['batch']} 已經結束認領了，有問題請直接找下單的人"
     _, item = find_item(state, no)
     if item is None:
         return f"這次結算沒有 #{no} 這個商品"
@@ -245,6 +247,24 @@ def claim(state: dict, no: int, owner: str) -> str:
     item["shares"] = [{"owner": owner, "cny": item["line"]}]
     item["hint"] = ""
     return ""
+
+
+def has_unclassified(state: dict) -> bool:
+    return any(is_unclassified(it) for u in state["units"] for it in u["items"])
+
+
+def close(state: dict) -> list[int]:
+    """結束認領：還沒人認領的全部算給下單人（可能是幫家人買的）。回傳被算給下單人的編號。"""
+    leftover = []
+    for unit in state["units"]:
+        for it in unit["items"]:
+            if is_unclassified(it):
+                it["shares"] = [{"owner": state["payer"], "cny": it["line"]}]
+                it["hint"] = ""
+                leftover.append(it["no"])
+    state["closed"] = True
+    state["leftover"] = leftover
+    return leftover
 
 
 # ---------------------------------------------------------------- 訊息
@@ -312,6 +332,8 @@ def render(state: dict, final: bool, mentions: dict | None = None) -> str:
         lines += item_lines(UNCLASSIFIED)
         if final:
             lines.append("　→ 是你的就回覆 `認領 編號`；幫別人認領用 `認領 編號 @某人`")
+            closer = f"{payer} 或 {poster}" if poster else payer
+            lines.append(f"　→ {closer} 按 🏁 結束認領，到時還沒人認領的算 {payer} 自己的")
 
     notes = list(state.get("notes") or []) + rate_notes(state["units"], state.get("market_rate"))
     if notes:
@@ -320,6 +342,22 @@ def render(state: dict, final: bool, mentions: dict | None = None) -> str:
     if not final:
         who_confirms = f"{payer} 或 {poster}" if poster else "下單人"
         lines += ["", f"{who_confirms} 按 ✅ 確認並寫入表格，按 ❌ 取消（10 分鐘內有效）"]
+    return "\n".join(lines)
+
+
+def render_closed(state: dict, mentions: dict | None = None) -> str:
+    """結束認領後的最終金額。只列要轉帳的人，下單人自己的另外寫一行。"""
+    mentions = mentions or {}
+    t = totals(state)
+    payer = state["payer"]
+    who = lambda name: mentions.get(name, name)
+    lines = [f"🏁 **結算 {state['batch']} 結束認領**｜請轉帳給 {who(payer)}", ""]
+    owe = sorted(o for o in t["twd"] if o != payer)
+    lines += [f"**{who(o)}　TWD {t['twd'][o]:,}**" for o in owe] or ["沒有人需要轉帳。"]
+    left = state.get("leftover") or []
+    if payer in t["twd"]:
+        note = f"，含沒人認領的 {'、'.join(f'#{n}' for n in left)}" if left else ""
+        lines += ["", f"下單人自己的 TWD {t['twd'][payer]:,} 不用轉{note}"]
     return "\n".join(lines)
 
 

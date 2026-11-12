@@ -271,6 +271,7 @@ async def send_delete(message: discord.Message, url: str, item_name: str, full_t
 SETTLE_RE = re.compile(r"^(結算|结算)")
 CLAIM_RE = re.compile(r"^(認領|认领)\s*#?\s*(\d+)")
 SETTLE_CONFIRM_SECONDS = 600
+CLOSE_EMOJI = "🏁"
 MAX_IMAGES = 10
 MAX_IMAGE_BYTES = 3_000_000  # Groq 的 base64 圖片上限是 4MB，編碼後會膨脹三分之一
 MATCH_CHUNK = 6  # 一次請 LLM 比對幾個商品；太多會超過每分鐘的 token 額度
@@ -391,6 +392,7 @@ async def build_settlement(message: discord.Message, images: list, payer) -> tup
         "payer": payer.name,
         "payer_id": payer.id,
         "poster": "" if payer.id == message.author.id else message.author.name,
+        "poster_id": message.author.id,
         "channel_id": message.channel.id,
         "units": units,
         "notes": notes + more,
@@ -494,6 +496,8 @@ async def handle_settle(message: discord.Message):
     state["message_ids"] = [m.id for m in sent]
     SETTLEMENTS[state["batch"]] = state
     save_settlements()
+    if settle.has_unclassified(state):
+        await safe_react(sent[-1], CLOSE_EMOJI)
 
 
 async def handle_claim(message: discord.Message, no: int):
@@ -517,13 +521,43 @@ async def handle_claim(message: discord.Message, no: int):
         return
 
     state["mentions"][target.name] = target.mention
-    save_settlements()
     _, item = settle.find_item(state, no)
-    await message.reply(
+    tail = (
+        f"{state['payer']} 按 🏁 可以結束認領，剩下的算 {state['payer']} 自己的"
+        if settle.has_unclassified(state)
+        else f"全部都有人認領了，{state['payer']} 按 🏁 公布最終金額並通知大家"
+    )
+    reply = await message.reply(
         f"#{no} {item['name']} 算在 {target.mention} 名下 ✅\n\n"
-        f"**結算 {state['batch']} 更新後：**\n{settle.render_totals(state, state['mentions'])}",
+        f"**結算 {state['batch']} 更新後：**\n{settle.render_totals(state, state['mentions'])}\n\n{tail}",
         allowed_mentions=discord.AllowedMentions(users=[target]),
     )
+    state["message_ids"].append(reply.id)  # 回覆這則也能找到同一次結算，在這則按 🏁 也有效
+    save_settlements()
+    await safe_react(reply, CLOSE_EMOJI)
+
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    """下單人在結算訊息上按 🏁 → 結束認領。用 raw 事件，bot 重啟後、訊息不在快取裡也收得到。"""
+    if str(payload.emoji) != CLOSE_EMOJI or (bot.user and payload.user_id == bot.user.id):
+        return
+    state = next((s for s in SETTLEMENTS.values() if payload.message_id in s["message_ids"]), None)
+    if state is None or state.get("closed"):
+        return
+    if payload.user_id not in (state["payer_id"], state.get("poster_id", state["payer_id"])):
+        return
+
+    settle.close(state)
+    save_settlements()
+    try:
+        channel = bot.get_channel(payload.channel_id) or await bot.fetch_channel(payload.channel_id)
+        ref = discord.MessageReference(message_id=payload.message_id, channel_id=payload.channel_id, fail_if_not_exists=False)
+        allowed = discord.AllowedMentions(everyone=False, roles=False, users=True)
+        for i, chunk in enumerate(settle.split_message(settle.render_closed(state, state["mentions"]))):
+            await channel.send(chunk, reference=ref if i == 0 else None, allowed_mentions=allowed)
+    except Exception as e:
+        print(f"[ERROR] 結算 {state['batch']} 已結束認領，但公布訊息送不出去:", repr(e))
 
 
 @bot.event

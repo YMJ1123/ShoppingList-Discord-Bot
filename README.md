@@ -27,6 +27,9 @@ A Discord bot that uses **AI-powered natural language processing (Groq / Llama 3
   - 將 **淘寶訂單寫入 Sheet「淘寶」**、**京東訂單寫入 Sheet「京東」**
 - 支援 `~刪除` 指令：貼上商品連結或原分享文字，bot 會依第一個 URL 尋找並刪除對應的清單紀錄
 - 429 rate limit 自動重試機制（最多 3 次）
+- **結算**：下單的人把淘寶 App 截圖和「結算」一起傳上來，bot 讀出品項和價格、對到清單上的登記人、
+  用「實付台幣 ÷ 商品人民幣合計」回算匯率，算出每個人應付的台幣；對不到人的商品列為 unclassified 讓人 `認領`。
+  詳見 [USAGE.md](USAGE.md) 的「結算」一節
 
 ---
 
@@ -86,6 +89,16 @@ GROQ_API_KEY=gsk_your_groq_api_key
 
   * 到 [console.groq.com](https://console.groq.com) 註冊後，在 API Keys 頁面建立
   * 免費方案：每分鐘 1,000 請求、每日約 14,000 請求，不需信用卡
+
+以下都是選填：
+
+| 變數 | 預設 | 用途 |
+|------|------|------|
+| `GROQ_MODEL` | `openai/gpt-oss-120b` | 解析訊息、結算時比對商品用的文字模型 |
+| `VISION_MODEL` | `qwen/qwen3.8-27b` | 結算時讀截圖用的視覺模型 |
+| `VISION_BASE_URL` / `VISION_API_KEY` | （用 Groq） | 改用其他 OpenAI 相容的服務讀截圖，例如本地 Ollama：`http://host:11434/v1` |
+| `N8N_SETTLE_WEBHOOK_URL` | `N8N_WEBHOOK_URL` 加上 `-settle` | 結算用 workflow 的 webhook |
+| `STATE_DIR` | （不存檔） | 存結算紀錄的資料夾。有設的話 bot 重啟後還能 `認領` |
 
 ### 2. 安裝相依套件
 
@@ -162,6 +175,30 @@ Discord Bot (AI 解析) → n8n Webhook → Code → Switch(platform)
    * 在 Google 憑證處選用你建立好的 Credential（或依下文建立）。
 
 如果你想了解每一個節點在做什麼，以下是手動建立的詳細說明。
+
+### 結算用的 workflow：`ShoppingListSettle.json`
+
+結算功能用另一個獨立的 workflow（webhook path：`discord-shopping-settle`），不會動到上面新增／刪除的流程。
+它用同一組 Google Sheets 憑證直接呼叫 Sheets API：
+
+```text
+Webhook → Read Sheets（讀兩個分頁）→ Plan（Code）→ 需要寫入？ → Write Sheets → Respond
+```
+
+- `{"action":"list"}`：回傳兩個分頁裡「結算批次」還是空白的列。
+- `{"action":"settle","batch":…,"rows":[…]}`：先檢查每一列的商品名、購買人都沒變、也還沒結算過，
+  全部通過才一次寫入「實際價格」和「結算批次」；有任何一列不對就回 409、什麼都不寫。
+- 表格沒有「結算批次」欄的話，第一次結算時會自動加在最右邊。
+
+`Plan` 節點的程式在 `workflow/settle_plan.js`，改完用 `python3 workflow/build_settle.py` 重新產生 JSON
+（spreadsheet ID 和憑證 ID 寫在 `build_settle.py` 裡，換表格要改那裡）。匯入與發布：
+
+```bash
+n8n import:workflow --input=ShoppingListSettle.json
+n8n publish:workflow --id=SLsettle20261112   # 發布後要重啟 n8n 才會生效
+```
+
+測試：`python3 test_bot.py`、`python3 test_settle.py`、`node workflow/test_settle_plan.js`。
 
 ---
 

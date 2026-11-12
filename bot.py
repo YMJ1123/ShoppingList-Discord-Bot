@@ -1,12 +1,18 @@
 import os
 import re
 import json
+import base64
 import asyncio
+from datetime import datetime
+from pathlib import Path
+
 import requests
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 from openai import AsyncOpenAI, RateLimitError
+
+import settle
 
 # -------------------------------------------------
 #  載入環境變數 (.env)
@@ -77,10 +83,10 @@ def safe_quantity(value) -> int:
 N8N_READ_TIMEOUT = 30
 
 
-async def post_to_n8n(payload: dict):
+async def post_to_n8n(payload: dict, url: str | None = None):
     """在 thread 裡送 webhook，避免卡住 Discord 的 event loop。"""
     return await asyncio.to_thread(
-        requests.post, N8N_WEBHOOK_URL, json=payload, timeout=(5, N8N_READ_TIMEOUT)
+        requests.post, url or N8N_WEBHOOK_URL, json=payload, timeout=(5, N8N_READ_TIMEOUT)
     )
 
 
@@ -104,6 +110,18 @@ groq_client = AsyncOpenAI(
 # 官方替代：openai/gpt-oss-120b（正式版）或 qwen/qwen3.6-27b（預覽，中文較強）
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_MAX_RETRIES = 3
+
+# 結算時讀截圖用的視覺模型。預設走 Groq；設了 VISION_BASE_URL 就改用那個
+# OpenAI 相容的服務（例如本地的 Ollama），截圖就不會離開自己的機器。
+VISION_MODEL = os.getenv("VISION_MODEL", "qwen/qwen3.8-27b")
+VISION_BASE_URL = os.getenv("VISION_BASE_URL")
+vision_client = (
+    AsyncOpenAI(base_url=VISION_BASE_URL, api_key=os.getenv("VISION_API_KEY", "none"))
+    if VISION_BASE_URL
+    else groq_client
+)
+N8N_SETTLE_WEBHOOK_URL = os.getenv("N8N_SETTLE_WEBHOOK_URL", N8N_WEBHOOK_URL + "-settle")
+STATE_DIR = os.getenv("STATE_DIR")  # 有設才會把結算紀錄存檔，重啟後還能認領
 
 SYSTEM_PROMPT = (
     "你是一個購物清單助手。使用者會在 Discord 傳購物相關訊息，你要判斷意圖並提取資訊。\n"
@@ -247,6 +265,259 @@ async def send_delete(message: discord.Message, url: str, item_name: str, full_t
         await message.reply(n8n_failure_reply("刪除", "從表格刪掉", e))
 
 
+# -------------------------------------------------
+#  結算：下單截圖 → 每人應付金額
+# -------------------------------------------------
+SETTLE_RE = re.compile(r"^(結算|结算)")
+CLAIM_RE = re.compile(r"^(認領|认领)\s*#?\s*(\d+)")
+SETTLE_CONFIRM_SECONDS = 600
+MAX_IMAGES = 10
+MAX_IMAGE_BYTES = 3_000_000  # Groq 的 base64 圖片上限是 4MB，編碼後會膨脹三分之一
+MATCH_CHUNK = 6  # 一次請 LLM 比對幾個商品；太多會超過每分鐘的 token 額度
+LLM_RETRY_WAIT = 15
+SETTLEMENTS: dict[str, dict] = {}  # batch → 結算狀態，照建立順序
+
+
+class SettleError(Exception):
+    """可以直接回給使用者看的錯誤。"""
+
+
+def load_settlements():
+    if STATE_DIR and (Path(STATE_DIR) / "settlements.json").exists():
+        SETTLEMENTS.update(json.loads((Path(STATE_DIR) / "settlements.json").read_text(encoding="utf-8")))
+
+
+def save_settlements():
+    if not STATE_DIR:
+        return
+    for old in list(SETTLEMENTS)[:-30]:
+        del SETTLEMENTS[old]
+    try:
+        tmp = Path(STATE_DIR) / "settlements.json.tmp"
+        tmp.write_text(json.dumps(SETTLEMENTS, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(Path(STATE_DIR) / "settlements.json")
+    except OSError as e:
+        print("[WARN] 結算紀錄存檔失敗（重啟後會無法認領）:", e)
+
+
+async def llm_json(client, **kwargs) -> dict:
+    """呼叫 LLM 並解析 JSON 回應；遇到 429 等一下再試。"""
+    for attempt in range(1, 7):
+        try:
+            response = await client.chat.completions.create(
+                temperature=0, response_format={"type": "json_object"}, **kwargs
+            )
+            return json.loads(response.choices[0].message.content)
+        except RateLimitError:
+            if attempt == 6:
+                raise
+            print(f"[WARN] LLM 429，第 {attempt} 次重試，等待 {LLM_RETRY_WAIT} 秒...")
+            await asyncio.sleep(LLM_RETRY_WAIT)
+
+
+async def read_screenshot(data: bytes, mime: str) -> dict:
+    url = f"data:{mime};base64,{base64.b64encode(data).decode()}"
+    raw = await llm_json(
+        vision_client,
+        model=VISION_MODEL,
+        max_tokens=2048,
+        messages=[{"role": "user", "content": [
+            {"type": "text", "text": settle.EXTRACT_PROMPT},
+            {"type": "image_url", "image_url": {"url": url}},
+        ]}],
+    )
+    return settle.clean_shot(raw)
+
+
+async def match_rows(payload: list[dict]) -> list[dict]:
+    """請 LLM 判斷每個商品對應表格的哪幾列。沒有候選列的商品不用問。"""
+    todo = [p for p in payload if p["candidates"]]
+    results = []
+    for i in range(0, len(todo), MATCH_CHUNK):
+        raw = await llm_json(
+            groq_client,
+            model=GROQ_MODEL,
+            max_tokens=4096,
+            messages=[
+                {"role": "system", "content": settle.MATCH_PROMPT},
+                {"role": "user", "content": json.dumps(todo[i:i + MATCH_CHUNK], ensure_ascii=False)},
+            ],
+        )
+        results += raw.get("results") or []
+    return results
+
+
+async def market_rate() -> float | None:
+    """今天的 CNY→TWD 市場匯率，只用來檢查回算匯率合不合理；抓不到就不檢查。"""
+    try:
+        resp = await asyncio.to_thread(requests.get, "https://open.er-api.com/v6/latest/CNY", timeout=5)
+        return float(resp.json()["rates"]["TWD"])
+    except Exception as e:
+        print("[WARN] 抓不到市場匯率:", e)
+        return None
+
+
+async def build_settlement(message: discord.Message, images: list) -> tuple[dict, list[dict]]:
+    shots = []
+    for i, att in enumerate(images, 1):
+        if att.size > MAX_IMAGE_BYTES:
+            raise SettleError(f"第 {i} 張圖超過 3MB，請改傳手機截圖（不要傳原始相片檔）")
+        shots.append(await read_screenshot(await att.read(), att.content_type.split(";")[0]))
+
+    units, errors, notes = settle.merge_shots(shots)
+    if errors:
+        raise SettleError("截圖有問題，沒辦法結算：\n" + "\n".join(f"- {e}" for e in errors))
+    if not units:
+        raise SettleError(
+            "我在截圖裡找不到商品和價格 QQ\n"
+            "請傳淘寶「确认订单」頁或訂單詳情頁的截圖，要拍到台幣金額。"
+        )
+
+    resp = await post_to_n8n({"action": "list"}, N8N_SETTLE_WEBHOOK_URL)
+    if not resp.ok:
+        raise SettleError(f"讀不到購物清單 QQ（n8n 回 {resp.status_code}）")
+    rows = resp.json()["rows"]
+
+    payload = settle.match_payload(units, rows)
+    writes, more = settle.assign(units, rows, payload, await match_rows(payload))
+    state = {
+        "batch": datetime.now().strftime("%Y%m%d-%H%M%S"),
+        "payer": message.author.name,
+        "payer_id": message.author.id,
+        "channel_id": message.channel.id,
+        "units": units,
+        "notes": notes + more,
+        "market_rate": await market_rate(),
+        "mentions": {},
+        "message_ids": [],
+    }
+    return state, writes
+
+
+async def send_chunks(target: discord.Message, text: str, ping: bool = False) -> list:
+    # 只 ping 人：商品名稱是從截圖讀來的，不能讓它觸發 @everyone 或身分組
+    allowed = discord.AllowedMentions(everyone=False, roles=False, users=ping)
+    chunks = settle.split_message(text)
+    sent = [await target.reply(chunks[0], allowed_mentions=allowed)]
+    for chunk in chunks[1:]:
+        sent.append(await target.channel.send(chunk, allowed_mentions=allowed))
+    return sent
+
+
+async def member_mentions(guild, state: dict) -> dict:
+    """表格裡記的是 Discord username，要查到 user id 才 @ 得到人；查不到就顯示純文字。"""
+    mentions = {state["payer"]: f"<@{state['payer_id']}>"}
+    for name in set(settle.totals(state)["twd"]) - {settle.UNCLASSIFIED, state["payer"]}:
+        if guild is None:
+            continue
+        member = discord.utils.find(lambda m: m.name == name, guild.members)
+        if member is None:
+            try:
+                found = await guild.query_members(query=name, limit=5)
+                member = next((m for m in found if m.name == name), None)
+            except Exception as e:
+                print(f"[WARN] 查不到成員 {name}: {e}")
+        if member is not None:
+            mentions[name] = member.mention
+    return mentions
+
+
+async def handle_settle(message: discord.Message):
+    images = [a for a in message.attachments if (a.content_type or "").startswith("image/")][:MAX_IMAGES]
+    if not images:
+        await message.reply("要結算的話，請把下單截圖和「結算」放在同一則訊息裡傳上來 🧾")
+        return
+
+    await safe_react(message, "⏳")
+    try:
+        state, writes = await build_settlement(message, images)
+    except SettleError as e:
+        await message.reply(str(e))
+        return
+    except Exception as e:
+        print("Error building settlement:", repr(e))
+        await message.reply("結算時我撞牆了 QQ 請幫我看一下 log")
+        return
+    finally:
+        await safe_react(message, "⏳", remove=True)
+
+    prompt = (await send_chunks(message, settle.render(state, final=False)))[-1]
+    await safe_react(prompt, "✅")
+    await safe_react(prompt, "❌")
+
+    def by_payer(reaction, user):
+        return (
+            reaction.message.id == prompt.id
+            and user.id == message.author.id
+            and str(reaction.emoji) in ("✅", "❌")
+        )
+
+    try:
+        reaction, _ = await bot.wait_for("reaction_add", timeout=SETTLE_CONFIRM_SECONDS, check=by_payer)
+    except asyncio.TimeoutError:
+        await prompt.reply("⌛ 太久沒有確認，這次結算已取消，表格沒有變動。")
+        return
+    if str(reaction.emoji) == "❌":
+        await prompt.reply("已取消，表格沒有變動。")
+        return
+
+    if writes:
+        try:
+            resp = await post_to_n8n(
+                {"action": "settle", "batch": state["batch"], "rows": writes}, N8N_SETTLE_WEBHOOK_URL
+            )
+        except Exception as e:
+            print("Error sending settle to n8n:", e)
+            await prompt.reply(n8n_failure_reply("結算", "寫進表格", e))
+            return
+        if resp.status_code == 409:
+            problems = resp.json().get("problems", [])
+            await prompt.reply(
+                "表格在這幾分鐘內被改過，這次沒有寫入任何東西，請重新傳截圖結算一次：\n"
+                + "\n".join(f"- {p['tab']} 第 {p['row']} 列：{p['reason']}" for p in problems[:10])
+            )
+            return
+        if not resp.ok:
+            await prompt.reply(f"結算結果寫進表格失敗 QQ（n8n 回 {resp.status_code}），表格沒有變動。")
+            return
+
+    state["mentions"] = await member_mentions(message.guild, state)
+    sent = await send_chunks(prompt, settle.render(state, final=True, mentions=state["mentions"]), ping=True)
+    state["message_ids"] = [m.id for m in sent]
+    SETTLEMENTS[state["batch"]] = state
+    save_settlements()
+
+
+async def handle_claim(message: discord.Message, no: int):
+    def open_item(state):
+        _, item = settle.find_item(state, no)
+        return item is not None and settle.is_unclassified(item)
+
+    pool = [s for s in SETTLEMENTS.values() if s["channel_id"] == message.channel.id]
+    replied_to = message.reference.message_id if message.reference else None
+    state = next((s for s in pool if replied_to in s["message_ids"]), None)
+    if state is None:
+        state = next((s for s in reversed(pool) if open_item(s)), None)
+    if state is None:
+        await message.reply(f"找不到還沒人認領的 #{no} 🙅\n要認領的話，請直接回覆在那則結算訊息底下。")
+        return
+
+    target = next((u for u in message.mentions if not u.bot), message.author)
+    error = settle.claim(state, no, target.name)
+    if error:
+        await message.reply(error)
+        return
+
+    state["mentions"][target.name] = target.mention
+    save_settlements()
+    _, item = settle.find_item(state, no)
+    await message.reply(
+        f"#{no} {item['name']} 算在 {target.mention} 名下 ✅\n\n"
+        f"**結算 {state['batch']} 更新後：**\n{settle.render_totals(state, state['mentions'])}",
+        allowed_mentions=discord.AllowedMentions(users=[target]),
+    )
+
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
@@ -255,10 +526,11 @@ async def on_ready():
     else:
         print("Allowed channel IDs: 不限制（所有頻道都會處理）")
     print(f"LLM: Groq {GROQ_MODEL} ✓")
+    print(f"結算: 讀圖 {VISION_MODEL} @ {VISION_BASE_URL or 'Groq'}，已載入 {len(SETTLEMENTS)} 筆結算紀錄")
 
 
 # -------------------------------------------------
-#  主訊息處理：買 / ~刪除
+#  主訊息處理：買 / ~刪除 / 結算 / 認領
 # -------------------------------------------------
 @bot.event
 async def on_message(message: discord.Message):
@@ -272,6 +544,20 @@ async def on_message(message: discord.Message):
         return
 
     text = message.content.strip()
+
+    # ============================================
+    # 0) 結算（附下單截圖）／認領 unclassified 的商品
+    # ============================================
+    if SETTLE_RE.match(text):
+        await handle_settle(message)
+        await bot.process_commands(message)
+        return
+
+    claim_match = CLAIM_RE.match(text)
+    if claim_match:
+        await handle_claim(message, int(claim_match.group(2)))
+        await bot.process_commands(message)
+        return
 
     # ============================================
     # 1) ~刪除：舊格式快速通道（用網址辨識，不經過 LLM）
@@ -401,4 +687,5 @@ async def on_message(message: discord.Message):
 #  入口
 # -------------------------------------------------
 if __name__ == "__main__":
+    load_settlements()
     bot.run(DISCORD_TOKEN)

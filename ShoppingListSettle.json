@@ -1,0 +1,206 @@
+{
+  "name": "ShoppingListSettle",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "discord-shopping-settle",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "settle-webhook",
+      "name": "Webhook",
+      "webhookId": "5e77c1e0-5e77-4c1e-9d5c-5e771e2026b1"
+    },
+    {
+      "parameters": {
+        "url": "=https://sheets.googleapis.com/v4/spreadsheets/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/values:batchGet?ranges={{ encodeURIComponent('淘寶!A1:Z') }}&ranges={{ encodeURIComponent('京東!A1:Z') }}&valueRenderOption=UNFORMATTED_VALUE",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        220,
+        0
+      ],
+      "id": "settle-read-sheets",
+      "name": "Read Sheets",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "TGwFp295v7gk3RIt",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ShoppingListSettle 的 Code 節點。\n// list   → 回傳兩個分頁裡還沒結算的列\n// settle → 檢查列沒有被動過，產生要寫回表格的儲存格（實際價格、結算批次）\nconst TABS = ['淘寶', '京東'];\nconst COLS = {\n  name: '預購買商品',\n  spec: '商品型號規格',\n  url: '商品網址',\n  qty: '商品數量',\n  price: '實際價格',\n  buyer: '購買人',\n  batch: '結算批次',\n};\n\nconst str = (v) => (v === undefined || v === null ? '' : String(v)).trim();\n\nfunction colLetter(index) {\n  let s = '';\n  for (let n = index + 1; n > 0; n = Math.floor((n - 1) / 26)) {\n    s = String.fromCharCode(65 + ((n - 1) % 26)) + s;\n  }\n  return s;\n}\n\nfunction readTab(valueRange, tab) {\n  const values = (valueRange && valueRange.values) || [];\n  const header = (values[0] || []).map(str);\n  const col = {};\n  for (const [key, title] of Object.entries(COLS)) col[key] = header.indexOf(title);\n\n  let needHeader = false;\n  if (col.batch < 0) {\n    // 放在所有資料右邊的第一個空欄，才不會蓋到沒有標題的雜項資料\n    col.batch = values.reduce((width, r) => Math.max(width, r.length), 0);\n    needHeader = true;\n  }\n\n  const rows = [];\n  for (let r = 1; r < values.length; r++) {\n    const v = values[r] || [];\n    const name = str(v[col.name]);\n    if (!name) continue;\n    const qty = Number(v[col.qty]);\n    rows.push({\n      tab,\n      row: r + 1,\n      name,\n      spec: str(v[col.spec]),\n      url: str(v[col.url]),\n      qty: qty > 0 ? qty : 1,\n      buyer: str(v[col.buyer]),\n      batch: str(v[col.batch]),\n    });\n  }\n  return { tab, col, needHeader, rows };\n}\n\nfunction plan(body, valueRanges) {\n  const tabs = {};\n  TABS.forEach((tab, i) => { tabs[tab] = readTab(valueRanges[i], tab); });\n\n  for (const t of Object.values(tabs)) {\n    for (const key of ['name', 'qty', 'price', 'buyer']) {\n      if (t.col[key] < 0) {\n        return { _status: 500, _write: null, _response: { status: 'error', message: `分頁「${t.tab}」找不到欄位「${COLS[key]}」` } };\n      }\n    }\n  }\n\n  if (body.action === 'list') {\n    const all = Object.values(tabs).flatMap((t) => t.rows);\n    const open = all.filter((r) => !r.batch).map(({ batch, ...rest }) => rest);\n    return { _status: 200, _write: null, _response: { status: 'ok', rows: open, settled: all.length - open.length } };\n  }\n\n  if (body.action === 'settle') {\n    const batch = str(body.batch);\n    const wanted = Array.isArray(body.rows) ? body.rows : [];\n    if (!batch || wanted.length === 0) {\n      return { _status: 400, _write: null, _response: { status: 'error', message: '缺少 batch 或 rows' } };\n    }\n\n    const problems = [];\n    const data = [];\n    const headerTabs = new Set();\n    const seen = new Set();\n    for (const w of wanted) {\n      const t = tabs[w.tab];\n      const cur = t && t.rows.find((r) => r.row === Number(w.row));\n      const id = `${w.tab}${w.row}`;\n      let reason = '';\n      if (!t) reason = '沒有這個分頁';\n      else if (seen.has(id)) reason = '同一列重複出現';\n      else if (!cur) reason = '這一列已經不存在';\n      else if (cur.name !== str(w.name) || cur.buyer !== str(w.buyer)) reason = '這一列的內容已經變了（可能有人新增或刪除過商品）';\n      else if (cur.batch) reason = `已經在批次 ${cur.batch} 結算過`;\n      seen.add(id);\n      if (reason) { problems.push({ tab: w.tab, row: w.row, reason }); continue; }\n\n      const price = w.price === null || w.price === undefined || w.price === '' ? null : Number(w.price);\n      if (price !== null && !(price >= 0)) { problems.push({ tab: w.tab, row: w.row, reason: '價格不是數字' }); continue; }\n      if (price !== null) data.push({ range: `'${w.tab}'!${colLetter(t.col.price)}${cur.row}`, values: [[price]] });\n      data.push({ range: `'${w.tab}'!${colLetter(t.col.batch)}${cur.row}`, values: [[batch]] });\n      if (t.needHeader) headerTabs.add(w.tab);\n    }\n\n    if (problems.length) {\n      return { _status: 409, _write: null, _response: { status: 'conflict', problems } };\n    }\n    for (const tab of headerTabs) {\n      data.unshift({ range: `'${tab}'!${colLetter(tabs[tab].col.batch)}1`, values: [[COLS.batch]] });\n    }\n    return { _status: 200, _write: { valueInputOption: 'RAW', data }, _response: { status: 'settled', batch, count: wanted.length } };\n  }\n\n  return { _status: 400, _write: null, _response: { status: 'error', message: `不認得的 action：${str(body.action)}` } };\n}\n\nif (typeof module !== 'undefined' && module.exports) module.exports = { plan, colLetter, readTab };\n\nreturn [{ json: plan($('Webhook').first().json.body || {}, $input.first().json.valueRanges || []) }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        0
+      ],
+      "id": "settle-plan",
+      "name": "Plan"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "settle-has-write",
+              "leftValue": "={{ $json._write !== null }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        660,
+        0
+      ],
+      "id": "settle-if-write",
+      "name": "If Write"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://sheets.googleapis.com/v4/spreadsheets/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/values:batchUpdate",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json._write) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        0
+      ],
+      "id": "settle-write-sheets",
+      "name": "Write Sheets",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "TGwFp295v7gk3RIt",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($('Plan').first().json._response) }}",
+        "options": {
+          "responseCode": "={{ $('Plan').first().json._status }}"
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        1100,
+        0
+      ],
+      "id": "settle-respond",
+      "name": "Respond"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Read Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Sheets": {
+      "main": [
+        [
+          {
+            "node": "Plan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan": {
+      "main": [
+        [
+          {
+            "node": "If Write",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Write": {
+      "main": [
+        [
+          {
+            "node": "Write Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Sheets": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "5e771e00-0000-4000-8000-000020261112",
+  "id": "SLsettle20261112",
+  "tags": []
+}

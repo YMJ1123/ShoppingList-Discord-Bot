@@ -5,6 +5,7 @@
 """
 import asyncio
 import itertools
+import json
 import re
 import sys
 import tempfile
@@ -217,9 +218,13 @@ check("「結算」開頭才觸發", [bool(bot.SETTLE_RE.match(t)) for t in ("�
 check("認領抓得到編號", [bot.CLAIM_RE.match(t).group(2) for t in ("認領 3", "認領#12", "认领 7 @人")], ["3", "12", "7"])
 check("不是認領開頭不觸發", bot.CLAIM_RE.match("我想認領 3"), None)
 
+# ------------------------------------------------------------------
+# 結算流程：Discord、n8n、LLM 都用假的，只驗證 bot 這一層怎麼串
 bot.STATE_DIR = None  # 測試不可以寫到正式的結算紀錄（容器裡 STATE_DIR 有設）
+real_post, real_parse = bot.post_to_n8n, bot.parse_with_llm
 _ids = itertools.count(1000)
 SENT = []  # bot 送出的每則訊息
+CALLS = []  # bot 送給 n8n 的每個請求
 
 
 class FakeUser:
@@ -240,7 +245,7 @@ class FakeMsg:
         self.id, self.author, self.channel, self.content = next(_ids), author, channel, text
         self.attachments, self.mentions, self.reference, self.guild, self.kw = list(attachments), list(mentions), reference, None, kw or {}
         self.raw_mentions = [int(i) for i in re.findall(r"<@!?(\d+)>", text)]
-        self.reactions = []
+        self.reactions, self.deleted = [], False
         if record:
             SENT.append(self)
 
@@ -253,13 +258,8 @@ class FakeMsg:
     async def remove_reaction(self, emoji, user):
         pass
 
-
-class FakeAtt:
-    def __init__(self, size=1000, content_type="image/jpeg"):
-        self.size, self.content_type = size, content_type
-
-    async def read(self):
-        return b"img"
+    async def delete(self):
+        self.deleted = True
 
 
 class FakeResp:
@@ -270,109 +270,351 @@ class FakeResp:
         return self._body
 
 
+def order(items, twd, order_no=""):
+    return {"items": [{"name": n, "spec": "", "qty": q, "price": p} for n, q, p in items], "total_twd": twd, "order_no": order_no}
+
+
+class FakeAtt:
+    def __init__(self, size=1000, content_type="image/jpeg", shot=None):
+        self.size, self.content_type, self.shot = size, content_type, shot or SHOT
+
+    async def read(self):
+        return json.dumps(self.shot).encode()
+
+
 BOT_USER, AMY, BOB, CAROL = FakeUser(1, "ShoppingListBot", True), FakeUser(100, "amy"), FakeUser(200, "bob"), FakeUser(300, "carol")
-SHOT = {"items": [{"name": "小米風扇", "spec": "白色", "qty": 1, "price": 100.0}, {"name": "神秘商品", "spec": "", "qty": 2, "price": 50.0}],
-        "total_twd": 990, "order_no": ""}
+CHAN = FakeChannel(1)
+SHOT = order([("小米風扇", 1, 100.0), ("神秘商品", 2, 50.0)], 990)
+EARBUDS = order([("藍牙耳機", 1, 30.0)], 150, "5127000000000000002")
 SHEET = [{"tab": "淘寶", "row": 2, "name": "小米風扇落地扇", "spec": "白色", "url": "", "qty": 1, "buyer": "bob"}]
 
 
-def run_settle(emoji="✅", settle_status=200, attachments=None, timeout=False, text="結算", mentions=(), confirmer=None, shot=None):
-    """跑一次 handle_settle，回傳 (n8n 收到的請求, bot 送出的訊息)。"""
+def stub(settle_status=200, read_delay=0.0):
     SENT.clear()
+    CALLS.clear()
     bot.SETTLEMENTS.clear()
-    calls, seen = [], {}
+    bot.PENDING.clear()
+    bot.ALLOWED_CHANNEL_IDS = set()
+    bot.SETTLE_CONFIRM_SECONDS = 600
 
     async def fake_read(data, mime):
-        src = shot or SHOT
-        return bot.settle.clean_shot({"items": [dict(i, paid_price=i["price"]) for i in src["items"]], "total_twd": src["total_twd"]})
+        await asyncio.sleep(read_delay)
+        raw = json.loads(data)
+        return bot.settle.clean_shot(dict(raw, items=[dict(i, paid_price=i["price"]) for i in raw["items"]]))
 
     async def fake_n8n(payload, url=None):
-        calls.append((payload, url))
+        CALLS.append(payload)
         if payload["action"] == "list":
             return FakeResp(200, {"status": "ok", "rows": SHEET})
-        body = {"status": "settled"} if settle_status == 200 else {"status": "conflict", "problems": [{"tab": "淘寶", "row": 2, "reason": "這一列已經不存在"}]}
-        return FakeResp(settle_status, body)
+        if settle_status == 409:
+            return FakeResp(409, {"status": "conflict", "problems": [{"tab": "淘寶", "row": 2, "reason": "這一列已經不存在"}]})
+        return FakeResp(settle_status, {"status": "settled"})
 
     async def fake_match(payload):
-        return [{"no": 1, "rows": ["淘寶2"], "confidence": "high"}]
+        return [{"no": p["no"], "rows": [c["id"] for c in p["candidates"]], "confidence": "high"} for p in payload]
 
     async def fake_rate():
         return None
 
-    async def fake_wait(event, timeout=None, check=None):
-        if timeout_flag:
-            raise asyncio.TimeoutError()
-        reaction = SimpleNamespace(message=SENT[-1], emoji=emoji)
-        seen.update({u.name: check(reaction, u) for u in (AMY, BOB, CAROL)})
-        seen["other_user_ok"], seen["payer_ok"] = seen["bob"], seen["amy"]
-        return reaction, confirmer or AMY
+    async def noop(message):
+        pass
 
-    timeout_flag = timeout
-    bot.read_screenshot, bot.post_to_n8n, bot.match_rows, bot.market_rate, bot.bot.wait_for = fake_read, fake_n8n, fake_match, fake_rate, fake_wait
-    msg = FakeMsg(AMY, FakeChannel(), text, mentions=mentions, attachments=[FakeAtt()] if attachments is None else attachments)
-    asyncio.run(bot.handle_settle(msg))
-    return calls, list(SENT), seen
+    async def no_llm(text):  # 測試不可以打真的 Groq
+        return None
+
+    bot.parse_with_llm = no_llm
+    bot.read_screenshot, bot.post_to_n8n, bot.match_rows, bot.market_rate = fake_read, fake_n8n, fake_match, fake_rate
+    bot.bot.process_commands = noop
+    bot.bot.get_channel = lambda cid: CHAN
+
+
+async def send(author, text="", shots=(), atts=None, mentions=(), reply_to=None):
+    atts = list(atts) if atts is not None else [FakeAtt(shot=x) for x in shots]
+    ref = SimpleNamespace(message_id=reply_to) if reply_to else None
+    msg = FakeMsg(author, CHAN, text, attachments=atts, mentions=mentions, reference=ref)
+    await bot.on_message(msg)
+    return msg
+
+
+async def react(emoji, user, msg):
+    await bot.on_raw_reaction_add(SimpleNamespace(emoji=emoji, user_id=user.id, message_id=msg.id, channel_id=CHAN.id))
+
+
+def drafts():
+    return [m for m in SENT if m.content.startswith("🧾 **結算草稿") and not m.deleted]
+
+
+def published():
+    return [m for m in SENT if m.content.startswith("🧾 **結算 ")]
+
+
+def settle_calls():
+    return [c for c in CALLS if c["action"] == "settle"]
+
+
+def nos(state):
+    return [it["no"] for u in state["units"] for it in u["items"]]
+
+
+async def settle_and_confirm(author=AMY, shots=(SHOT,), text="結算", mentions=(), confirmer=None):
+    await send(author, text, shots, mentions=mentions)
+    await react("✅", confirmer or author, drafts()[-1])
+    return list(bot.SETTLEMENTS.values())[-1]
 
 
 print("\n結算：確認後寫入表格並公布")
-real_post = bot.post_to_n8n
-calls, sent, seen = run_settle("✅")
-check("先向結算用的 webhook 要清單", (calls[0][0], calls[0][1]), ({"action": "list"}, bot.N8N_SETTLE_WEBHOOK_URL))
-check("草稿不 ping 任何人", (sent[0].content.startswith("🧾 **結算草稿**｜下單人 amy"), sent[0].kw["allowed_mentions"].to_dict()["parse"]), (True, []))
-check("只有下單人按的才算數", (seen["payer_ok"], seen["other_user_ok"]), (True, False))
-batch = calls[1][0]["batch"]
-check("確認後把對到的列寫回表格", calls[1][0], {"action": "settle", "batch": batch,
-      "rows": [{"tab": "淘寶", "row": 2, "name": "小米風扇落地扇", "buyer": "bob", "price": 100.0}]})
-check("正式結果 @ 下單人", f"🧾 **結算 {batch}**｜請轉帳給 <@100>" in sent[-1].content, True)
-check("正式結果有每人金額，加總等於實付", ("**bob　TWD 495**" in sent[-1].content, "unclassified　TWD 495" in sent[-1].content), (True, True))
-check("正式結果會 ping 人", sent[-1].kw["allowed_mentions"].to_dict()["parse"], ["users"])
-check("結算狀態有留下來給認領用", (list(bot.SETTLEMENTS), bot.SETTLEMENTS[batch]["message_ids"]), ([batch], [sent[-1].id]))
+stub()
+
+
+async def basic():
+    await send(AMY, "結算", [SHOT])
+    d = drafts()[-1]
+    check("草稿不 ping 任何人，有 ✅ ❌", (d.content.split("\n")[0], d.kw["allowed_mentions"].to_dict()["parse"], d.reactions),
+          ("🧾 **結算草稿**｜下單人 amy", [], ["✅", "❌"]))
+    check("先向結算用的 webhook 要清單", CALLS[0], {"action": "list"})
+    await react("✅", BOB, d)
+    check("別人按 ✅ → 不算", (settle_calls(), len(bot.PENDING)), ([], 1))
+    await react("👍", AMY, d)
+    check("下單人按別的表情 → 不算", settle_calls(), [])
+    await react("✅", AMY, d)
+    batch = settle_calls()[0]["batch"]
+    check("下單人按 ✅ → 把對到的列寫回表格", settle_calls()[0],
+          {"action": "settle", "batch": batch, "rows": [{"tab": "淘寶", "row": 2, "name": "小米風扇落地扇", "buyer": "bob", "price": 100.0}]})
+    f = published()[-1]
+    check("正式結果 @ 下單人、有每人金額", (f.content.split("\n")[0], "**bob　TWD 495**" in f.content, "unclassified　TWD 495" in f.content),
+          (f"🧾 **結算 {batch}**｜請轉帳給 <@100>", True, True))
+    check("正式結果只 ping 人", f.kw["allowed_mentions"].to_dict()["parse"], ["users"])
+    check("結算留下紀錄、草稿收掉", (list(bot.SETTLEMENTS), bot.SETTLEMENTS[batch]["message_ids"], bot.PENDING), ([batch], [f.id], {}))
+    await react("✅", AMY, d)
+    check("再按一次 ✅ 不會重寫", len(settle_calls()), 1)
+
+asyncio.run(basic())
+
+print("\n追加截圖：還沒按 ✅ 前併成同一張草稿")
+stub()
+
+
+async def merge():
+    await send(AMY, "結算", [SHOT])
+    first = drafts()[-1]
+    await send(AMY, "", [EARBUDS])  # 第二則只傳圖，沒打「結算」
+    live = drafts()
+    check("舊草稿被刪掉，只剩一張新的", (first.deleted, len(live)), (True, 1))
+    state = bot.PENDING[(1, AMY.id)]["state"]
+    check("兩則訊息的商品併在一起，編號接著排", nos(state), [1, 2, 3])
+    check("新草稿列出兩筆訂單", live[0].content.split("\n")[1].startswith("2 筆訂單，實付合計 **TWD 1,140**"), True)
+    await react("✅", AMY, first)
+    check("在被取代的舊草稿上按 ✅ → 不算", settle_calls(), [])
+    await send(BOB, "", [EARBUDS])
+    check("別人只傳圖 → 不會被併進來", (len(bot.PENDING[(1, AMY.id)]["shots"]), len(drafts())), (2, 1))
+    await react("✅", AMY, live[0])
+    s = list(bot.SETTLEMENTS.values())[-1]
+    check("確認後公布的是合併後的整張", (nos(s), sum(bot.settle.totals(s)["twd"].values())), ([1, 2, 3], 1140))
+    n = len(SENT)
+    await send(AMY, "", [EARBUDS])
+    check("草稿確認後再只傳圖 → 不理會", (bot.PENDING, len(SENT)), ({}, n))
+
+asyncio.run(merge())
+
+stub()
+
+
+async def overlap():
+    page1 = order([("小米風扇", 1, 100.0), ("神秘商品", 2, 50.0)], 1200)
+    page2 = order([("神秘商品", 2, 50.0), ("藍牙耳機", 1, 30.0)], 1200)
+    await send(AMY, "結算", [page1])
+    await send(AMY, "", [page2])
+    state = bot.PENDING[(1, AMY.id)]["state"]
+    check("確認頁分兩則傳、重疊拍到的商品 → 去重後是同一筆付款", ([len(u["items"]) for u in state["units"]], state["units"][0]["cny"]), ([3], 230.0))
+
+asyncio.run(overlap())
+
+stub(read_delay=0.05)
+
+
+async def burst():
+    await asyncio.gather(send(AMY, "結算", [SHOT]), send(AMY, "", [EARBUDS]))
+    check("第一張還在讀圖時第二則就到 → 排隊併成一張", (len(drafts()), nos(bot.PENDING[(1, AMY.id)]["state"])), (1, [1, 2, 3]))
+    check("沒有出現「草稿已經確認」的誤報", any("已經確認或取消" in m.content for m in SENT), False)
+
+asyncio.run(burst())
+
+stub(read_delay=0.05)
+
+
+async def race():
+    await send(AMY, "結算", [SHOT])
+    old = drafts()[-1]
+    await asyncio.gather(send(AMY, "", [EARBUDS]), react("✅", AMY, old))
+    check("第二批還在處理時在舊草稿按 ✅ → 不算（不能確認還沒看過的商品）", (settle_calls(), len(bot.PENDING)), ([], 1))
+    await react("✅", AMY, drafts()[-1])
+    check("在新草稿上按 ✅ 才確認", nos(list(bot.SETTLEMENTS.values())[-1]), [1, 2, 3])
+
+asyncio.run(race())
+
+print("\n編號：同頻道不撞號")
+stub()
+
+
+async def numbering():
+    s1 = await settle_and_confirm(AMY, [SHOT])
+    s2 = await settle_and_confirm(CAROL, [EARBUDS])
+    check("第二筆接著第一筆的編號", (nos(s1), nos(s2)), ([1, 2], [3]))
+    check("同一秒開始的兩筆，批次編號不會撞", s1["batch"] != s2["batch"], True)
+    await bot.handle_claim(FakeMsg(BOB, CHAN, "認領 3", mentions=()), 3)
+    check("「認領 3」不用回覆，落在第二筆", bot.settle.find_item(s2, 3)[1]["shares"][0]["owner"], "bob")
+    SENT.clear()
+    await bot.handle_claim(FakeMsg(BOB, CHAN, "認領 2", mentions=()), 2)
+    check("「認領 2」落在第一筆", bot.settle.find_item(s1, 2)[1]["shares"][0]["owner"], "bob")
+    SENT.clear()
+    await bot.handle_claim(FakeMsg(CAROL, CHAN, "認領 1", mentions=()), 1)
+    check("已經對到人的編號 → 說明算在誰名下，而不是找不到", SENT[-1].content, "#1 已經算在 bob 名下了")
+    await react("🏁", AMY, SimpleNamespace(id=s1["message_ids"][-1]))
+    s3 = await settle_and_confirm(AMY, [EARBUDS])
+    check("只看還在認領中的結算接續編號（第一筆已結束）", nos(s3), [4])
+    await react("🏁", CAROL, SimpleNamespace(id=s2["message_ids"][-1]))
+    await react("🏁", AMY, SimpleNamespace(id=s3["message_ids"][-1]))
+    s4 = await settle_and_confirm(AMY, [EARBUDS])
+    check("全部都結束認領後，編號從 #1 重新開始", nos(s4), [1])
+
+asyncio.run(numbering())
+
+print("\n重複結算的警告")
+stub()
+
+
+async def duplicate():
+    s1 = await settle_and_confirm(AMY, [SHOT])
+    await send(BOB, "結算", [SHOT])
+    text = drafts()[-1].content
+    check("同樣的商品又結算一次 → 草稿提醒", (f"#3 小米風扇 ×1 ¥100.00 和結算 {s1['batch']} 的 #1 看起來是同一件，可能重複結算" in text,
+                                         f"#4 神秘商品 ×2 ¥50.00 和結算 {s1['batch']} 的 #2 看起來是同一件，可能重複結算" in text), (True, True))
+    await send(CAROL, "結算", [EARBUDS])
+    check("不同商品 → 不提醒", "重複結算" in drafts()[-1].content, False)
+
+asyncio.run(duplicate())
+
+print("\n結算：不寫入的情況")
+stub()
+
+
+async def cancelled():
+    await send(AMY, "結算", [SHOT])
+    await react("❌", AMY, drafts()[-1])
+    check("按 ❌ → 不寫表格、不留紀錄", (settle_calls(), SENT[-1].content, bot.SETTLEMENTS, bot.PENDING), ([], "已取消，表格沒有變動。", {}, {}))
+
+asyncio.run(cancelled())
+
+stub()
+
+
+async def expired():
+    bot.SETTLE_CONFIRM_SECONDS = 0.1
+    await send(AMY, "結算", [SHOT])
+    await asyncio.sleep(0.06)
+    await send(AMY, "", [EARBUDS])  # 追加會重新計時
+    await asyncio.sleep(0.06)
+    check("追加後重新計時，還沒過期", len(bot.PENDING), 1)
+    await asyncio.sleep(0.1)
+    check("沒人確認 → 逾時取消", (settle_calls(), SENT[-1].content[:8], bot.PENDING), ([], "⌛ 太久沒有確認", {}))
+    d = [m for m in SENT if m.content.startswith("🧾 **結算草稿") and not m.deleted][-1]
+    await react("✅", AMY, d)
+    check("過期後按 ✅ 沒用", (settle_calls(), bot.SETTLEMENTS), ([], {}))
+
+asyncio.run(expired())
+
+for status, label, expect in [(409, "表格被改過（409）→ 說明原因、不公布、不留紀錄", "淘寶 第 2 列：這一列已經不存在"),
+                              (500, "n8n 寫入失敗 → 不公布", "寫進表格失敗")]:
+    stub(settle_status=status)
+
+    async def fail():
+        await send(AMY, "結算", [SHOT])
+        await react("✅", AMY, drafts()[-1])
+        check(label, (expect in SENT[-1].content, published(), bot.SETTLEMENTS), (True, [], {}))
+    asyncio.run(fail())
+
+stub()
+
+
+async def bad_input():
+    await send(AMY, "結算")
+    check("沒附圖 → 提示用法，不呼叫任何服務", (CALLS, "請把下單截圖和「結算」放在同一則訊息" in SENT[-1].content), ([], True))
+    await send(AMY, "結算", atts=[FakeAtt(size=5_000_000)])
+    check("圖太大 → 說明原因，不留草稿", (CALLS, SENT[-1].content[:12], bot.PENDING), ([], "第 1 張圖超過 3MB", {}))
+    await send(AMY, "結算", atts=[FakeAtt(content_type="application/pdf")])
+    check("不是圖片的附件不算", CALLS, [])
+    await send(AMY, "結算", [SHOT])
+    await send(AMY, "", atts=[FakeAtt(size=5_000_000)])
+    check("追加的圖有問題 → 舊草稿保留", (SENT[-1].content.endswith("（之前的草稿還在，這幾張沒有併進去）"), len(drafts()), len(bot.PENDING)), (True, 1, 1))
+    n = len(SENT)
+    await send(BOB, "", [SHOT])
+    check("沒有草稿時只傳圖 → 不理會", (len(bot.PENDING), len(SENT)), (1, n))
+    n = len(SENT)
+    await send(AMY, "買 小米風扇 https://e.tb.cn/x", [EARBUDS])
+    check("有草稿時傳「買…」附圖 → 不會被當成追加截圖", (len(bot.PENDING[(1, AMY.id)]["shots"]), len([m for m in SENT[n:] if "結算草稿" in m.content])), (1, 0))
+
+asyncio.run(bad_input())
 
 print("\n認領")
-state = bot.SETTLEMENTS[batch]
-final_id = sent[-1].id
 
 
-def run_claim(author, text, channel=None, mentions=(), reply_to=None):
+def run_claim(author, text, mentions=(), reply_to=None):
     SENT.clear()
     ref = SimpleNamespace(message_id=reply_to) if reply_to else None
-    msg = FakeMsg(author, channel or FakeChannel(), text, mentions=mentions, reference=ref)
-    asyncio.run(bot.handle_claim(msg, int(bot.CLAIM_RE.match(text).group(2))))
+    asyncio.run(bot.handle_claim(FakeMsg(author, CHAN, text, mentions=mentions, reference=ref), int(bot.CLAIM_RE.match(text).group(2))))
     return SENT[-1].content
 
 
-check("別的頻道認領不到", run_claim(CAROL, "認領 2", channel=FakeChannel(2))[:14], "找不到還沒人認領的 #2 🙅")
+stub()
+state = asyncio.run(settle_and_confirm(AMY, [SHOT]))
+batch, final_id = state["batch"], state["message_ids"][-1]
+check("別的頻道認領不到", (SENT.clear(), asyncio.run(bot.handle_claim(FakeMsg(CAROL, FakeChannel(2), "認領 2"), 2)), SENT[-1].content[:14])[2], "找不到還沒人認領的 #2 🙅")
 out = run_claim(CAROL, "認領 2")
 check("認領後回覆更新的金額", out, f"#2 神秘商品 算在 <@300> 名下 ✅\n\n**結算 {batch} 更新後：**\nbob　TWD 495\n<@300>　TWD 495\n\n全部都有人認領了，amy 按 🏁 公布最終金額並通知大家")
-check("認領後算在認領的人名下", (bot.settle.totals(state)["twd"], "算在 <@300> 名下" in out), ({"bob": 495, "carol": 495}, True))
+check("認領後算在認領的人名下", bot.settle.totals(state)["twd"], {"bob": 495, "carol": 495})
 check("被認領走的不能再認領", run_claim(BOB, "認領 2", reply_to=final_id), "#2 已經算在 carol 名下了")
 check("已經對到人的商品不能認領", run_claim(CAROL, "認領 1", reply_to=final_id), "#1 已經算在 bob 名下了")
 
-calls, sent, _ = run_settle("✅")
-out = run_claim(AMY, "認領 2 <@200>", mentions=[BOT_USER, BOB], reply_to=sent[-1].id)
-check("可以幫別人認領（略過被回覆的 bot 本身）", bot.settle.totals(next(iter(bot.SETTLEMENTS.values())))["twd"], {"bob": 990})
+stub()
+state = asyncio.run(settle_and_confirm(AMY, [SHOT]))
+run_claim(AMY, "認領 2 <@200>", mentions=[BOT_USER, BOB], reply_to=state["message_ids"][-1])
+check("可以幫別人認領（略過被回覆的 bot 本身）", bot.settle.totals(state)["twd"], {"bob": 990})
 
-calls, sent, _ = run_settle("✅")
-out = run_claim(CAROL, "認領 2", mentions=[BOB], reply_to=sent[-1].id)
-check("回覆 bob 的訊息打「認領 2」→ 算給自己，不是被回覆的 bob", bot.settle.totals(next(iter(bot.SETTLEMENTS.values())))["twd"], {"bob": 495, "carol": 495})
+stub()
+state = asyncio.run(settle_and_confirm(AMY, [SHOT]))
+run_claim(CAROL, "認領 2", mentions=[BOB], reply_to=state["message_ids"][-1])
+check("回覆 bob 的訊息打「認領 2」→ 算給自己，不是被回覆的 bob", bot.settle.totals(state)["twd"], {"bob": 495, "carol": 495})
 
 print("\n幫別人結算：「結算 @B」")
-calls, sent, seen = run_settle("✅", text="結算 <@300>", mentions=[CAROL], confirmer=CAROL)
-final = sent[-1].content
-check("下單人和代傳的人都能確認，其他人不行", (seen["amy"], seen["carol"], seen["bob"]), (True, True, False))
-check("草稿標出代傳", sent[0].content.split("\n")[0], "🧾 **結算草稿**｜下單人 carol（amy 代傳）")
-check("正式結果請大家轉給 carol", final.split("\n")[0], f"🧾 **結算 {calls[1][0]['batch']}**｜請轉帳給 <@300>（amy 代傳）")
-check("代傳的人不會被當成下單人", "不用轉" in final, False)
-state = next(iter(bot.SETTLEMENTS.values()))
-check("結算紀錄裡的下單人是 carol", (state["payer"], state["payer_id"], state["poster"]), ("carol", 300, "amy"))
+stub()
 
-calls, sent, seen = run_settle("✅", text="結算 <@200>", mentions=[BOB])
-check("被幫忙的人自己有買 → 他那份標不用轉", "**<@200>　TWD 495**（¥100.00）（下單人自己的，不用轉）" in sent[-1].content, True)
 
-calls, sent, seen = run_settle("✅", text="結算", mentions=[CAROL])
-check("沒在內文 @ 人（例如回覆別人時被帶進來的）→ 維持傳圖的人", (sent[0].content.split("\n")[0], seen["carol"]), ("🧾 **結算草稿**｜下單人 amy", False))
-calls, sent, seen = run_settle("✅", text="結算 <@1>", mentions=[BOT_USER])
-check("@ 的是 bot → 不算", sent[0].content.split("\n")[0], "🧾 **結算草稿**｜下單人 amy")
+async def proxy():
+    await send(AMY, "結算 <@300>", [SHOT], mentions=[CAROL])
+    d = drafts()[-1]
+    check("草稿標出代傳", d.content.split("\n")[0], "🧾 **結算草稿**｜下單人 carol（amy 代傳）")
+    await react("✅", BOB, d)
+    check("其他人按 ✅ 不算", settle_calls(), [])
+    await send(AMY, "", [EARBUDS])
+    check("代傳的人追加截圖 → 併進同一張", nos(bot.PENDING[(1, AMY.id)]["state"]), [1, 2, 3])
+    await react("✅", CAROL, drafts()[-1])
+    s = list(bot.SETTLEMENTS.values())[-1]
+    check("被幫忙的人也能按 ✅", (s["payer"], s["payer_id"], s["poster"]), ("carol", 300, "amy"))
+    check("正式結果請大家轉給 carol", published()[-1].content.split("\n")[0], f"🧾 **結算 {s['batch']}**｜請轉帳給 <@300>（amy 代傳）")
+    check("代傳的人不會被當成下單人", "不用轉" in published()[-1].content, False)
+
+asyncio.run(proxy())
+
+stub()
+asyncio.run(send(AMY, "結算 <@200>", [SHOT], mentions=[BOB]))
+asyncio.run(react("✅", AMY, drafts()[-1]))
+check("被幫忙的人自己有買 → 他那份標不用轉", "**<@200>　TWD 495**（¥100.00）（下單人自己的，不用轉）" in published()[-1].content, True)
+stub()
+asyncio.run(send(AMY, "結算", [SHOT], mentions=[CAROL]))
+check("沒在內文 @ 人（例如回覆別人時被帶進來的）→ 維持傳圖的人", drafts()[-1].content.split("\n")[0], "🧾 **結算草稿**｜下單人 amy")
+stub()
+asyncio.run(send(AMY, "結算 <@1>", [SHOT], mentions=[BOT_USER]))
+check("@ 的是 bot → 不算", drafts()[-1].content.split("\n")[0], "🧾 **結算草稿**｜下單人 amy")
 
 print("\n🏁 結束認領")
 
@@ -380,16 +622,15 @@ print("\n🏁 結束認領")
 def press(emoji, user, message_id):
     """模擬有人在某則訊息上按反應，回傳 bot 因此送出的訊息。"""
     SENT.clear()
-    bot.bot.get_channel = lambda cid: FakeChannel(cid)
     asyncio.run(bot.on_raw_reaction_add(SimpleNamespace(emoji=emoji, user_id=user.id, message_id=message_id, channel_id=1)))
     return list(SENT)
 
 
-calls, sent, _ = run_settle("✅")
-final_id, batch = sent[-1].id, calls[1][0]["batch"]
-state = bot.SETTLEMENTS[batch]
-check("有沒人認領的商品 → 正式結果上有 🏁", sent[-1].reactions, ["🏁"])
-check("草稿上沒有 🏁", "🏁" in sent[0].reactions, False)
+stub()
+state = asyncio.run(settle_and_confirm(AMY, [SHOT]))
+batch, final = state["batch"], published()[-1]
+final_id = final.id
+check("有沒人認領的商品 → 正式結果上有 🏁", final.reactions, ["🏁"])
 check("別人按 🏁 → 沒反應", (press("🏁", BOB, final_id), state.get("closed")), ([], None))
 check("下單人按別的表情 → 沒反應", (press("👍", AMY, final_id), state.get("closed")), ([], None))
 check("在不相干的訊息按 🏁 → 沒反應", (press("🏁", AMY, 424242), state.get("closed")), ([], None))
@@ -402,30 +643,36 @@ check("再按一次不會重發", press("🏁", AMY, final_id), [])
 check("結束後回覆那則訊息認領 → 拒絕", run_claim(CAROL, "認領 2", reply_to=final_id), f"結算 {batch} 已經結束認領了，有問題請直接找下單的人")
 check("結束後不回覆直接認領 → 找不到", run_claim(CAROL, "認領 2")[:14], "找不到還沒人認領的 #2 🙅")
 
-calls, sent, _ = run_settle("✅")
-batch = calls[1][0]["batch"]
+stub()
+state = asyncio.run(settle_and_confirm(AMY, [SHOT]))
 run_claim(CAROL, "認領 2")
 claim_reply = SENT[-1]
-check("認領的回覆上也有 🏁，而且記進這次結算", (claim_reply.reactions, claim_reply.id in bot.SETTLEMENTS[batch]["message_ids"]), (["🏁"], True))
+check("認領的回覆上也有 🏁，而且記進這次結算", (claim_reply.reactions, claim_reply.id in state["message_ids"]), (["🏁"], True))
 out = press("🏁", AMY, claim_reply.id)
 check("全部認領完，在認領回覆上按 🏁 → 公布並 ping 每個要付錢的人", out[0].content,
-      f"🏁 **結算 {batch} 結束認領**｜請轉帳給 <@100>\n\n**bob　TWD 495**\n**<@300>　TWD 495**")
+      f"🏁 **結算 {state['batch']} 結束認領**｜請轉帳給 <@100>\n\n**bob　TWD 495**\n**<@300>　TWD 495**")
 
-calls, sent, _ = run_settle("✅", shot={"items": [{"name": "小米風扇", "spec": "白色", "qty": 1, "price": 100.0}], "total_twd": 495})
-check("全部都對到人 → 不放 🏁", sent[-1].reactions, [])
+stub()
+asyncio.run(settle_and_confirm(AMY, [order([("小米風扇", 1, 100.0)], 495)]))
+check("全部都對到人 → 不放 🏁", published()[-1].reactions, [])
 
-calls, sent, _ = run_settle("✅", text="結算 <@300>", mentions=[CAROL], confirmer=CAROL)
-out = press("🏁", AMY, sent[-1].id)
+stub()
+state = asyncio.run(settle_and_confirm(AMY, [SHOT], text="結算 <@300>", mentions=[CAROL], confirmer=CAROL))
+out = press("🏁", AMY, published()[-1].id)
 lines = out[0].content.split("\n") if out else ["（沒有送出任何訊息）"]
 check("代傳：代傳的人也能按 🏁，剩下的算給被幫忙的人", (lines[0], lines[-1]),
-      (f"🏁 **結算 {calls[1][0]['batch']} 結束認領**｜請轉帳給 <@300>", "下單人自己的 TWD 495 不用轉，含沒人認領的 #2"))
+      (f"🏁 **結算 {state['batch']} 結束認領**｜請轉帳給 <@300>", "下單人自己的 TWD 495 不用轉，含沒人認領的 #2"))
 
+print("\n結算紀錄存檔")
 with tempfile.TemporaryDirectory() as d:
     bot.STATE_DIR = d
-    calls, sent, _ = run_settle("✅")
-    final_id, batch = sent[-1].id, calls[1][0]["batch"]
+    stub()
+    state = asyncio.run(settle_and_confirm(AMY, [SHOT]))
+    final_id, batch = state["message_ids"][-1], state["batch"]
+    saved = json.loads(json.dumps(bot.SETTLEMENTS))
     bot.SETTLEMENTS.clear()
     bot.load_settlements()
+    check("重啟後讀得回來", bot.SETTLEMENTS == saved and len(saved) == 1, True)
     bot.SETTLEMENTS[batch].pop("poster_id")           # 舊版存的紀錄沒有這個欄位
     check("重啟後、舊紀錄：別人按還是沒反應", press("🏁", CAROL, final_id), [])
     check("重啟後、舊紀錄：下單人按 🏁 照樣有效", len(press("🏁", AMY, final_id)), 1)
@@ -433,33 +680,8 @@ with tempfile.TemporaryDirectory() as d:
     bot.load_settlements()
     check("結束狀態有存檔，重啟後不會被重開", (bot.SETTLEMENTS[batch]["closed"], press("🏁", AMY, final_id)), (True, []))
     bot.STATE_DIR = None
-
-print("\n結算：不寫入的情況")
-calls, sent, _ = run_settle("❌")
-check("按 ❌ → 不寫表格、不留紀錄", ([c[0]["action"] for c in calls], sent[-1].content, bot.SETTLEMENTS), (["list"], "已取消，表格沒有變動。", {}))
-calls, sent, _ = run_settle(timeout=True)
-check("沒人確認 → 逾時取消", ([c[0]["action"] for c in calls], sent[-1].content[:8]), (["list"], "⌛ 太久沒有確認"))
-calls, sent, _ = run_settle("✅", settle_status=409)
-check("表格被改過（409）→ 說明原因、不公布、不留紀錄", ("淘寶 第 2 列：這一列已經不存在" in sent[-1].content, "請轉帳給" in sent[-1].content, bot.SETTLEMENTS), (True, False, {}))
-calls, sent, _ = run_settle("✅", settle_status=500)
-check("n8n 寫入失敗 → 不公布", ("寫進表格失敗" in sent[-1].content, bot.SETTLEMENTS), (True, {}))
-calls, sent, _ = run_settle(attachments=[])
-check("沒附圖 → 提示用法，不呼叫任何服務", (calls, "請把下單截圖和「結算」放在同一則訊息" in sent[-1].content), ([], True))
-calls, sent, _ = run_settle(attachments=[FakeAtt(size=5_000_000)])
-check("圖太大 → 說明原因", (calls, sent[-1].content[:12]), ([], "第 1 張圖超過 3MB"))
-calls, sent, _ = run_settle(attachments=[FakeAtt(content_type="application/pdf")])
-check("不是圖片的附件不算", calls, [])
-
-print("\n結算紀錄存檔")
-with tempfile.TemporaryDirectory() as d:
-    bot.STATE_DIR = d
-    run_settle("✅")
-    saved = dict(bot.SETTLEMENTS)
-    bot.SETTLEMENTS.clear()
-    bot.load_settlements()
-    check("重啟後讀得回來", bot.SETTLEMENTS == saved and len(saved) == 1, True)
-    bot.STATE_DIR = None
-bot.post_to_n8n = real_post
+bot.post_to_n8n, bot.parse_with_llm = real_post, real_parse
+bot.SETTLE_CONFIRM_SECONDS = 600
 
 print("\nllm_json：429 重試")
 

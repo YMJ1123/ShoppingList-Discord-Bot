@@ -61,11 +61,11 @@ def clean_shot(raw: dict) -> dict:
     return {"items": items, "total_twd": total, "order_no": order_no if len(order_no) >= 10 else ""}
 
 
-def merge_shots(shots: list[dict]) -> tuple[list[dict], list[str], list[str]]:
+def merge_shots(shots: list[dict], start: int = 1) -> tuple[list[dict], list[str], list[str]]:
     """把多張截圖合併成「付款單位」：每個單位有自己的台幣實付金額。
 
     訂單詳情頁一張訂單一個單位（用訂單號認）；確認訂單頁所有截圖共用一個總額，
-    捲動時重疊拍到的商品要去重。回傳 (units, errors, notes)，errors 非空就不該繼續。
+    捲動時重疊拍到的商品要去重。商品編號從 start 開始。回傳 (units, errors, notes)，errors 非空就不該繼續。
     """
     groups: dict[str, dict] = {}
     orphans, errors = [], []
@@ -99,7 +99,7 @@ def merge_shots(shots: list[dict]) -> tuple[list[dict], list[str], list[str]]:
         elif shot["items"]:
             errors.append(f"第 {idx} 張截圖看不到台幣金額，沒辦法判斷屬於哪一筆付款")
 
-    units, no = [], 0
+    units, no = [], start - 1
     for unit in groups.values():
         del unit["_seen"]
         if not unit["items"]:
@@ -140,6 +140,36 @@ def candidates(item: dict, rows: list[dict], k: int = 6) -> list[dict]:
         scored.append((score, row))
     scored.sort(key=lambda x: -x[0])
     return [row for score, row in scored[:k] if score > 0.25]
+
+
+def _same_goods(a: dict, b: dict) -> bool:
+    """同數量、同單價（到分），名稱又夠像，就當成同一件。確認頁和訂單頁的標題寫法不同，所以只看相似度。"""
+    if a["qty"] != b["qty"] or abs(a["price"] - b["price"]) >= 0.005:
+        return False
+    ga, gb = _grams(a["name"]), _grams(b["name"])
+    return len(ga & gb) / max(1, min(len(ga), len(gb))) >= 0.3
+
+
+def duplicate_notes(units: list[dict], previous: list[dict]) -> list[str]:
+    """這張草稿裡的商品，如果在之前的結算或同一張草稿的其他付款裡出現過，就提醒可能重複結算。"""
+    notes, seen = [], []
+    for unit in units:
+        hit = next((s for s in previous for u in s["units"] if unit["order_no"] and u["order_no"] == unit["order_no"]), None)
+        if hit:
+            notes.append(f"訂單 …{unit['order_no'][-6:]} 已經在結算 {hit['batch']} 算過了，可能重複結算")
+            seen += [(None, it) for it in unit["items"]]
+            continue
+        for it in unit["items"]:
+            label = f"#{it['no']} {_short(it['name'], 16)} ×{it['qty']} ¥{it['price']:.2f}"
+            old = next(((s["batch"], o) for s in previous for u in s["units"] for o in u["items"] if _same_goods(o, it)), None)
+            if old:
+                notes.append(f"{label} 和結算 {old[0]} 的 #{old[1]['no']} 看起來是同一件，可能重複結算")
+            else:
+                twin = next((o for u_, o in seen if u_ is not unit and _same_goods(o, it)), None)
+                if twin:
+                    notes.append(f"{label} 和這張草稿的 #{twin['no']} 看起來是同一件（同一筆訂單的不同頁面？），可能算了兩次")
+            seen.append((unit, it))
+    return notes
 
 
 def match_payload(units: list[dict], rows: list[dict]) -> list[dict]:
@@ -343,7 +373,8 @@ def render(state: dict, final: bool, mentions: dict | None = None) -> str:
 
     if not final:
         who_confirms = f"{payer} 或 {poster} " if poster else "下單人"
-        lines += ["", f"{who_confirms}按 ✅ 確認並寫入表格，按 ❌ 取消（10 分鐘內有效）"]
+        lines += ["", f"{who_confirms}按 ✅ 確認並寫入表格，按 ❌ 取消（10 分鐘內有效）",
+                  "還有截圖的話直接再傳（不用打「結算」），會併進這張草稿，編號接著排"]
     return "\n".join(lines)
 
 

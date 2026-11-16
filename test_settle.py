@@ -104,6 +104,9 @@ long_order = [shot([("甲", "", 1, 10)], 0, "5127481190470000001"), shot([("甲"
 units, errors, _ = settle.merge_shots(long_order)
 check("同一張訂單分兩張截圖：合併、去重、取到金額", [(len(u["items"]), u["total_twd"]) for u in units], [(2, 150)])
 
+units, _, _ = settle.merge_shots(copy.deepcopy(DETAIL), start=8)
+check("編號可以從指定號碼開始（同頻道不撞號）", [it["no"] for u in units for it in u["items"]], [8, 9, 10])
+
 print("\nmerge_shots：讀不到金額要擋下來")
 _, errors, _ = settle.merge_shots([shot([("甲", "", 1, 10)], 0, "5127481190470000001")])
 check("訂單詳情頁沒拍到实付款 → 錯誤", len(errors), 1)
@@ -192,6 +195,33 @@ solo = {"batch": "B", "payer": "p", "units": [{"order_no": "", "total_twd": 50, 
 settle.close(solo)
 check("全部都是下單人自己的", settle.render_closed(solo), "🏁 **結算 B 結束認領**｜請轉帳給 p\n\n沒有人需要轉帳。\n\n下單人自己的 TWD 50 不用轉，含沒人認領的 #1")
 
+print("\nduplicate_notes：重複結算")
+# 2026-11-16 的真實情況：11/12 用確認頁結算過，11/16 又用訂單頁結算同一批（標題寫法不同、OCR 也有錯字）
+NOV12 = {"batch": "20261112-145453", "units": [{"order_no": "", "items": [
+    {"no": 1, "name": "盲盒收纳展示架手办亚克力柜", "qty": 2, "price": 24.6},
+    {"no": 3, "name": "轻奢钛架男士高清防蓝光眼镜", "qty": 1, "price": 284.66},
+    {"no": 5, "name": "TANZ 002 夜侦361男鞋运动鞋20", "qty": 1, "price": 352.33}]}]}
+nov16, _, _ = settle.merge_shots([
+    shot([("盲盒收纳展示架手办子透明防...", "", 2, 24.6)], 272),
+    shot([("正品澳洲摩洛哥护发精油经典黑...", "", 1, 110.29)], 565, "5127927841059004149"),
+    shot([("TANZ 002 夜梭361男鞋运动...", "", 1, 352.33)], 1773),
+    shot([("轻奢手工钛架眼镜男款近视度...", "", 1, 284.66)], 1426),
+])
+dups = settle.duplicate_notes(nov16, [NOV12])
+check("真實案例：三件重複都抓到，護髮精油沒有", [d.split(" ")[0] for d in dups], ["#1", "#3", "#4"])
+check("提醒寫出是哪一次結算的哪一號", dups[0], "#1 盲盒收纳展示架手办子透明防... ×2 ¥24.60 和結算 20261112-145453 的 #1 看起來是同一件，可能重複結算")
+check("同價但不同商品 → 不提醒", settle.duplicate_notes(settle.merge_shots([shot([("净得丽粘尘纸粘毛器10cm", "", 2, 24.6)], 100)])[0], [NOV12]), [])
+check("同名但數量不同 → 不提醒", settle.duplicate_notes(settle.merge_shots([shot([("盲盒收纳展示架手办亚克力柜", "", 1, 24.6)], 100)])[0], [NOV12]), [])
+check("沒有之前的結算 → 不提醒", settle.duplicate_notes(nov16, []), [])
+old_order = {"batch": "B0", "units": [{"order_no": "5127927841059004149", "items": [{"no": 1, "name": "x", "qty": 1, "price": 1.0}]}]}
+check("同一個訂單號 → 整筆提醒一次", settle.duplicate_notes(nov16, [old_order]), ["訂單 …004149 已經在結算 B0 算過了，可能重複結算"])
+same_draft, _, _ = settle.merge_shots([
+    shot([("盲盒收纳展示架手办亚克力柜", "颜色分类:集装箱", 2, 24.6), ("TANZ 002 夜倓361男鞋运动鞋20", "", 1, 352.33)], 4540),
+    shot([("盲盒收纳展示架手办子透明防...", "", 2, 24.6)], 272, "5127927841059000001"),
+])
+check("同一張草稿裡確認頁＋訂單頁拍到同一件 → 提醒算了兩次",
+      settle.duplicate_notes(same_draft, []), ["#3 盲盒收纳展示架手办子透明防... ×2 ¥24.60 和這張草稿的 #1 看起來是同一件（同一筆訂單的不同頁面？），可能算了兩次"])
+
 print("\nrate_notes：回算匯率檢查")
 check("比市場匯率高 8% → 提醒可能漏截圖", [n[:28] for n in settle.rate_notes(state["units"], 4.93)], ["TWD 4,540 這筆付款的回算匯率 5.323 比今"])
 check("和市場匯率差不多 → 不提醒", settle.rate_notes(multi["units"], 4.93), [])
@@ -211,13 +241,15 @@ check("unclassified 有認領說明", "回覆 `認領 編號`" in final, True)
 check("unclassified 的商品附上大約台幣", "#1 轻奢钛架男士高清防蓝光眼镜 ×1　¥284.66 ≈ TWD 1,515\n" in final, True)
 proxy = dict(state, poster="amy")
 check("代傳：草稿標出代傳的人，兩個人都能確認",
-      settle.render(proxy, final=False).split("\n")[0] + " / " + settle.render(proxy, final=False).split("\n")[-1],
+      settle.render(proxy, final=False).split("\n")[0] + " / " + settle.render(proxy, final=False).split("\n")[-2],
       "🧾 **結算草稿**｜下單人 ymj1123（amy 代傳） / ymj1123 或 amy 按 ✅ 確認並寫入表格，按 ❌ 取消（10 分鐘內有效）")
 check("代傳：正式版請大家轉給下單人，不是代傳的人",
       settle.render(proxy, final=True, mentions={"ymj1123": "<@1>"}).split("\n")[0], "🧾 **結算 20261112-1510**｜請轉帳給 <@1>（amy 代傳）")
 check("代傳：下單人自己的份仍標不用轉", "**<@1>　TWD 1,876**（¥352.33）（下單人自己的，不用轉）" in settle.render(proxy, final=True, mentions={"ymj1123": "<@1>"}), True)
 check("沒有代傳時不顯示", "代傳" in settle.render(state, final=False), False)
-check("沒有代傳時寫「下單人按 ✅」", settle.render(state, final=False).split("\n")[-1], "下單人按 ✅ 確認並寫入表格，按 ❌ 取消（10 分鐘內有效）")
+check("沒有代傳時寫「下單人按 ✅」", settle.render(state, final=False).split("\n")[-2], "下單人按 ✅ 確認並寫入表格，按 ❌ 取消（10 分鐘內有效）")
+check("草稿最後提示可以追加截圖", settle.render(state, final=False).split("\n")[-1], "還有截圖的話直接再傳（不用打「結算」），會併進這張草稿，編號接著排")
+check("正式結果沒有追加提示", "直接再傳" in settle.render(state, final=True), False)
 nobody = copy.deepcopy(state)
 for u in nobody["units"]:
     for it in u["items"]:

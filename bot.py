@@ -276,7 +276,8 @@ MAX_IMAGES = 10
 MAX_IMAGE_BYTES = 3_000_000  # Groq 的 base64 圖片上限是 4MB，編碼後會膨脹三分之一
 MATCH_CHUNK = 6  # 一次請 LLM 比對幾個商品；太多會超過每分鐘的 token 額度
 LLM_RETRY_WAIT = 15
-SETTLEMENTS: dict[str, dict] = {}  # batch → 結算狀態，照建立順序
+SETTLEMENTS: dict[str, dict] = {}  # batch → 已公布的結算，照建立順序
+PENDING: dict[tuple[int, int], dict] = {}  # (頻道, 傳圖的人) → 還沒按 ✅ 的草稿；追加的截圖會併進來
 
 
 class SettleError(Exception):
@@ -364,14 +365,26 @@ async def market_rate() -> float | None:
         return None
 
 
-async def build_settlement(message: discord.Message, images: list, payer) -> tuple[dict, list[dict]]:
+async def read_images(images: list) -> list[dict]:
     shots = []
     for i, att in enumerate(images, 1):
         if att.size > MAX_IMAGE_BYTES:
             raise SettleError(f"第 {i} 張圖超過 3MB，請改傳手機截圖（不要傳原始相片檔）")
         shots.append(await read_screenshot(await att.read(), att.content_type.split(";")[0]))
+    return shots
 
-    units, errors, notes = settle.merge_shots(shots)
+
+def next_number(channel_id: int, session: dict) -> int:
+    """同頻道裡還能認領的結算、和其他人進行中的草稿用到的最大編號 + 1，讓「認領 N」不會撞號。"""
+    used = [it["no"] for s in SETTLEMENTS.values() if s["channel_id"] == channel_id and not s.get("closed")
+            for u in s["units"] for it in u["items"]]
+    used += [it["no"] for p in PENDING.values() if p is not session and p["channel_id"] == channel_id and p["state"]
+             for u in p["state"]["units"] for it in u["items"]]
+    return max(used, default=0) + 1
+
+
+async def build_settlement(session: dict, shots: list[dict]) -> tuple[dict, list[dict]]:
+    units, errors, notes = settle.merge_shots(shots, start=next_number(session["channel_id"], session))
     if errors:
         raise SettleError("截圖有問題，沒辦法結算：\n" + "\n".join(f"- {e}" for e in errors))
     if not units:
@@ -387,16 +400,20 @@ async def build_settlement(message: discord.Message, images: list, payer) -> tup
 
     payload = settle.match_payload(units, rows)
     writes, more = settle.assign(units, rows, payload, await match_rows(payload))
+    previous = [s for s in SETTLEMENTS.values() if s["channel_id"] == session["channel_id"]]
+    if "market_rate" not in session:
+        session["market_rate"] = await market_rate()
+    payer, poster = session["payer"], session["poster"]
     state = {
-        "batch": datetime.now().strftime("%Y%m%d-%H%M%S"),
+        "batch": session["batch"],
         "payer": payer.name,
         "payer_id": payer.id,
-        "poster": "" if payer.id == message.author.id else message.author.name,
-        "poster_id": message.author.id,
-        "channel_id": message.channel.id,
+        "poster": "" if payer.id == poster.id else poster.name,
+        "poster_id": poster.id,
+        "channel_id": session["channel_id"],
         "units": units,
-        "notes": notes + more,
-        "market_rate": await market_rate(),
+        "notes": notes + more + settle.duplicate_notes(units, previous),
+        "market_rate": session["market_rate"],
         "mentions": {},
         "message_ids": [],
     }
@@ -432,42 +449,88 @@ async def member_mentions(guild, state: dict) -> dict:
 
 
 async def handle_settle(message: discord.Message):
+    """「結算」＋截圖開一張草稿；還沒按 ✅ 之前，同一個人在同頻道再傳的截圖都併進同一張。"""
     images = [a for a in message.attachments if (a.content_type or "").startswith("image/")][:MAX_IMAGES]
     if not images:
         await message.reply("要結算的話，請把下單截圖和「結算」放在同一則訊息裡傳上來 🧾")
         return
 
-    payer = named_user(message) or message.author  # 「結算 @B」＝幫 B 結算，大家要轉帳給 B
+    key = (message.channel.id, message.author.id)
+    session = PENDING.get(key)
+    if session is None:
+        batch, taken, n = datetime.now().strftime("%Y%m%d-%H%M%S"), set(SETTLEMENTS) | {p["batch"] for p in PENDING.values()}, 1
+        while (batch if n == 1 else f"{batch}-{n}") in taken:  # 同一秒有兩個人開始結算
+            n += 1
+        session = PENDING[key] = {
+            "batch": batch if n == 1 else f"{batch}-{n}",
+            "payer": named_user(message) or message.author,  # 「結算 @B」＝幫 B 結算，大家要轉帳給 B
+            "poster": message.author,
+            "channel_id": message.channel.id,
+            "guild": message.guild,
+            "lock": asyncio.Lock(),
+            "shots": [],
+            "state": None,
+            "writes": [],
+            "drafts": [],
+            "timer": None,
+        }
+
     await safe_react(message, "⏳")
     try:
-        state, writes = await build_settlement(message, images, payer)
+        async with session["lock"]:
+            if PENDING.get(key) is not session:
+                await message.reply("剛剛那張草稿已經確認或取消了，這幾張沒有算進去。要另外結算的話，請重新傳並打「結算」。")
+                return
+            shots = session["shots"] + await read_images(images)
+            state, writes = await build_settlement(session, shots)
+            sent = await send_chunks(message, settle.render(state, final=False))
+            old = session["drafts"]
+            session.update(shots=shots, state=state, writes=writes, drafts=sent)
+            for draft in old:
+                try:
+                    await draft.delete()
+                except Exception as e:
+                    print("[WARN] 刪不掉舊草稿:", e)
+            await safe_react(sent[-1], "✅")
+            await safe_react(sent[-1], "❌")
+            restart_timer(key, session)
     except SettleError as e:
-        await message.reply(str(e))
-        return
+        await message.reply(str(e) + ("\n（之前的草稿還在，這幾張沒有併進去）" if session["state"] else ""))
     except Exception as e:
         print("Error building settlement:", repr(e))
         await message.reply("結算時我撞牆了 QQ 請幫我看一下 log")
-        return
     finally:
+        if session["state"] is None and PENDING.get(key) is session:
+            PENDING.pop(key)
         await safe_react(message, "⏳", remove=True)
 
-    prompt = (await send_chunks(message, settle.render(state, final=False)))[-1]
-    await safe_react(prompt, "✅")
-    await safe_react(prompt, "❌")
 
-    def can_confirm(reaction, user):
-        return (
-            reaction.message.id == prompt.id
-            and user.id in (message.author.id, payer.id)
-            and str(reaction.emoji) in ("✅", "❌")
-        )
+def restart_timer(key: tuple, session: dict):
+    if session["timer"]:
+        session["timer"].cancel()
+    session["timer"] = asyncio.create_task(expire_draft(key, session))
 
-    try:
-        reaction, _ = await bot.wait_for("reaction_add", timeout=SETTLE_CONFIRM_SECONDS, check=can_confirm)
-    except asyncio.TimeoutError:
-        await prompt.reply("⌛ 太久沒有確認，這次結算已取消，表格沒有變動。")
-        return
-    if str(reaction.emoji) == "❌":
+
+async def expire_draft(key: tuple, session: dict):
+    await asyncio.sleep(SETTLE_CONFIRM_SECONDS)
+    async with session["lock"]:
+        if PENDING.get(key) is not session:
+            return
+        PENDING.pop(key)
+    await session["drafts"][-1].reply("⌛ 太久沒有確認，這次結算已取消，表格沒有變動。")
+
+
+async def confirm_draft(key: tuple, session: dict, message_id: int, ok: bool):
+    async with session["lock"]:
+        # 按的是被新截圖取代掉的舊草稿 → 不算，要在新的草稿上按
+        if PENDING.get(key) is not session or session["drafts"][-1].id != message_id:
+            return
+        PENDING.pop(key)
+        if session["timer"]:
+            session["timer"].cancel()
+
+    prompt, state, writes = session["drafts"][-1], session["state"], session["writes"]
+    if not ok:
         await prompt.reply("已取消，表格沒有變動。")
         return
 
@@ -491,7 +554,7 @@ async def handle_settle(message: discord.Message):
             await prompt.reply(f"結算結果寫進表格失敗 QQ（n8n 回 {resp.status_code}），表格沒有變動。")
             return
 
-    state["mentions"] = await member_mentions(message.guild, state)
+    state["mentions"] = await member_mentions(session["guild"], state)
     sent = await send_chunks(prompt, settle.render(state, final=True, mentions=state["mentions"]), ping=True)
     state["message_ids"] = [m.id for m in sent]
     SETTLEMENTS[state["batch"]] = state
@@ -510,6 +573,8 @@ async def handle_claim(message: discord.Message, no: int):
     state = next((s for s in pool if replied_to in s["message_ids"]), None)
     if state is None:
         state = next((s for s in reversed(pool) if open_item(s)), None)
+    if state is None:  # 有這個編號但不能領（已經有主），交給 claim() 說明原因
+        state = next((s for s in reversed(pool) if not s.get("closed") and settle.find_item(s, no)[1]), None)
     if state is None:
         await message.reply(f"找不到還沒人認領的 #{no} 🙅\n要認領的話，請直接回覆在那則結算訊息底下。")
         return
@@ -539,8 +604,21 @@ async def handle_claim(message: discord.Message, no: int):
 
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    """下單人在結算訊息上按 🏁 → 結束認領。用 raw 事件，bot 重啟後、訊息不在快取裡也收得到。"""
-    if str(payload.emoji) != CLOSE_EMOJI or (bot.user and payload.user_id == bot.user.id):
+    """草稿上的 ✅／❌ 確認或取消；結算訊息上的 🏁 結束認領。
+
+    用 raw 事件：bot 重啟後、訊息不在快取裡也收得到。
+    """
+    emoji = str(payload.emoji)
+    if bot.user and payload.user_id == bot.user.id:
+        return
+    if emoji in ("✅", "❌"):
+        for key, session in list(PENDING.items()):
+            if session["drafts"] and session["drafts"][-1].id == payload.message_id:
+                if payload.user_id in (session["payer"].id, session["poster"].id):
+                    await confirm_draft(key, session, payload.message_id, emoji == "✅")
+                return
+        return
+    if emoji != CLOSE_EMOJI:
         return
     state = next((s for s in SETTLEMENTS.values() if payload.message_id in s["message_ids"]), None)
     if state is None or state.get("closed"):
@@ -590,7 +668,9 @@ async def on_message(message: discord.Message):
     # ============================================
     # 0) 結算（附下單截圖）／認領 unclassified 的商品
     # ============================================
-    if SETTLE_RE.match(text):
+    has_image = any((a.content_type or "").startswith("image/") for a in message.attachments)
+    adding = has_image and (message.channel.id, message.author.id) in PENDING and not text.startswith("買")
+    if SETTLE_RE.match(text) or adding:
         await handle_settle(message)
         await bot.process_commands(message)
         return

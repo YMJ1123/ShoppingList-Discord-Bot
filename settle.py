@@ -2,6 +2,7 @@
 
 這裡只有純邏輯，不碰 Discord、n8n、LLM，所以可以直接測。
 """
+import copy
 import math
 import re
 
@@ -138,6 +139,49 @@ def merge_shots(shots: list[dict], start: int = 1) -> tuple[list[dict], list[str
     return units, errors, notes
 
 
+def prepare_append(base: dict, incoming_units: list[dict]) -> tuple[dict, list[dict], list[str]]:
+    """追加商品，保留原有編號及認領。delta 的新商品與 combined 共用物件，供 assign 寫入歸屬。"""
+    combined = copy.deepcopy(base)
+    if base.get("closed"):
+        return combined, [], [f"結算 {base['batch']} 已經結束認領，不能再追加商品"]
+
+    additions = {}
+    for incoming in copy.deepcopy(incoming_units):
+        order_no = incoming.get("order_no") or ""
+        matches = [unit for unit in combined["units"]
+                   if (order_no and unit.get("order_no") == order_no)
+                   or (not order_no and not unit.get("order_no") and unit["total_twd"] == incoming["total_twd"])]
+        if len(matches) > 1:
+            return copy.deepcopy(base), [], ["追加截圖對到多筆相同付款，無法判斷要併進哪一筆，請提供有訂單號的截圖"]
+        if matches and matches[0]["total_twd"] != incoming["total_twd"]:
+            return copy.deepcopy(base), [], [f"訂單 …{order_no[-6:]} 的台幣金額和原結算不同，請確認截圖"]
+
+        if matches:
+            unit = matches[0]
+        else:
+            unit = dict(incoming, items=[])
+            combined["units"].append(unit)
+        identity = lambda it: (norm(it["name"]), norm(it.get("spec")), it["qty"], it["price"])
+        seen = {identity(it) for it in unit["items"]}
+        for item in incoming["items"]:
+            key = identity(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            item.setdefault("shares", [{"owner": UNCLASSIFIED, "cny": item["line"]}])
+            item.setdefault("hint", "")
+            item.setdefault("rows", [])
+            unit["items"].append(item)
+            additions.setdefault(id(unit), (unit, []))[1].append(item)
+        unit["cny"] = round(sum(it["line"] for it in unit["items"]), 2)
+        unit["rate"] = unit["total_twd"] / unit["cny"]
+
+    if not additions:
+        return copy.deepcopy(base), [], ["這些截圖的商品都已經在這筆結算裡，沒有新的商品可以追加"]
+    added_units = [dict(unit, items=items) for unit, items in additions.values()]
+    return combined, added_units, []
+
+
 # ---------------------------------------------------------------- 對到表格
 
 def _grams(text) -> set:
@@ -163,6 +207,21 @@ def _same_goods(a: dict, b: dict) -> bool:
         return False
     ga, gb = _grams(a["name"]), _grams(b["name"])
     return len(ga & gb) / max(1, min(len(ga), len(gb))) >= 0.3
+
+
+def append_overlap_notes(base: dict, added_units: list[dict]) -> list[str]:
+    """同筆付款的 OCR 名稱有差異時保留新商品，但提醒確認是否重複。"""
+    notes = []
+    for unit in added_units:
+        order_no = unit.get("order_no") or ""
+        previous = [old for old in base["units"]
+                    if (order_no and old.get("order_no") == order_no)
+                    or (not order_no and not old.get("order_no") and old["total_twd"] == unit["total_twd"])]
+        for item in unit["items"]:
+            overlap = next((old for payment in previous for old in payment["items"] if _same_goods(old, item)), None)
+            if overlap is not None:
+                notes.append(f"#{item['no']} {_short(item['name'], 16)} 和原結算的 #{overlap['no']} 看起來是同一件，可能重複，請確認這次追加的商品")
+    return notes
 
 
 def duplicate_notes(units: list[dict], previous: list[dict]) -> list[str]:
@@ -416,6 +475,67 @@ def render_totals(state: dict, mentions: dict | None = None) -> str:
     if UNCLASSIFIED in t["twd"]:
         left = [f"#{it['no']}" for u in state["units"] for it in u["items"] if is_unclassified(it)]
         lines.append(f"❓ 還沒人認領　TWD {t['twd'][UNCLASSIFIED]:,}（{'、'.join(left)}）")
+    return "\n".join(lines)
+
+
+def changed_owners(before: dict, after: dict) -> set[str]:
+    old, new = totals(before)["twd"], totals(after)["twd"]
+    return {owner for owner in old.keys() | new.keys()
+            if owner != UNCLASSIFIED and old.get(owner, 0) != new.get(owner, 0)}
+
+
+def _append_item_lines(added_units: list[dict], mentions: dict | None = None) -> list[str]:
+    mentions = mentions or {}
+    lines = []
+    for unit in added_units:
+        for item in unit["items"]:
+            owners = "、".join(dict.fromkeys(mentions.get(s["owner"], s["owner"]) for s in item["shares"]))
+            lines.append(f"#{item['no']} {_short(item['name'])} ×{item['qty']}　¥{item['line']:.2f}（{owners}）")
+    return lines
+
+
+def _append_paid_line(before: dict, after: dict) -> str:
+    old, new = totals(before)["total_twd"], totals(after)["total_twd"]
+    return f"實付合計 TWD {old:,} → TWD {new:,}（{new - old:+,}）"
+
+
+def render_append_draft(base: dict, combined: dict, added_units: list[dict], notes: list[str], market=None) -> str:
+    payer, poster = base["payer"], base.get("poster") or ""
+    head = f"🧾 **追加結算草稿**｜結算 {base['batch']}｜下單人 {payer}"
+    if poster:
+        head += f"（{poster} 代傳）"
+    lines = [head, _append_paid_line(base, combined), "", "**這次追加的商品**"]
+    lines += _append_item_lines(added_units)
+    old, new = totals(base)["twd"], totals(combined)["twd"]
+    changes = [owner for owner in sorted(old.keys() | new.keys()) if old.get(owner, 0) != new.get(owner, 0)]
+    lines += ["", "**金額變化**"]
+    for owner in changes:
+        label = "❓ 還沒人認領" if owner == UNCLASSIFIED else owner
+        previous, current = old.get(owner, 0), new.get(owner, 0)
+        lines.append(f"{label}　TWD {previous:,} → TWD {current:,}（{current - previous:+,}）")
+    if not changes:
+        lines.append("每人應付台幣金額維持原值")
+    warnings = list(notes) + rate_notes(added_units, market)
+    if warnings:
+        lines += ["", "⚠️ 請確認"] + [f"　{note}" for note in warnings]
+    confirmer = f"{payer} 或 {poster}" if poster else payer
+    lines += ["", f"{confirmer} 按 ✅ 確認追加並寫入原結算批次，按 ❌ 取消（10 分鐘內有效）",
+              "還有漏掉的截圖可以直接再傳，會併進這張追加草稿"]
+    return "\n".join(lines)
+
+
+def render_append_result(before: dict, after: dict, added_units: list[dict]) -> str:
+    mentions = after.get("mentions") or {}
+    payer, poster = after["payer"], after.get("poster") or ""
+    who = lambda owner: mentions.get(owner, owner)
+    lines = [f"🧾 **結算 {after['batch']} 已追加**｜請轉帳給 {who(payer)}",
+             _append_paid_line(before, after), "", "**這次追加的商品**"]
+    lines += _append_item_lines(added_units, mentions)
+    lines += ["", "**更新後的每人金額**", render_totals(after, mentions)]
+    if has_unclassified(after):
+        lines += ["", "是你的商品就回覆 `認領 編號`，幫別人認領用 `認領 編號 @某人`"]
+    closer = f"{payer} 或 {poster}" if poster else payer
+    lines += [f"{closer} 按 🏁 結束認領，公布最終金額"]
     return "\n".join(lines)
 
 

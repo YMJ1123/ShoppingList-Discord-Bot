@@ -3,8 +3,10 @@ import re
 import json
 import base64
 import asyncio
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import requests
 import discord
@@ -279,10 +281,22 @@ MATCH_CHUNK = 6  # 一次請 LLM 比對幾個商品；太多會超過每分鐘�
 LLM_RETRY_WAIT = 15
 SETTLEMENTS: dict[str, dict] = {}  # batch → 已公布的結算，照建立順序
 PENDING: dict[tuple[int, int], dict] = {}  # (頻道, 傳圖的人) → 還沒按 ✅ 的草稿；追加的截圖會併進來
+SETTLEMENT_LOCKS: dict[str, asyncio.Lock] = {}
+CHANNEL_LOCKS: dict[int, asyncio.Lock] = {}
 
 
 class SettleError(Exception):
     """可以直接回給使用者看的錯誤。"""
+
+
+def settlement_lock(batch: str) -> asyncio.Lock:
+    return SETTLEMENT_LOCKS.setdefault(batch, asyncio.Lock())
+
+
+def replied_settlement(message: discord.Message) -> dict | None:
+    message_id = message.reference.message_id if message.reference else None
+    return next((s for s in SETTLEMENTS.values()
+                 if s["channel_id"] == message.channel.id and message_id in s["message_ids"]), None)
 
 
 def named_user(message: discord.Message):
@@ -298,15 +312,18 @@ def load_settlements():
 
 def save_settlements():
     if not STATE_DIR:
-        return
+        return True
     for old in list(SETTLEMENTS)[:-30]:
-        del SETTLEMENTS[old]
+        if not SETTLEMENTS[old].get("append_attempt"):
+            del SETTLEMENTS[old]
     try:
         tmp = Path(STATE_DIR) / "settlements.json.tmp"
         tmp.write_text(json.dumps(SETTLEMENTS, ensure_ascii=False), encoding="utf-8")
         tmp.replace(Path(STATE_DIR) / "settlements.json")
+        return True
     except OSError as e:
         print("[WARN] 結算紀錄存檔失敗（重啟後會無法認領）:", e)
+        return False
 
 
 async def llm_json(client, **kwargs) -> dict:
@@ -394,12 +411,14 @@ def next_number(channel_id: int, session: dict) -> int:
     """同頻道裡還能認領的結算、和其他人進行中的草稿用到的最大編號 + 1，讓「認領 N」不會撞號。"""
     used = [it["no"] for s in SETTLEMENTS.values() if s["channel_id"] == channel_id and not s.get("closed")
             for u in s["units"] for it in u["items"]]
+    used += [it["no"] for s in SETTLEMENTS.values() if s["channel_id"] == channel_id and not s.get("closed")
+             for u in s.get("append_attempt", {}).get("added_units", []) for it in u["items"]]
     used += [it["no"] for p in PENDING.values() if p is not session and p["channel_id"] == channel_id and p["state"]
              for u in p["state"]["units"] for it in u["items"]]
     return max(used, default=0) + 1
 
 
-async def build_settlement(session: dict, shots: list[dict]) -> tuple[dict, list[dict]]:
+async def build_settlement(session: dict, shots: list[dict]) -> tuple[dict, list[dict], dict]:
     units, errors, notes = settle.merge_shots(shots, start=next_number(session["channel_id"], session))
     if errors:
         raise SettleError("截圖有問題，沒辦法結算：\n" + "\n".join(f"- {e}" for e in errors))
@@ -409,17 +428,39 @@ async def build_settlement(session: dict, shots: list[dict]) -> tuple[dict, list
             "請傳淘寶「确认订单」頁或訂單詳情頁的截圖，要拍到台幣金額。"
         )
 
+    base = None
+    if session.get("append_to"):
+        base = SETTLEMENTS.get(session["append_to"])
+        if base is None or base.get("closed"):
+            raise SettleError("這筆結算已經結束認領，不能再追加截圖。")
+        if base.get("append_attempt"):
+            raise SettleError("這筆結算有已確認的追加正在寫入，請先在那張追加草稿按 ✅ 重試完成。")
+        state, units, errors = settle.prepare_append(base, units)
+        if errors:
+            raise SettleError("沒辦法追加：\n" + "\n".join(f"- {e}" for e in errors))
+
     resp = await post_to_n8n({"action": "list"}, N8N_SETTLE_WEBHOOK_URL)
     if not resp.ok:
         raise SettleError(f"讀不到購物清單 QQ（n8n 回 {resp.status_code}）")
     rows = resp.json()["rows"]
+    if base is not None:
+        used = {row for u in base["units"] for it in u["items"] for row in it.get("rows", [])}
+        rows = [r for r in rows if settle.row_id(r) not in used]
 
     payload = settle.match_payload(units, rows)
     writes, more = settle.assign(units, rows, payload, await match_rows(payload))
-    previous = [s for s in SETTLEMENTS.values() if s["channel_id"] == session["channel_id"]]
+    previous = [s for s in SETTLEMENTS.values() if s["channel_id"] == session["channel_id"]
+                and s["batch"] != session.get("append_to")]
     if "market_rate" not in session:
         session["market_rate"] = await market_rate()
     payer, poster = session["payer"], session["poster"]
+    notes += more + settle.duplicate_notes(units, previous)
+    if base is not None:
+        notes += settle.append_overlap_notes(base, units)
+        details = dict(added_units=units, append_notes=notes, before_state=deepcopy(base),
+                       base_revision=base.get("append_revision", 0))
+        state["notes"] = list(base.get("notes") or []) + notes
+        return state, writes, details
     state = {
         "batch": session["batch"],
         "payer": payer.name,
@@ -428,21 +469,26 @@ async def build_settlement(session: dict, shots: list[dict]) -> tuple[dict, list
         "poster_id": poster.id,
         "channel_id": session["channel_id"],
         "units": units,
-        "notes": notes + more + settle.duplicate_notes(units, previous),
+        "notes": notes,
         "market_rate": session["market_rate"],
         "mentions": {},
         "message_ids": [],
     }
-    return state, writes
+    return state, writes, {}
 
 
-async def send_chunks(target: discord.Message, text: str, ping: bool = False) -> list:
+async def send_chunks(target: discord.Message, text: str, ping=False, register: dict | None = None) -> list:
     # 只 ping 人：商品名稱是從截圖讀來的，不能讓它觸發 @everyone 或身分組
-    allowed = discord.AllowedMentions(everyone=False, roles=False, users=ping)
+    allowed = discord.AllowedMentions(everyone=False, roles=False, users=ping, replied_user=False)
     chunks = settle.split_message(text)
-    sent = [await target.reply(chunks[0], allowed_mentions=allowed)]
-    for chunk in chunks[1:]:
-        sent.append(await target.channel.send(chunk, allowed_mentions=allowed))
+    sent = []
+    for i, chunk in enumerate(chunks):
+        message = (await target.reply(chunk, allowed_mentions=allowed) if i == 0
+                   else await target.channel.send(chunk, allowed_mentions=allowed))
+        sent.append(message)
+        if register is not None:
+            register["message_ids"].append(message.id)
+            save_settlements()
     return sent
 
 
@@ -464,7 +510,7 @@ async def member_mentions(guild, state: dict) -> dict:
     return mentions
 
 
-async def handle_settle(message: discord.Message):
+async def handle_settle(message: discord.Message, append_to: dict | None = None):
     """「結算」＋截圖開一張草稿；還沒按 ✅ 之前，同一個人在同頻道再傳的截圖都併進同一張。"""
     images = [a for a in message.attachments if (a.content_type or "").startswith("image/")][:MAX_IMAGES]
     if not images:
@@ -473,6 +519,16 @@ async def handle_settle(message: discord.Message):
 
     key = (message.channel.id, message.author.id)
     session = PENDING.get(key)
+    if session is not None and session.get("write_started"):
+        await message.reply("這批追加已經確認並送出寫入，請先在原追加草稿按 ✅ 重試完成，再傳其他截圖。")
+        return
+    if append_to is not None:
+        if append_to.get("closed"):
+            await message.reply("這筆結算已經結束認領，不能再追加截圖。")
+            return
+        if session is not None and session.get("append_to") != append_to["batch"]:
+            await message.reply("你還有另一張草稿，請先按 ✅ 確認或 ❌ 取消，再追加這筆結算。")
+            return
     if session is None:
         batch, taken, n = datetime.now().strftime("%Y%m%d-%H%M%S"), set(SETTLEMENTS) | {p["batch"] for p in PENDING.values()}, 1
         while (batch if n == 1 else f"{batch}-{n}") in taken:  # 同一秒有兩個人開始結算
@@ -490,6 +546,14 @@ async def handle_settle(message: discord.Message):
             "drafts": [],
             "timer": None,
         }
+        if append_to is not None:
+            session.update(
+                batch=append_to["batch"], append_to=append_to["batch"],
+                payer=SimpleNamespace(name=append_to["payer"], id=append_to["payer_id"]),
+                poster=SimpleNamespace(name=append_to.get("poster") or append_to["payer"],
+                                       id=append_to.get("poster_id", append_to["payer_id"])),
+                market_rate=append_to.get("market_rate"),
+            )
 
     await safe_react(message, "⏳")
     try:
@@ -498,10 +562,20 @@ async def handle_settle(message: discord.Message):
                 await message.reply("剛剛那張草稿已經確認或取消了，這幾張沒有算進去。要另外結算的話，請重新傳並打「結算」。")
                 return
             shots = session["shots"] + await read_images(images, first=len(session["shots"]) + 1)
-            state, writes = await build_settlement(session, shots)
-            sent = await send_chunks(message, settle.render(state, final=False))
-            old = session["drafts"]
-            session.update(shots=shots, state=state, writes=writes, drafts=sent)
+            async with CHANNEL_LOCKS.setdefault(message.channel.id, asyncio.Lock()):
+                if session.get("append_to"):
+                    async with settlement_lock(session["append_to"]):
+                        state, writes, details = await build_settlement(session, shots)
+                else:
+                    state, writes, details = await build_settlement(session, shots)
+                if session.get("append_to"):
+                    text = settle.render_append_draft(details["before_state"], state, details["added_units"],
+                                                      details["append_notes"], session.get("market_rate"))
+                else:
+                    text = settle.render(state, final=False)
+                sent = await send_chunks(message, text)
+                old = session["drafts"]
+                session.update(shots=shots, state=state, writes=writes, drafts=sent, **details)
             for draft in old:
                 try:
                     await draft.delete()
@@ -532,8 +606,108 @@ async def expire_draft(key: tuple, session: dict):
     async with session["lock"]:
         if PENDING.get(key) is not session:
             return
+        if session.get("write_started"):
+            await session["drafts"][-1].reply("追加已確認並存檔，表格寫入結果仍待確認，請移除再加上 ✅ 重試完成。")
+            return
         PENDING.pop(key)
     await session["drafts"][-1].reply("⌛ 太久沒有確認，這次結算已取消，表格沒有變動。")
+
+
+def discard_draft(key: tuple, session: dict):
+    if PENDING.get(key) is session:
+        PENDING.pop(key)
+    if session["timer"]:
+        session["timer"].cancel()
+
+
+async def write_settlement(prompt, state: dict, writes: list[dict], retrying: bool = False) -> str:
+    """成功回空字串；表格衝突須重做草稿，暫時失敗可重試同一批寫入。"""
+    if not writes:
+        return ""
+    try:
+        resp = await post_to_n8n(
+            {"action": "settle", "batch": state["batch"], "rows": writes}, N8N_SETTLE_WEBHOOK_URL
+        )
+    except Exception as e:
+        print("Error sending settle to n8n:", e)
+        await prompt.reply(n8n_failure_reply("結算", "寫進表格", e))
+        return "retry"
+    if resp.status_code == 409:
+        problems = resp.json().get("problems", [])
+        explanation = ("先前的追加可能已寫進表格，但這次核對發現內容有變。已保留確認紀錄，請先核對這些列：\n"
+                       if retrying else "表格在這幾分鐘內被改過，這次沒有寫入任何東西，請重新傳截圖結算一次：\n")
+        await prompt.reply(
+            explanation
+            + "\n".join(f"- {p['tab']} 第 {p['row']} 列：{p['reason']}" for p in problems[:10])
+        )
+        return "conflict"
+    if not resp.ok:
+        await prompt.reply(f"結算結果寫進表格失敗 QQ（n8n 回 {resp.status_code}），請稍後再試。")
+        return "retry"
+    return ""
+
+
+async def confirm_append(key: tuple, session: dict):
+    prompt = session["drafts"][-1]
+    async with settlement_lock(session["append_to"]):
+        state = SETTLEMENTS.get(session["append_to"])
+        if state is None or state.get("closed"):
+            discard_draft(key, session)
+            await prompt.reply("這筆結算已經結束認領，不能再追加截圖。")
+            return
+        attempt = state.get("append_attempt")
+        if attempt and attempt["prompt_id"] != prompt.id:
+            await prompt.reply("這筆結算有另一批已確認的追加正在寫入，請先完成那張草稿。")
+            return
+        if state.get("append_revision", 0) != session["base_revision"]:
+            discard_draft(key, session)
+            await prompt.reply("這筆結算已有另一批追加確認，請回覆最新結算訊息重傳這次截圖，重新確認金額。")
+            return
+        before = deepcopy(state)
+        combined, added, errors = settle.prepare_append(state, session["added_units"])
+        if errors:
+            discard_draft(key, session)
+            await prompt.reply("沒辦法追加：\n" + "\n".join(errors))
+            return
+        if not attempt:
+            state["append_attempt"] = {
+                "added_units": deepcopy(session["added_units"]), "writes": deepcopy(session["writes"]),
+                "notes": list(session["append_notes"]), "base_revision": session["base_revision"],
+                "prompt_id": prompt.id, "submitter_id": key[1],
+            }
+            if not save_settlements():
+                state.pop("append_attempt")
+                await prompt.reply("追加確認紀錄存檔失敗，請稍後按 ✅ 重試。")
+                return
+        session["write_started"] = True
+        outcome = await write_settlement(prompt, combined, session["writes"], retrying=bool(attempt))
+        if outcome:
+            if outcome == "conflict" and not attempt:
+                state.pop("append_attempt", None)
+                save_settlements()
+                discard_draft(key, session)
+            else:
+                restart_timer(key, session)
+                await prompt.reply("追加草稿仍保留，稍後請移除再加上 ✅ 重試同一批追加。")
+            return
+
+        combined["notes"] = list(state.get("notes") or []) + session["append_notes"]
+        combined["append_revision"] = state.get("append_revision", 0) + 1
+        state.update(combined)
+        state.pop("append_attempt", None)
+        save_settlements()
+        discard_draft(key, session)
+        try:
+            state["mentions"].update(await member_mentions(session["guild"], state))
+            changed = settle.changed_owners(before, state)
+            people = [discord.Object(id=int(mention[2:-1].lstrip("!")))
+                      for name in changed if (mention := state["mentions"].get(name, "")).startswith("<@")]
+            text = settle.render_append_result(before, state, added)
+            sent = await send_chunks(prompt, text, ping=people, register=state)
+            await safe_react(sent[-1], CLOSE_EMOJI)
+        except Exception as e:
+            print(f"[ERROR] 結算 {state['batch']} 已追加，但通知送不出去:", repr(e))
+            await prompt.reply("追加已完成並存檔，但更新金額的通知送出失敗，請查看 bot log。")
 
 
 async def confirm_draft(key: tuple, session: dict, message_id: int, ok: bool):
@@ -541,42 +715,28 @@ async def confirm_draft(key: tuple, session: dict, message_id: int, ok: bool):
         # 按的是被新截圖取代掉的舊草稿 → 不算，要在新的草稿上按
         if PENDING.get(key) is not session or session["drafts"][-1].id != message_id:
             return
-        PENDING.pop(key)
-        if session["timer"]:
-            session["timer"].cancel()
-
-    prompt, state, writes = session["drafts"][-1], session["state"], session["writes"]
-    if not ok:
-        await prompt.reply("已取消，表格沒有變動。")
-        return
-
-    if writes:
-        try:
-            resp = await post_to_n8n(
-                {"action": "settle", "batch": state["batch"], "rows": writes}, N8N_SETTLE_WEBHOOK_URL
-            )
-        except Exception as e:
-            print("Error sending settle to n8n:", e)
-            await prompt.reply(n8n_failure_reply("結算", "寫進表格", e))
+        prompt, state, writes = session["drafts"][-1], session["state"], session["writes"]
+        if not ok:
+            if session.get("write_started"):
+                await prompt.reply("這批追加已經確認並送出，請按 ✅ 重試完成寫入。")
+                return
+            discard_draft(key, session)
+            await prompt.reply("已取消，表格沒有變動。")
             return
-        if resp.status_code == 409:
-            problems = resp.json().get("problems", [])
-            await prompt.reply(
-                "表格在這幾分鐘內被改過，這次沒有寫入任何東西，請重新傳截圖結算一次：\n"
-                + "\n".join(f"- {p['tab']} 第 {p['row']} 列：{p['reason']}" for p in problems[:10])
-            )
+        if session.get("append_to"):
+            await confirm_append(key, session)
             return
-        if not resp.ok:
-            await prompt.reply(f"結算結果寫進表格失敗 QQ（n8n 回 {resp.status_code}），表格沒有變動。")
+        if await write_settlement(prompt, state, writes):
+            discard_draft(key, session)
             return
 
-    state["mentions"] = await member_mentions(session["guild"], state)
-    sent = await send_chunks(prompt, settle.render(state, final=True, mentions=state["mentions"]), ping=True)
-    state["message_ids"] = [m.id for m in sent]
-    SETTLEMENTS[state["batch"]] = state
-    save_settlements()
-    if settle.has_unclassified(state):
-        await safe_react(sent[-1], CLOSE_EMOJI)
+        state["mentions"] = await member_mentions(session["guild"], state)
+        SETTLEMENTS[state["batch"]] = state
+        save_settlements()
+        discard_draft(key, session)
+        sent = await send_chunks(prompt, settle.render(state, final=True, mentions=state["mentions"]), ping=True, register=state)
+        if settle.has_unclassified(state):
+            await safe_react(sent[-1], CLOSE_EMOJI)
 
 
 def claim_numbers(text: str) -> list[int]:
@@ -611,7 +771,14 @@ async def handle_claim(message: discord.Message, nos: list[int]):
     failed = []
     for no in nos:
         state = find_state(no)
-        error = f"找不到還沒人認領的 #{no} 🙅" if state is None else settle.claim(state, no, target.name)
+        if state is None:
+            error = f"找不到還沒人認領的 #{no} 🙅"
+        else:
+            async with settlement_lock(state["batch"]):
+                error = settle.claim(state, no, target.name)
+                if not error:
+                    state["mentions"][target.name] = target.mention
+                    save_settlements()
         if error:
             failed.append(error)
         else:
@@ -672,16 +839,23 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if payload.user_id not in (state["payer_id"], state.get("poster_id", state["payer_id"])):
         return
 
-    settle.close(state)
-    save_settlements()
-    try:
-        channel = bot.get_channel(payload.channel_id) or await bot.fetch_channel(payload.channel_id)
-        ref = discord.MessageReference(message_id=payload.message_id, channel_id=payload.channel_id, fail_if_not_exists=False)
-        allowed = discord.AllowedMentions(everyone=False, roles=False, users=True)
-        for i, chunk in enumerate(settle.split_message(settle.render_closed(state, state["mentions"]))):
-            await channel.send(chunk, reference=ref if i == 0 else None, allowed_mentions=allowed)
-    except Exception as e:
-        print(f"[ERROR] 結算 {state['batch']} 已結束認領，但公布訊息送不出去:", repr(e))
+    async with settlement_lock(state["batch"]):
+        if state.get("closed"):
+            return
+        if state.get("append_attempt"):
+            channel = bot.get_channel(payload.channel_id) or await bot.fetch_channel(payload.channel_id)
+            await channel.send("這筆結算的追加已確認，表格寫入結果仍待確認，請先在追加草稿按 ✅ 重試完成，再按 🏁。")
+            return
+        settle.close(state)
+        save_settlements()
+        try:
+            channel = bot.get_channel(payload.channel_id) or await bot.fetch_channel(payload.channel_id)
+            ref = discord.MessageReference(message_id=payload.message_id, channel_id=payload.channel_id, fail_if_not_exists=False)
+            allowed = discord.AllowedMentions(everyone=False, roles=False, users=True)
+            for i, chunk in enumerate(settle.split_message(settle.render_closed(state, state["mentions"]))):
+                await channel.send(chunk, reference=ref if i == 0 else None, allowed_mentions=allowed)
+        except Exception as e:
+            print(f"[ERROR] 結算 {state['batch']} 已結束認領，但公布訊息送不出去:", repr(e))
 
 
 @bot.event
@@ -693,6 +867,35 @@ async def on_ready():
         print("Allowed channel IDs: 不限制（所有頻道都會處理）")
     print(f"LLM: Groq {GROQ_MODEL} ✓")
     print(f"結算: 讀圖 {VISION_MODEL} @ {VISION_BASE_URL or 'Groq'}，已載入 {len(SETTLEMENTS)} 筆結算紀錄")
+    await recover_appends()
+
+
+async def recover_appends():
+    """重啟後接續已按 ✅ 且已存檔的追加，n8n 會接受同批次相同金額的重試。"""
+    for state in list(SETTLEMENTS.values()):
+        attempt = state.get("append_attempt")
+        if not attempt:
+            continue
+        key = (state["channel_id"], attempt["submitter_id"])
+        if key in PENDING:
+            continue
+        try:
+            channel = bot.get_channel(state["channel_id"]) or await bot.fetch_channel(state["channel_id"])
+            prompt = await channel.fetch_message(attempt["prompt_id"])
+            session = PENDING[key] = {
+                "append_to": state["batch"], "batch": state["batch"], "channel_id": state["channel_id"],
+                "payer": SimpleNamespace(name=state["payer"], id=state["payer_id"]),
+                "poster": SimpleNamespace(name=state.get("poster") or state["payer"],
+                                          id=state.get("poster_id", state["payer_id"])),
+                "lock": asyncio.Lock(), "guild": channel.guild, "drafts": [prompt], "timer": None,
+                "state": state, "writes": attempt["writes"], "shots": [], "write_started": True,
+                "added_units": attempt["added_units"], "append_notes": attempt["notes"],
+                "base_revision": attempt["base_revision"],
+            }
+            async with session["lock"]:
+                await confirm_append(key, session)
+        except Exception as e:
+            print(f"[ERROR] 無法接續結算 {state['batch']} 的追加:", repr(e))
 
 
 # -------------------------------------------------
@@ -715,9 +918,10 @@ async def on_message(message: discord.Message):
     # 0) 結算（附下單截圖）／認領 unclassified 的商品
     # ============================================
     has_image = any((a.content_type or "").startswith("image/") for a in message.attachments)
+    append_to = replied_settlement(message) if has_image and not text.startswith("買") else None
     adding = has_image and (message.channel.id, message.author.id) in PENDING and not text.startswith("買")
-    if SETTLE_RE.match(text) or adding:
-        await handle_settle(message)
+    if SETTLE_RE.match(text) or adding or append_to is not None:
+        await handle_settle(message, append_to=append_to)
         await bot.process_commands(message)
         return
 

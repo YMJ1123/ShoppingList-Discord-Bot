@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -238,10 +239,13 @@ class FakeUser:
 
 class FakeChannel:
     def __init__(self, cid=1):
-        self.id = cid
+        self.id, self.guild = cid, None
 
     async def send(self, text, **kw):
         return FakeMsg(BOT_USER, self, text=text, kw=kw, record=True)
+
+    async def fetch_message(self, message_id):
+        return next(message for message in SENT if message.id == message_id)
 
 
 class FakeMsg:
@@ -293,11 +297,13 @@ EARBUDS = order([("藍牙耳機", 1, 30.0)], 150, "5127000000000000002")
 SHEET = [{"tab": "淘寶", "row": 2, "name": "小米風扇落地扇", "spec": "白色", "url": "", "qty": 1, "buyer": "bob"}]
 
 
-def stub(settle_status=200, read_delay=0.0):
+def stub(settle_status=200, read_delay=0.0, sheet=None):
     SENT.clear()
     CALLS.clear()
     bot.SETTLEMENTS.clear()
     bot.PENDING.clear()
+    for lock_name in ("SETTLEMENT_LOCKS", "CHANNEL_LOCKS"):
+        getattr(bot, lock_name, {}).clear()
     bot.ALLOWED_CHANNEL_IDS = set()
     bot.SETTLE_CONFIRM_SECONDS = 600
 
@@ -309,7 +315,7 @@ def stub(settle_status=200, read_delay=0.0):
     async def fake_n8n(payload, url=None):
         CALLS.append(payload)
         if payload["action"] == "list":
-            return FakeResp(200, {"status": "ok", "rows": SHEET})
+            return FakeResp(200, {"status": "ok", "rows": SHEET if sheet is None else sheet})
         if settle_status == 409:
             return FakeResp(409, {"status": "conflict", "problems": [{"tab": "淘寶", "row": 2, "reason": "這一列已經不存在"}]})
         return FakeResp(settle_status, {"status": "settled"})
@@ -743,6 +749,532 @@ out = press("🏁", AMY, published()[-1].id)
 lines = out[0].content.split("\n") if out else ["（沒有送出任何訊息）"]
 check("代傳：代傳的人也能按 🏁，剩下的算給被幫忙的人", (lines[0], lines[-1]),
       (f"🏁 **結算 {state['batch']} 結束認領**｜請轉帳給 <@300>", "下單人自己的 TWD 495 不用轉，含沒人認領的 #2"))
+
+print("\n已公布結算：回覆附圖追加")
+stub()
+
+
+async def published_append_trigger():
+    state = await settle_and_confirm(AMY, [SHOT])
+    await send(AMY, "", [EARBUDS], reply_to=state["message_ids"][0])
+    check("回覆已公布結算並附圖 → 建立追加草稿", len(bot.PENDING), 1)
+
+
+asyncio.run(published_append_trigger())
+
+
+def append_draft(author=AMY):
+    return bot.PENDING[(CHAN.id, author.id)]["drafts"][-1]
+
+
+def copy_state(state):
+    return json.loads(json.dumps(state))
+
+
+stub()
+
+
+async def append_unmatched():
+    state = await settle_and_confirm(AMY, [SHOT])
+    batch, original_id = state["batch"], state["message_ids"][0]
+    old = copy_state(state)
+    writes_before = len(settle_calls())
+    await send(AMY, "", [EARBUDS], reply_to=original_id)
+    draft = append_draft()
+    check("追加草稿只列新商品", ("藍牙耳機" in draft.content, "小米風扇" in draft.content, "神秘商品" in draft.content), (True, False, False))
+    check("追加草稿沿用原批次", bot.PENDING[(1, AMY.id)]["state"]["batch"], batch)
+    check("確認前原結算與表格維持原狀", (bot.SETTLEMENTS[batch], len(settle_calls())), (old, writes_before))
+    await react("✅", BOB, draft)
+    check("第三人按追加草稿 ✅ 無效", (len(bot.PENDING), len(settle_calls())), (1, writes_before))
+    await react("✅", AMY, draft)
+    current = bot.SETTLEMENTS[batch]
+    check("追加後同一批次、商品編號接續", (list(bot.SETTLEMENTS), nos(current)), ([batch], [1, 2, 3]))
+    check("新訂單實付只加一次", bot.settle.totals(current)["total_twd"], 1140)
+    check("沒對到表格的追加不呼叫寫入", len(settle_calls()), writes_before)
+    check("追加保留原結算訊息、登記更新訊息", (original_id in current["message_ids"], SENT[-1].id in current["message_ids"]), (True, True))
+    check("追加公布可繼續結束認領", "🏁" in SENT[-1].reactions, True)
+    writes_after = len(settle_calls())
+    await react("✅", AMY, draft)
+    check("同一張追加草稿重按不重複加入", (nos(bot.SETTLEMENTS[batch]), len(settle_calls())), ([1, 2, 3], writes_after))
+    await send(BOB, "認領 3", reply_to=original_id)
+    check("舊正式訊息仍能認領新商品", bot.settle.find_item(bot.SETTLEMENTS[batch], 3)[1]["shares"][0]["owner"], "bob")
+
+
+asyncio.run(append_unmatched())
+
+stub(sheet=[])
+
+
+async def pencil_fifteen():
+    fourteen = order([(f"原商品{i}", 1, 10.0) for i in range(1, 15)], 6404, "5127000000000000014")
+    state = await settle_and_confirm(AMY, [fourteen])
+    batch = state["batch"]
+    pencil = order([("适用applepencil笔尖", 1, 9.8)], 46, "3317017045092056761")
+    await send(AMY, "", [pencil], reply_to=state["message_ids"][0])
+    await react("✅", AMY, append_draft())
+    state = bot.SETTLEMENTS[batch]
+    check("筆尖補進原本十四件成 #15", (nos(state), bot.settle.find_item(state, 15)[1]["name"]), (list(range(1, 16)), "适用applepencil笔尖"))
+    check("筆尖追加後同單合計 TWD 6450", (len(bot.SETTLEMENTS), bot.settle.totals(state)["total_twd"], settle_calls()), (1, 6450, []))
+
+
+asyncio.run(pencil_fifteen())
+
+print("\n追加確認：原下單人與代傳人的權限")
+for approver in (AMY, CAROL):
+    stub()
+
+    async def append_proxy(approver=approver):
+        state = await settle_and_confirm(AMY, [SHOT], text="結算 <@300>", mentions=[CAROL], confirmer=CAROL)
+        batch = state["batch"]
+        await send(BOB, "補圖 <@100>", [EARBUDS], reply_to=state["message_ids"][0], mentions=[AMY])
+        draft = append_draft(BOB)
+        await react("✅", BOB, draft)
+        check("補圖的人不會取得原結算確認權", (len(bot.PENDING), nos(bot.SETTLEMENTS[batch])), (1, [1, 2]))
+        await react("✅", approver, draft)
+        state = bot.SETTLEMENTS[batch]
+        check(f"原 {'代傳人' if approver is AMY else '下單人'}可以確認追加", (nos(state), state["payer"], state["payer_id"], state["poster_id"]), ([1, 2, 3], "carol", CAROL.id, AMY.id))
+
+    asyncio.run(append_proxy())
+
+stub()
+
+
+async def append_legacy():
+    state = await settle_and_confirm(AMY, [SHOT])
+    state.pop("poster_id")
+    await send(BOB, "", [EARBUDS], reply_to=state["message_ids"][0])
+    await react("✅", BOB, append_draft(BOB))
+    check("舊資料沒有 poster_id 時補圖人不能確認", len(bot.PENDING), 1)
+    await react("✅", AMY, append_draft(BOB))
+    check("舊資料沒有 poster_id 時下單人可確認", nos(bot.SETTLEMENTS[state["batch"]]), [1, 2, 3])
+
+
+asyncio.run(append_legacy())
+
+print("\n追加表格回寫與同筆付款重新分攤")
+stub()
+
+
+async def append_matched():
+    state = await settle_and_confirm(AMY, [SHOT])
+    batch = state["batch"]
+    original_post = bot.post_to_n8n
+    new_row = {"tab": "淘寶", "row": 3, "name": "藍牙耳機", "spec": "", "url": "", "qty": 1, "buyer": "carol"}
+
+    async def changed_sheet(payload, url=None):
+        if payload["action"] == "list":
+            CALLS.append(payload)
+            return FakeResp(200, {"rows": [new_row]})
+        return await original_post(payload, url)
+
+    bot.post_to_n8n = changed_sheet
+    await send(AMY, "", [EARBUDS], reply_to=state["message_ids"][0])
+    await react("✅", AMY, append_draft())
+    check("追加配對的新列用原 batch 寫回", settle_calls()[-1], {"action": "settle", "batch": batch, "rows": [{"tab": "淘寶", "row": 3, "name": "藍牙耳機", "buyer": "carol", "price": 30.0}]})
+    check("追加只回寫新列，舊列維持原價", len(settle_calls()), 2)
+    check("新增配對人取得新增金額", bot.settle.totals(bot.SETTLEMENTS[batch])["twd"], {"bob": 495, "unclassified": 495, "carol": 150})
+
+
+asyncio.run(append_matched())
+
+stub()
+
+
+async def append_shared_payment():
+    state = await settle_and_confirm(AMY, [SHOT])
+    batch = state["batch"]
+    await send(CAROL, "認領 2", reply_to=state["message_ids"][0])
+    state["mentions"].update(bob=BOB.mention, carol=CAROL.mention)
+    overlapping = order([("神秘商品", 2, 50.0), ("藍牙耳機", 1, 30.0)], 990)
+    await send(AMY, "", [overlapping], reply_to=state["message_ids"][0])
+    draft = append_draft()
+    check("同筆付款草稿只列真正新增的商品", ("藍牙耳機" in draft.content, "神秘商品" in draft.content), (True, False))
+    await react("✅", AMY, draft)
+    state = bot.SETTLEMENTS[batch]
+    check("同付款補漏圖保持 TWD990 並去重", (len(state["units"]), nos(state)[:2], len(nos(state)), bot.settle.totals(state)["total_twd"]), (1, [1, 2], 3, 990))
+    check("重新分攤保留舊認領", bot.settle.totals(state)["twd"], {"bob": 431, "carol": 430, "unclassified": 129})
+    check("更新通知只允許金額有變動的人被 ping", sorted(int(uid) for uid in SENT[-1].kw["allowed_mentions"].to_dict().get("users", [])), [BOB.id, CAROL.id])
+    check("追加通知不額外 ping 被回覆的草稿作者", SENT[-1].kw["allowed_mentions"].replied_user, False)
+
+
+asyncio.run(append_shared_payment())
+
+stub()
+
+
+async def claim_during_append_draft():
+    state = await settle_and_confirm(AMY, [SHOT])
+    batch = state["batch"]
+    await send(AMY, "", [EARBUDS], reply_to=state["message_ids"][0])
+    draft = append_draft()
+    await send(CAROL, "認領 2", reply_to=state["message_ids"][0])
+    claim_reply_id = SENT[-1].id
+    await react("✅", AMY, draft)
+    state = bot.SETTLEMENTS[batch]
+    check("追加草稿期間的認領不會被舊快照覆蓋", bot.settle.find_item(state, 2)[1]["shares"][0]["owner"], "carol")
+    check("追加保留草稿期間的認領回覆參照", claim_reply_id in state["message_ids"], True)
+
+
+asyncio.run(claim_during_append_draft())
+
+print("\n追加取消、逾時、關閉與重傳")
+for emoji in ("❌", "timeout"):
+    stub()
+
+    async def append_cancelled(emoji=emoji):
+        state = await settle_and_confirm(AMY, [SHOT])
+        batch, before, calls_before = state["batch"], copy_state(state), len(settle_calls())
+        if emoji == "timeout":
+            bot.SETTLE_CONFIRM_SECONDS = 0.02
+        await send(AMY, "", [EARBUDS], reply_to=state["message_ids"][0])
+        if emoji == "timeout":
+            await asyncio.sleep(0.05)
+        else:
+            await react(emoji, AMY, append_draft())
+        check(f"追加 {emoji} 保留原結算、不回寫", (bot.SETTLEMENTS[batch], len(settle_calls()), bot.PENDING), (before, calls_before, {}))
+
+    asyncio.run(append_cancelled())
+
+stub()
+
+
+async def closed_append():
+    state = await settle_and_confirm(AMY, [SHOT])
+    original_id = state["message_ids"][0]
+    await react("🏁", AMY, SimpleNamespace(id=original_id))
+    before, calls_before = copy_state(state), len(CALLS)
+    await send(AMY, "", [EARBUDS], reply_to=original_id)
+    check("結束認領的單拒絕追加，連讀表都不做", (bot.SETTLEMENTS[state["batch"]], bot.PENDING, len(CALLS)), (before, {}, calls_before))
+    check("已關閉追加會告知原因", "結束認領" in SENT[-1].content, True)
+
+
+asyncio.run(closed_append())
+
+stub()
+
+
+async def closed_after_draft():
+    state = await settle_and_confirm(AMY, [SHOT])
+    await send(AMY, "", [EARBUDS], reply_to=state["message_ids"][0])
+    draft = append_draft()
+    await react("🏁", AMY, SimpleNamespace(id=state["message_ids"][0]))
+    before, calls_before = copy_state(state), len(settle_calls())
+    await react("✅", AMY, draft)
+    check("草稿建立後先關閉，再確認追加仍被拒絕", (bot.SETTLEMENTS[state["batch"]], len(settle_calls())), (before, calls_before))
+    check("關閉後不能留下可確認的追加草稿", bot.PENDING, {})
+
+
+asyncio.run(closed_after_draft())
+
+stub()
+
+
+async def duplicate_append():
+    state = await settle_and_confirm(AMY, [SHOT])
+    before, calls_before = copy_state(state), len(settle_calls())
+    await send(AMY, "", [SHOT], reply_to=state["message_ids"][0])
+    check("重傳完全相同的圖不會加出可確認的草稿", bot.PENDING, {})
+    check("重傳完全相同的圖不變更金額與表格", (bot.SETTLEMENTS[state["batch"]], len(settle_calls())), (before, calls_before))
+
+
+asyncio.run(duplicate_append())
+
+for failure in (409, 500, "timeout"):
+    stub()
+
+    async def append_write_failure(failure=failure):
+        state = await settle_and_confirm(AMY, [EARBUDS])
+        before = copy_state(state)
+        original_post = bot.post_to_n8n
+
+        async def failing_write(payload, url=None):
+            if payload["action"] != "settle":
+                return await original_post(payload, url)
+            CALLS.append(payload)
+            if failure == "timeout":
+                raise requests.exceptions.ReadTimeout()
+            return FakeResp(failure, {"problems": [{"tab": "淘寶", "row": 2, "reason": "這一列已經不存在"}]})
+
+        bot.post_to_n8n = failing_write
+        await send(AMY, "", [SHOT], reply_to=state["message_ids"][0])
+        await react("✅", AMY, append_draft())
+        current = {key: value for key, value in bot.SETTLEMENTS[state["batch"]].items() if key != "append_attempt"}
+        check(f"追加表格寫入 {failure} 保留原結算", current, before)
+        if failure == "timeout":
+            check("追加逾時告知可能已回寫", any("可能已經寫進表格" in message.content for message in SENT[-2:]), True)
+
+    asyncio.run(append_write_failure())
+
+stub()
+
+
+async def append_write_retry():
+    state = await settle_and_confirm(AMY, [EARBUDS])
+    batch = state["batch"]
+    original_post = bot.post_to_n8n
+    attempts = []
+
+    async def uncertain_first_write(payload, url=None):
+        if payload["action"] == "settle":
+            attempts.append(copy_state(payload))
+            if len(attempts) == 1:
+                CALLS.append(payload)
+                raise requests.exceptions.ReadTimeout()
+        return await original_post(payload, url)
+
+    bot.post_to_n8n = uncertain_first_write
+    bot.SETTLE_CONFIRM_SECONDS = 0.02
+    await send(AMY, "", [SHOT], reply_to=state["message_ids"][0])
+    draft = append_draft()
+    await react("✅", AMY, draft)
+    check("追加寫表逾時保留核准的操作紀錄", "append_attempt" in bot.SETTLEMENTS[batch], True)
+    check("追加寫表逾時保留同一張可重試草稿", append_draft().id, draft.id)
+    approved_shots = len(bot.PENDING[(1, AMY.id)]["shots"])
+    await send(AMY, "", [EARBUDS], reply_to=state["message_ids"][0])
+    check("已送出寫表的追加不會再併進新截圖", len(bot.PENDING[(1, AMY.id)]["shots"]), approved_shots)
+    await react("❌", AMY, draft)
+    check("可能已寫入的追加不能取消丟棄", len(bot.PENDING), 1)
+    await asyncio.sleep(0.05)
+    check("可能已寫入的追加不因草稿逾時消失", len(bot.PENDING), 1)
+    await react("✅", AMY, draft)
+    check("追加重試使用完全相同的 batch 與列", (len(attempts), attempts[0] == attempts[1]), (2, True))
+    check("追加重試成功只併入一次並清除操作紀錄", (nos(bot.SETTLEMENTS[batch]), "append_attempt" in bot.SETTLEMENTS[batch], bot.PENDING), ([1, 2, 3], False, {}))
+
+
+asyncio.run(append_write_retry())
+
+stub()
+
+
+async def recover_approved_append():
+    with tempfile.TemporaryDirectory() as state_dir:
+        bot.STATE_DIR = state_dir
+        try:
+            state = await settle_and_confirm(AMY, [EARBUDS])
+            batch, original_id = state["batch"], state["message_ids"][0]
+            original_post = bot.post_to_n8n
+            attempts = []
+
+            async def uncertain_first_write(payload, url=None):
+                if payload["action"] == "settle":
+                    attempts.append(copy_state(payload))
+                    if len(attempts) == 1:
+                        CALLS.append(payload)
+                        raise requests.exceptions.ReadTimeout()
+                return await original_post(payload, url)
+
+            bot.post_to_n8n = uncertain_first_write
+            await send(AMY, "", [SHOT], reply_to=original_id)
+            await react("✅", AMY, append_draft())
+            saved = json.loads((Path(state_dir) / "settlements.json").read_text())
+            check("核准後的追加寫表前先存檔", ("append_attempt" in saved[batch], nos(saved[batch])), (True, [1]))
+            for pending in bot.PENDING.values():
+                if pending["timer"]:
+                    pending["timer"].cancel()
+            bot.PENDING.clear()
+            bot.SETTLEMENTS.clear()
+            bot.load_settlements()
+            await bot.recover_appends()
+            current = bot.SETTLEMENTS[batch]
+            check("重啟接續已核准追加時重送相同 batch 與列", (len(attempts), attempts[0] == attempts[1]), (2, True))
+            check("重啟接續追加保留原訊息與新商品", (original_id in current["message_ids"], nos(current), "append_attempt" in current, bot.PENDING), (True, [1, 2, 3], False, {}))
+            await bot.recover_appends()
+            check("再次 ready 不重做已完成的追加", len(attempts), 2)
+        finally:
+            bot.STATE_DIR = None
+
+
+asyncio.run(recover_approved_append())
+
+stub()
+
+
+async def restarting_append_reserves_numbers():
+    state = await settle_and_confirm(AMY, [EARBUDS])
+    original_post = bot.post_to_n8n
+
+    async def uncertain_write(payload, url=None):
+        if payload["action"] == "settle":
+            CALLS.append(payload)
+            raise requests.exceptions.ReadTimeout()
+        return await original_post(payload, url)
+
+    bot.post_to_n8n = uncertain_write
+    await send(AMY, "", [SHOT], reply_to=state["message_ids"][0])
+    await react("✅", AMY, append_draft())
+    reserved = [item["no"] for unit in bot.SETTLEMENTS[state["batch"]]["append_attempt"]["added_units"] for item in unit["items"]]
+    for pending in bot.PENDING.values():
+        if pending["timer"]:
+            pending["timer"].cancel()
+    bot.PENDING.clear()
+    fresh = order([("独立新商品", 1, 40.0)], 200, "5127000000000000003")
+    await send(BOB, "結算", [fresh])
+    fresh_nos = nos(bot.PENDING[(1, BOB.id)]["state"])
+    check("重啟後尚未接續的已核准追加仍預留商品編號", min(fresh_nos) > max(reserved), True)
+
+
+asyncio.run(restarting_append_reserves_numbers())
+
+stub(read_delay=0.02)
+
+
+async def append_burst_and_conflict():
+    state = await settle_and_confirm(AMY, [SHOT])
+    first_id = state["message_ids"][0]
+    extra = order([("独立新商品", 1, 40.0)], 200, "5127000000000000003")
+    await asyncio.gather(send(AMY, "", [EARBUDS], reply_to=first_id), send(AMY, "", [extra]))
+    draft = append_draft()
+    check("追加草稿多則附圖排隊合併", ("藍牙耳機" in draft.content, "独立新商品" in draft.content), (True, True))
+    await react("✅", AMY, draft)
+    check("追加多則附圖只增加各筆一次", (nos(bot.SETTLEMENTS[state["batch"]]), bot.settle.totals(bot.SETTLEMENTS[state["batch"]])["total_twd"]), ([1, 2, 3, 4], 1340))
+
+
+asyncio.run(append_burst_and_conflict())
+
+stub()
+
+
+async def append_replacement_notification_failure():
+    state = await settle_and_confirm(AMY, [SHOT])
+    batch = state["batch"]
+    await send(AMY, "", [EARBUDS], reply_to=state["message_ids"][0])
+    visible_draft = append_draft()
+    original_send_chunks = bot.send_chunks
+    extra = order([("独立新商品", 1, 40.0)], 200, "5127000000000000003")
+
+    async def failing_replacement(target, text, **kwargs):
+        if text.startswith("🧾 **追加結算草稿"):
+            raise RuntimeError("新草稿無法送出")
+        return await original_send_chunks(target, text, **kwargs)
+
+    bot.send_chunks = failing_replacement
+    try:
+        await send(AMY, "", [extra])
+    finally:
+        bot.send_chunks = original_send_chunks
+    check("替代草稿送出失敗後仍保留原本可見草稿", (append_draft().id, visible_draft.deleted), (visible_draft.id, False))
+    await react("✅", AMY, visible_draft)
+    current = bot.SETTLEMENTS[batch]
+    names = [item["name"] for unit in current["units"] for item in unit["items"]]
+    check("舊草稿確認只併入使用者看過的追加商品", names, ["小米風扇", "神秘商品", "藍牙耳機"])
+    check("替代草稿失敗不把看不到的金額併入", bot.settle.totals(current)["total_twd"], 1140)
+
+
+asyncio.run(append_replacement_notification_failure())
+
+stub()
+
+
+async def concurrent_append_confirmations():
+    state = await settle_and_confirm(AMY, [SHOT])
+    original_id = state["message_ids"][0]
+    extra = order([("独立新商品", 1, 40.0)], 200, "5127000000000000003")
+    await asyncio.gather(send(AMY, "", [EARBUDS], reply_to=original_id), send(BOB, "", [extra], reply_to=original_id))
+    amy_draft, bob_draft = append_draft(), append_draft(BOB)
+    proposed = [bot.PENDING[(1, user.id)]["state"] for user in (AMY, BOB)]
+    proposed_nos = [[n for n in nos(s) if n not in [1, 2]] for s in proposed]
+    check("同時追加的兩張草稿預留不同編號", bool(set(proposed_nos[0]) & set(proposed_nos[1])), False)
+    await asyncio.gather(react("✅", AMY, amy_draft), react("✅", AMY, bob_draft))
+    current = bot.SETTLEMENTS[state["batch"]]
+    names = [it["name"] for unit in current["units"] for it in unit["items"]]
+    accepted = [name for name in ("藍牙耳機", "独立新商品") if name in names]
+    check("同時確認至少保留第一筆追加且編號唯一", (len(accepted) >= 1, len(nos(current)) == len(set(nos(current)))), (True, True))
+    if len(accepted) == 1:
+        check("第二筆被拒時清楚說明結算已更新", any(("更新" in message.content or "追加確認" in message.content) and ("重新" in message.content or "重傳" in message.content) for message in SENT[-3:]), True)
+    check("並行確認保留原本兩件", names[:2], ["小米風扇", "神秘商品"])
+
+
+asyncio.run(concurrent_append_confirmations())
+
+print("\n追加確認：表格等待期間的認領與結束認領")
+stub()
+
+
+async def claim_while_append_writes():
+    state = await settle_and_confirm(AMY, [EARBUDS])
+    batch = state["batch"]
+    original_post = bot.post_to_n8n
+    writing, release = asyncio.Event(), asyncio.Event()
+
+    async def delayed_write(payload, url=None):
+        if payload["action"] == "settle":
+            writing.set()
+            await release.wait()
+        return await original_post(payload, url)
+
+    bot.post_to_n8n = delayed_write
+    await send(AMY, "", [SHOT], reply_to=state["message_ids"][0])
+    confirming = asyncio.create_task(react("✅", AMY, append_draft()))
+    await writing.wait()
+    claiming = asyncio.create_task(send(CAROL, "認領 1", reply_to=state["message_ids"][0]))
+    await asyncio.sleep(0.01)
+    check("追加寫表等待期間認領會排隊", claiming.done(), False)
+    release.set()
+    await asyncio.gather(confirming, claiming)
+    current = bot.SETTLEMENTS[batch]
+    check("寫表後認領與追加都保留", (nos(current), bot.settle.find_item(current, 1)[1]["shares"][0]["owner"]), ([1, 2, 3], "carol"))
+
+
+asyncio.run(claim_while_append_writes())
+
+stub()
+
+
+async def close_while_append_writes():
+    state = await settle_and_confirm(AMY, [EARBUDS])
+    batch, original_id = state["batch"], state["message_ids"][0]
+    original_post = bot.post_to_n8n
+    writing, release = asyncio.Event(), asyncio.Event()
+
+    async def delayed_write(payload, url=None):
+        if payload["action"] == "settle":
+            writing.set()
+            await release.wait()
+        return await original_post(payload, url)
+
+    bot.post_to_n8n = delayed_write
+    await send(AMY, "", [SHOT], reply_to=original_id)
+    confirming = asyncio.create_task(react("✅", AMY, append_draft()))
+    await writing.wait()
+    closing = asyncio.create_task(react("🏁", AMY, SimpleNamespace(id=original_id)))
+    await asyncio.sleep(0.01)
+    check("追加寫表等待期間結束認領會排隊", closing.done(), False)
+    release.set()
+    await asyncio.gather(confirming, closing)
+    current = bot.SETTLEMENTS[batch]
+    check("追加後結束認領會處理全部新舊商品", (nos(current), current["closed"], bot.settle.has_unclassified(current)), ([1, 2, 3], True, False))
+
+
+asyncio.run(close_while_append_writes())
+
+stub()
+
+
+async def append_notification_failure():
+    with tempfile.TemporaryDirectory() as state_dir:
+        bot.STATE_DIR = state_dir
+        original_send_chunks = bot.send_chunks
+        try:
+            state = await settle_and_confirm(AMY, [EARBUDS])
+            batch = state["batch"]
+
+            async def failing_result(target, text, **kwargs):
+                if text.startswith(f"🧾 **結算 {batch} 已追加"):
+                    raise RuntimeError("Discord 暫時無法送出訊息")
+                return await original_send_chunks(target, text, **kwargs)
+
+            bot.send_chunks = failing_result
+            await send(AMY, "", [SHOT], reply_to=state["message_ids"][0])
+            await react("✅", AMY, append_draft())
+            check("寫表成功但通知失敗仍保存追加", (nos(bot.SETTLEMENTS[batch]), len(settle_calls())), ([1, 2, 3], 1))
+            saved = json.loads((Path(state_dir) / "settlements.json").read_text())
+            check("通知失敗後重啟資料仍含追加商品", nos(saved[batch]), [1, 2, 3])
+        finally:
+            bot.send_chunks = original_send_chunks
+            bot.STATE_DIR = None
+
+
+asyncio.run(append_notification_failure())
 
 print("\n結算紀錄存檔")
 with tempfile.TemporaryDirectory() as d:

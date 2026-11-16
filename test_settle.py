@@ -285,4 +285,104 @@ check("超過上限照行切", settle.split_message("aaaa\nbbbb\ncccc", limit=9)
 check("單行超長也切得開", settle.split_message("x" * 25, limit=10), ["x" * 10, "x" * 10, "x" * 5])
 check("每段都不超過上限", max(len(c) for c in settle.split_message(final, limit=120)) <= 120, True)
 
+print("\nprepare_append：已公布結算追加漏掉的商品")
+old_items = [(f"原商品{i}", "", 1, 10.0) for i in range(1, 15)]
+append_base, _, _, _ = build([shot(old_items, 6404)], [], [], payer="payer")
+append_base.update(poster="proxy", mentions={"payer": "<@100>", "carol": "<@300>"}, message_ids=[123])
+settle.claim(append_base, 1, "bob")
+append_snapshot = copy.deepcopy(append_base)
+pencil_units, _, _ = settle.merge_shots([
+    shot([("适用applepencil笔尖", "白色【2 枚装】", 1, 9.8)], 46, "3317017045092056761")
+], start=15)
+pencil_snapshot = copy.deepcopy(pencil_units)
+appended, delta, errors = settle.prepare_append(append_base, pencil_units)
+check("獨立筆尖訂單保留原批次，追加成 #15", (errors, appended["batch"], [it["no"] for u in appended["units"] for it in u["items"]]),
+      ([], append_base["batch"], list(range(1, 16))))
+check("實付只加筆尖那筆的 46 元", (settle.totals(appended)["total_twd"], sum(settle.totals(appended)["twd"].values())), (6450, 6450))
+check("原結算和輸入資料都未被修改", (append_base, pencil_units), (append_snapshot, pencil_snapshot))
+check("付款人、代傳人與舊訊息識別碼保留", (appended["payer"], appended["poster"], appended["message_ids"]), ("payer", "proxy", [123]))
+check("原本手動認領的人保留", appended["units"][0]["items"][0]["shares"], [{"owner": "bob", "cny": 10.0}])
+check("delta 只含 #15 並使用該筆付款匯率", ([it["no"] for u in delta for it in u["items"]], delta[0]["rate"]), ([15], 46 / 9.8))
+pencil_rows = [{"tab": "淘寶", "row": 90, "name": "适用applepencil笔尖", "spec": "白色【2 枚装】", "qty": 1, "buyer": "carol"}]
+pencil_payload = settle.match_payload(delta, pencil_rows)
+pencil_writes, _ = settle.assign(delta, pencil_rows, pencil_payload, [{"no": 15, "rows": ["淘寶90"], "confidence": "high"}])
+check("配對 delta 同步更新完整結算的新商品", appended["units"][-1]["items"][0]["shares"], [{"owner": "carol", "cny": 9.8}])
+check("只產生新配對列的表格寫入", pencil_writes, [{"tab": "淘寶", "row": 90, "name": "适用applepencil笔尖", "buyer": "carol", "price": 9.8}])
+
+same_base, _, _, _ = build([shot([("原登記商品", "白色", 1, 10), ("已認領商品", "", 1, 10)], 150, "5127481190470000001")], [], [])
+settle.claim(same_base, 1, "bob")
+settle.claim(same_base, 2, "carol")
+same_base["mentions"] = {"bob": "<@200>", "carol": "<@300>"}
+same_snapshot = copy.deepcopy(same_base)
+same_incoming = settle.merge_shots([shot([("原登记商品", "白色", 1, 10), ("漏掉商品", "", 1, 10)], 150, "5127481190470000001")], start=3)[0]
+same_after, same_delta, errors = settle.prepare_append(same_base, same_incoming)
+check("同訂單截圖重疊商品去重，沿用新編號並保留間隔", (errors, [it["no"] for it in same_after["units"][0]["items"]]), ([], [1, 2, 4]))
+check("同筆付款只重算匯率，實付金額維持 150", (len(same_after["units"]), same_after["units"][0]["cny"], same_after["units"][0]["rate"], settle.totals(same_after)["total_twd"]), (1, 30.0, 5.0, 150))
+check("delta 視圖使用合併後付款匯率", same_delta[0]["rate"], 5.0)
+check("舊的歸屬、表格配對與手動認領完整保留", same_after["units"][0]["items"][:2], same_snapshot["units"][0]["items"])
+settle.assign(same_delta, [], [], [])
+check("重算後每人金額包含原成員的減少", settle.totals(same_after)["twd"], {"bob": 50, "carol": 50, UNCLASSIFIED: 50})
+check("同付款追加也不修改原結算", same_base, same_snapshot)
+shared_base, _, _, _ = build([shot([("原商品", "", 1, 10)], 100)], [], [])
+shared_incoming = settle.merge_shots([shot([("新商品", "", 1, 10)], 100)], start=2)[0]
+shared_after, _, errors = settle.prepare_append(shared_base, shared_incoming)
+check("沒有訂單號時以相同付款總額合併", (errors, len(shared_after["units"]), shared_after["units"][0]["rate"]), ([], 1, 5.0))
+deduped, no_delta, errors = settle.prepare_append(same_base, settle.merge_shots([shot([("原登记商品", "白色", 1, 10)], 150, "5127481190470000001")], start=3)[0])
+check("只有重複商品時回覆沒有新商品，完整結算維持原值", (deduped, no_delta, "沒有新的商品" in errors[0]), (same_snapshot, [], True))
+conflicting = settle.merge_shots([shot([("漏掉商品", "", 1, 10)], 151, "5127481190470000001")], start=3)[0]
+rejected, no_delta, errors = settle.prepare_append(same_base, pencil_units + conflicting)
+check("同訂單付款金額衝突時整次拒絕，連前面的有效追加也不留下", (rejected, no_delta, "台幣金額和原結算不同" in errors[0]), (same_snapshot, [], True))
+ambiguous = copy.deepcopy(shared_base)
+ambiguous["units"].append(copy.deepcopy(ambiguous["units"][0]))
+rejected, no_delta, errors = settle.prepare_append(ambiguous, shared_incoming)
+check("多筆相同付款總額時說明需要訂單號", (rejected, no_delta, "多筆相同付款" in errors[0]), (ambiguous, [], True))
+closed_append = copy.deepcopy(same_base)
+settle.close(closed_append)
+rejected, no_delta, errors = settle.prepare_append(closed_append, pencil_units)
+check("已按 🏁 的結算拒絕追加", (rejected, no_delta, "已經結束認領" in errors[0]), (closed_append, [], True))
+
+print("\nappend_overlap_notes：同付款的 OCR 差異要提醒重複")
+overlap_base, _, _, _ = build([shot([("适用applepencil笔尖...", "白色2枚", 1, 9.8)], 46, "3317017045092056761")], [], [])
+overlap_incoming = settle.merge_shots([shot([("适用applepencil笔尖苹果pencil", "白色2枚", 1, 9.8)], 46, "3317017045092056761")], start=2)[0]
+overlap_after, overlap_delta, _ = settle.prepare_append(overlap_base, overlap_incoming)
+overlap_notes = settle.append_overlap_notes(overlap_base, overlap_delta)
+check("同訂單名稱被 OCR 截斷成不同寫法時提醒原編號", overlap_notes,
+      ["#2 适用applepencil笔尖苹… 和原結算的 #1 看起來是同一件，可能重複，請確認這次追加的商品"])
+check("模糊相似只提醒，保留商品讓確認者判斷", [it["no"] for it in overlap_after["units"][0]["items"]], [1, 2])
+shared_overlap_base = copy.deepcopy(overlap_base)
+shared_overlap_base["units"][0]["order_no"] = ""
+shared_overlap_delta = copy.deepcopy(overlap_delta)
+shared_overlap_delta[0]["order_no"] = ""
+check("同樣沒有訂單號且付款相同也提醒", settle.append_overlap_notes(shared_overlap_base, shared_overlap_delta), overlap_notes)
+different_order_delta = copy.deepcopy(overlap_delta)
+different_order_delta[0]["order_no"] = "3317017045092056762"
+check("不同訂單不產生同付款的模糊提醒", settle.append_overlap_notes(overlap_base, different_order_delta), [])
+shared_overlap_delta[0]["total_twd"] = 47
+check("沒有訂單號且付款不同不產生同付款提醒", settle.append_overlap_notes(shared_overlap_base, shared_overlap_delta), [])
+different_price_delta = copy.deepcopy(overlap_delta)
+different_price_delta[0]["items"][0]["price"] = 9.9
+check("名稱相近但單價不同不提醒", settle.append_overlap_notes(overlap_base, different_price_delta), [])
+
+print("\n追加通知：只列新商品、金額變化，通知台幣真的有變的人")
+append_draft = settle.render_append_draft(append_base, appended, delta, [])
+check("追加草稿只列新商品描述", ("#15 适用applepencil笔尖" in append_draft, "原商品" in append_draft), (True, False))
+check("追加草稿顯示實付前後金額與差額", "實付合計 TWD 6,404 → TWD 6,450（+46）" in append_draft, True)
+check("追加草稿沿用原付款與代傳確認權限，使用純名稱", ("payer 或 proxy 按 ✅" in append_draft, "<@" in append_draft), (True, False))
+same_draft = settle.render_append_draft(same_base, same_after, same_delta, ["測試提醒"])
+check("同付款草稿顯示每人金額減少與未認領增加", all(s in same_draft for s in ("bob　TWD 75 → TWD 50（-25）", "carol　TWD 75 → TWD 50（-25）", "還沒人認領　TWD 0 → TWD 50（+50）", "測試提醒")), True)
+append_result = settle.render_append_result(append_base, appended, delta)
+check("追加結果列出完整更新金額與正確付款對象", all(s in append_result for s in ("請轉帳給 <@100>", "<@300>　TWD 46", "bob　TWD", "按 🏁")), True)
+check("追加結果同樣只列新商品描述", ("#15 适用applepencil笔尖" in append_result, "原商品" in append_result), (True, False))
+check("尚有未認領時保留認領說明", "回覆 `認領 編號`" in append_result, True)
+check("同付款金額變動名單排除 unclassified", settle.changed_owners(same_base, same_after), {"bob", "carol"})
+round_before, _, _, _ = build([shot([("a", "", 1, 6), ("b", "", 1, 4)], 1)], [], [])
+settle.claim(round_before, 1, "a")
+settle.claim(round_before, 2, "b")
+round_incoming = settle.merge_shots([shot([("c", "", 1, 3), ("d", "", 1, 3), ("e", "", 1, 4)], 1, "5127481190470000009")], start=3)[0]
+round_after, round_delta, _ = settle.prepare_append(round_before, round_incoming)
+for no, owner in zip((3, 4, 5), ("c", "d", "e")):
+    settle.claim(round_after, no, owner)
+check("獨立新付款的尾數分配也會改到原成員", (settle.totals(round_before)["twd"], settle.totals(round_after)["twd"]), ({"a": 1, "b": 0}, {"a": 1, "b": 1, "c": 0, "d": 0, "e": 0}))
+check("通知比較完整結算的整數台幣，新增但仍為零的人略過", settle.changed_owners(round_before, round_after), {"b"})
+
 print(f"\n全部 {PASSED} 項測試通過 ✓\n")

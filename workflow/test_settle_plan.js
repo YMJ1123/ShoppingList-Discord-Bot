@@ -64,4 +64,65 @@ check('缺 batch → 400', plan({ action: 'settle', rows: want }, [tb(), jd])._s
 check('不認得的 action → 400', plan({ action: 'nope' }, [tb(), jd])._status, 400);
 check('缺必要欄位 → 500', plan({ action: 'list' }, [{ values: [['預購買商品']] }, jd])._status, 500);
 
+console.log('\nsettle：逾時後重試同一批次');
+const applied = tb(['結算批次']);
+applied.values[1][6] = 52.54;
+applied.values[1][8] = 'B1';
+r = plan({ action: 'settle', batch: 'B1', rows: [want[0]] }, [applied, jd]);
+check('同批次、相同商品和價格 → 重試成功', r._status, 200);
+check('重試只重寫相同儲存格', r._write.data, [
+  { range: "'淘寶'!G2", values: [[52.54]] },
+  { range: "'淘寶'!I2", values: [['B1']] },
+]);
+
+r = plan({ action: 'settle', batch: 'B1', rows: [
+  want[0], { tab: '淘寶', row: 4, name: '牙刷', buyer: 'bob', price: 9 },
+] }, [applied, jd]);
+check('同批次已寫入列和新列可以一起重試', [r._status, r._response.count], [200, 2]);
+check('新列照常帶原批次寫入', r._write.data.slice(-2), [
+  { range: "'淘寶'!G4", values: [[9]] },
+  { range: "'淘寶'!I4", values: [['B1']] },
+]);
+
+r = plan({ action: 'settle', batch: 'B1', rows: [{ ...want[0], price: 7 }] }, [applied, jd]);
+check('同批次價格已被改過 → 409、完全不寫', [r._status, r._write], [409, null]);
+check('價格衝突有說明原因', r._response.problems[0].reason.includes('價格'), true);
+
+r = plan({ action: 'settle', batch: 'B1', rows: [
+  { tab: '淘寶', row: 4, name: '牙刷', buyer: 'bob', price: 9 },
+  { ...want[0], price: 7 },
+] }, [applied, jd]);
+check('同批次價格衝突時、新列也完全不寫', [r._status, r._write], [409, null]);
+
+const blankPrice = tb(['結算批次']);
+blankPrice.values[1][8] = 'B1';
+r = plan({ action: 'settle', batch: 'B1', rows: [{ ...want[0], price: 0 }] }, [blankPrice, jd]);
+check('空白價格不能當成已寫入的 0 元', [r._status, r._write], [409, null]);
+
+r = plan({ action: 'settle', batch: 'B2', rows: [want[0]] }, [applied, jd]);
+check('價格相同但屬於別的批次 → 409', [r._status, r._write], [409, null]);
+
+r = plan({ action: 'settle', batch: 'B1', rows: [{ ...want[0], buyer: 'bob' }] }, [applied, jd]);
+check('同批次仍檢查購買人', [r._status, r._write], [409, null]);
+
+r = plan({ action: 'settle', batch: 'B1', rows: [{ ...want[0], name: '已被改名' }] }, [applied, jd]);
+check('同批次仍檢查商品名稱', [r._status, r._write], [409, null]);
+
+const stringPrice = tb(['結算批次']);
+stringPrice.values[1][6] = '52.54';
+stringPrice.values[1][8] = 'B1';
+r = plan({ action: 'settle', batch: 'B1', rows: [want[0]] }, [stringPrice, jd]);
+check('表格價格是相同數字字串時也可重試', r._status, 200);
+
+r = plan({ action: 'settle', batch: 'B1', rows: [{ ...want[0], price: Infinity }] }, [tb(), jd]);
+check('非有限價格拒絕寫入', [r._status, r._write], [409, null]);
+
+r = plan({ action: 'settle', batch: 'B1', rows: [{ ...want[0], price: null }] }, [applied, jd]);
+check('同批次 price=null 只重寫批次、保留價格', [r._status, r._write.data], [200, [
+  { range: "'淘寶'!I2", values: [['B1']] },
+]]);
+
+r = plan({ action: 'list' }, [applied, jd]);
+check('list 回應不增加內部價格欄位', r._response.rows.every((row) => !Object.hasOwn(row, 'price')), true);
+
 console.log(`\n全部 ${passed} 項測試通過 ✓\n`);

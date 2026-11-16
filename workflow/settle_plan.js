@@ -50,6 +50,7 @@ function readTab(valueRange, tab) {
       qty: qty > 0 ? qty : 1,
       buyer: str(v[col.buyer]),
       batch: str(v[col.batch]),
+      price: v[col.price],
     });
   }
   return { tab, col, needHeader, rows };
@@ -69,7 +70,7 @@ function plan(body, valueRanges) {
 
   if (body.action === 'list') {
     const all = Object.values(tabs).flatMap((t) => t.rows);
-    const open = all.filter((r) => !r.batch).map(({ batch, ...rest }) => rest);
+    const open = all.filter((r) => !r.batch).map(({ batch, price, ...rest }) => rest);
     return { _status: 200, _write: null, _response: { status: 'ok', rows: open, settled: all.length - open.length } };
   }
 
@@ -93,12 +94,18 @@ function plan(body, valueRanges) {
       else if (seen.has(id)) reason = '同一列重複出現';
       else if (!cur) reason = '這一列已經不存在';
       else if (cur.name !== str(w.name) || cur.buyer !== str(w.buyer)) reason = '這一列的內容已經變了（可能有人新增或刪除過商品）';
-      else if (cur.batch) reason = `已經在批次 ${cur.batch} 結算過`;
+      else if (cur.batch && cur.batch !== batch) reason = `已經在批次 ${cur.batch} 結算過`;
       seen.add(id);
       if (reason) { problems.push({ tab: w.tab, row: w.row, reason }); continue; }
 
       const price = w.price === null || w.price === undefined || w.price === '' ? null : Number(w.price);
-      if (price !== null && !(price >= 0)) { problems.push({ tab: w.tab, row: w.row, reason: '價格不是數字' }); continue; }
+      if (price !== null && (!Number.isFinite(price) || price < 0)) {
+        problems.push({ tab: w.tab, row: w.row, reason: '價格不是數字' }); continue;
+      }
+      // 寫入成功但回應逾時時，重試只允許原批次的相同價格，避免蓋掉人工修改。
+      if (cur.batch === batch && price !== null && (str(cur.price) === '' || Number(cur.price) !== price)) {
+        problems.push({ tab: w.tab, row: w.row, reason: '這一列同批次的實際價格已經變了' }); continue;
+      }
       if (price !== null) data.push({ range: `'${w.tab}'!${colLetter(t.col.price)}${cur.row}`, values: [[price]] });
       data.push({ range: `'${w.tab}'!${colLetter(t.col.batch)}${cur.row}`, values: [[batch]] });
       if (t.needHeader) headerTabs.add(w.tab);

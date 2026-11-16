@@ -215,8 +215,12 @@ check(
 print("\n結算：觸發關鍵字")
 
 check("「結算」開頭才觸發", [bool(bot.SETTLE_RE.match(t)) for t in ("結算", "结算 這批", "幫我結算", "買 結算")], [True, True, False, False])
-check("認領抓得到編號", [bot.CLAIM_RE.match(t).group(2) for t in ("認領 3", "認領#12", "认领 7 @人")], ["3", "12", "7"])
-check("不是認領開頭不觸發", bot.CLAIM_RE.match("我想認領 3"), None)
+check("認領抓得到編號", [bot.claim_numbers(t) for t in ("認領 3", "認領#12", "认领 7 @人")], [[3], [12], [7]])
+check("不是認領開頭不觸發", (bot.CLAIM_RE.match("我想認領 3"), bot.CLAIM_RE.match("認領 @某人")), (None, None))
+check("一次多個：空白、逗號、頓號", [bot.claim_numbers(t) for t in ("認領 3 5 7", "認領 3,5，7", "認領 #3、#5")], [[3, 5, 7], [3, 5, 7], [3, 5]])
+check("範圍（反過來寫也可以）", [bot.claim_numbers(t) for t in ("認領 3-5", "認領 5~3", "認領 #3 到 #5")], [[3, 4, 5]] * 3)
+check("@ 人的 id 裡的數字不算、重複的只算一次", [bot.claim_numbers(t) for t in ("認領 3 <@300>", "認領 3 <@!300> 5", "認領 3 3")], [[3], [3, 5], [3]])
+check("離譜的範圍不展開", len(bot.claim_numbers("認領 1-100000")), 2)
 
 # ------------------------------------------------------------------
 # 結算流程：Discord、n8n、LLM 都用假的，只驗證 bot 這一層怎麼串
@@ -461,13 +465,13 @@ async def numbering():
     s2 = await settle_and_confirm(CAROL, [EARBUDS])
     check("第二筆接著第一筆的編號", (nos(s1), nos(s2)), ([1, 2], [3]))
     check("同一秒開始的兩筆，批次編號不會撞", s1["batch"] != s2["batch"], True)
-    await bot.handle_claim(FakeMsg(BOB, CHAN, "認領 3", mentions=()), 3)
+    await bot.handle_claim(FakeMsg(BOB, CHAN, "認領 3", mentions=()), [3])
     check("「認領 3」不用回覆，落在第二筆", bot.settle.find_item(s2, 3)[1]["shares"][0]["owner"], "bob")
     SENT.clear()
-    await bot.handle_claim(FakeMsg(BOB, CHAN, "認領 2", mentions=()), 2)
+    await bot.handle_claim(FakeMsg(BOB, CHAN, "認領 2", mentions=()), [2])
     check("「認領 2」落在第一筆", bot.settle.find_item(s1, 2)[1]["shares"][0]["owner"], "bob")
     SENT.clear()
-    await bot.handle_claim(FakeMsg(CAROL, CHAN, "認領 1", mentions=()), 1)
+    await bot.handle_claim(FakeMsg(CAROL, CHAN, "認領 1", mentions=()), [1])
     check("已經對到人的編號 → 說明算在誰名下，而不是找不到", SENT[-1].content, "#1 已經算在 bob 名下了")
     await react("🏁", AMY, SimpleNamespace(id=s1["message_ids"][-1]))
     s3 = await settle_and_confirm(AMY, [EARBUDS])
@@ -561,14 +565,14 @@ print("\n認領")
 def run_claim(author, text, mentions=(), reply_to=None):
     SENT.clear()
     ref = SimpleNamespace(message_id=reply_to) if reply_to else None
-    asyncio.run(bot.handle_claim(FakeMsg(author, CHAN, text, mentions=mentions, reference=ref), int(bot.CLAIM_RE.match(text).group(2))))
+    asyncio.run(bot.handle_claim(FakeMsg(author, CHAN, text, mentions=mentions, reference=ref), bot.claim_numbers(text)))
     return SENT[-1].content
 
 
 stub()
 state = asyncio.run(settle_and_confirm(AMY, [SHOT]))
 batch, final_id = state["batch"], state["message_ids"][-1]
-check("別的頻道認領不到", (SENT.clear(), asyncio.run(bot.handle_claim(FakeMsg(CAROL, FakeChannel(2), "認領 2"), 2)), SENT[-1].content[:14])[2], "找不到還沒人認領的 #2 🙅")
+check("別的頻道認領不到", (SENT.clear(), asyncio.run(bot.handle_claim(FakeMsg(CAROL, FakeChannel(2), "認領 2"), [2])), SENT[-1].content[:14])[2], "找不到還沒人認領的 #2 🙅")
 out = run_claim(CAROL, "認領 2")
 check("認領後回覆更新的金額", out, f"#2 神秘商品 算在 <@300> 名下 ✅\n\n**結算 {batch} 更新後：**\nbob　TWD 495\n<@300>　TWD 495\n\n全部都有人認領了，amy 按 🏁 公布最終金額並通知大家")
 check("認領後算在認領的人名下", bot.settle.totals(state)["twd"], {"bob": 495, "carol": 495})
@@ -584,6 +588,34 @@ stub()
 state = asyncio.run(settle_and_confirm(AMY, [SHOT]))
 run_claim(CAROL, "認領 2", mentions=[BOB], reply_to=state["message_ids"][-1])
 check("回覆 bob 的訊息打「認領 2」→ 算給自己，不是被回覆的 bob", bot.settle.totals(state)["twd"], {"bob": 495, "carol": 495})
+
+print("\n一次認領多件")
+THREE = order([("甲甲甲", 1, 10.0), ("乙乙乙", 1, 20.0), ("丙丙丙", 1, 30.0)], 300)
+stub()
+state = asyncio.run(settle_and_confirm(AMY, [THREE]))
+out = run_claim(CAROL, "認領 1 3")
+check("一次認領兩件 → 一則回覆列出全部", out.split("\n\n")[0], "2 件算在 <@300> 名下 ✅\n#1 甲甲甲\n#3 丙丙丙")
+check("金額一起更新（匯率 5：¥40 → 200，剩 ¥20 → 100）", bot.settle.totals(state)["twd"], {"carol": 200, "unclassified": 100})
+check("兩件都算在 carol", [bot.settle.find_item(state, n)[1]["shares"][0]["owner"] for n in (1, 2, 3)], ["carol", "unclassified", "carol"])
+reply = SENT[-1]
+check("回覆上有 🏁、記進這次結算", (reply.reactions, reply.id in state["message_ids"]), (["🏁"], True))
+out = run_claim(BOB, "認領 1-2")
+check("部分成功：成功的照領，失敗的說明原因", out.split("\n\n")[:2], ["#2 乙乙乙 算在 <@200> 名下 ✅", "沒有認領到：\n- #1 已經算在 carol 名下了"])
+check("部分成功後金額正確", bot.settle.totals(state)["twd"], {"carol": 200, "bob": 100})
+check("全部都失敗 → 列出每一件的原因，不改任何東西", run_claim(BOB, "認領 1 3 9"),
+      "沒有認領到任何一件：\n- #1 已經算在 carol 名下了\n- #3 已經算在 carol 名下了\n- 找不到還沒人認領的 #9 🙅")
+check("全部失敗後金額沒變", bot.settle.totals(state)["twd"], {"carol": 200, "bob": 100})
+check("單一編號失敗的訊息和以前一樣", run_claim(BOB, "認領 9"), "找不到還沒人認領的 #9 🙅\n要認領的話，請直接回覆在那則結算訊息底下。")
+check("一次超過上限 → 拒絕", run_claim(BOB, "認領 1-40"), "一次最多認領 30 件，請分幾次打 🙏")
+
+stub()
+s1 = asyncio.run(settle_and_confirm(AMY, [THREE]))
+s2 = asyncio.run(settle_and_confirm(CAROL, [order([("丁丁丁", 1, 40.0), ("戊戊戊", 1, 50.0)], 450)]))
+run_claim(BOB, "認領 3 4 <@300>", mentions=[CAROL])
+replies = [m.content for m in SENT]
+check("跨兩筆結算 + 幫別人認領 → 每筆各回一則", [r.split("\n")[0] for r in replies], ["#3 丙丙丙 算在 <@300> 名下 ✅", "#4 丁丁丁 算在 <@300> 名下 ✅"])
+check("@ 的 id 不會被當成編號 300", any("#300" in r for r in replies), False)
+check("各自歸到 carol", (bot.settle.find_item(s1, 3)[1]["shares"][0]["owner"], bot.settle.find_item(s2, 4)[1]["shares"][0]["owner"]), ("carol", "carol"))
 
 print("\n幫別人結算：「結算 @B」")
 stub()

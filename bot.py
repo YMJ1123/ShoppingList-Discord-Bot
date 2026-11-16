@@ -269,7 +269,8 @@ async def send_delete(message: discord.Message, url: str, item_name: str, full_t
 #  結算：下單截圖 → 每人應付金額
 # -------------------------------------------------
 SETTLE_RE = re.compile(r"^(結算|结算)")
-CLAIM_RE = re.compile(r"^(認領|认领)\s*#?\s*(\d+)")
+CLAIM_RE = re.compile(r"^(認領|认领)\s*#?\s*\d")
+MAX_CLAIMS = 30
 SETTLE_CONFIRM_SECONDS = 600
 CLOSE_EMOJI = "🏁"
 MAX_IMAGES = 10
@@ -563,43 +564,73 @@ async def confirm_draft(key: tuple, session: dict, message_id: int, ok: bool):
         await safe_react(sent[-1], CLOSE_EMOJI)
 
 
-async def handle_claim(message: discord.Message, no: int):
-    def open_item(state):
-        _, item = settle.find_item(state, no)
-        return item is not None and settle.is_unclassified(item)
+def claim_numbers(text: str) -> list[int]:
+    """「認領 3 5、7 9-11」→ [3, 5, 7, 9, 10, 11]。@ 人的 <@id> 裡的數字不算。"""
+    rest = re.sub(r"<[@#][!&]?\d+>", " ", text)
+    nos = []
+    for m in re.finditer(r"#?(\d+)(?:\s*[-~～–至到]\s*#?(\d+))?", rest):
+        a, b = int(m.group(1)), int(m.group(2) or m.group(1))
+        nos += range(min(a, b), max(a, b) + 1) if abs(a - b) < 100 else [a, b]
+    return list(dict.fromkeys(nos))
+
+
+async def handle_claim(message: discord.Message, nos: list[int]):
+    if len(nos) > MAX_CLAIMS:
+        await message.reply(f"一次最多認領 {MAX_CLAIMS} 件，請分幾次打 🙏")
+        return
 
     pool = [s for s in SETTLEMENTS.values() if s["channel_id"] == message.channel.id]
     replied_to = message.reference.message_id if message.reference else None
-    state = next((s for s in pool if replied_to in s["message_ids"]), None)
-    if state is None:
-        state = next((s for s in reversed(pool) if open_item(s)), None)
-    if state is None:  # 有這個編號但不能領（已經有主），交給 claim() 說明原因
-        state = next((s for s in reversed(pool) if not s.get("closed") and settle.find_item(s, no)[1]), None)
-    if state is None:
-        await message.reply(f"找不到還沒人認領的 #{no} 🙅\n要認領的話，請直接回覆在那則結算訊息底下。")
-        return
+    replied = next((s for s in pool if replied_to in s["message_ids"]), None)
+
+    def find_state(no):
+        if replied:
+            return replied
+        open_item = lambda s: (lambda it: it is not None and settle.is_unclassified(it))(settle.find_item(s, no)[1])
+        # 有這個編號但不能領（已經有主）的，交給 claim() 說明原因
+        return (next((s for s in reversed(pool) if open_item(s)), None)
+                or next((s for s in reversed(pool) if not s.get("closed") and settle.find_item(s, no)[1]), None))
 
     target = named_user(message) or message.author
-    error = settle.claim(state, no, target.name)
-    if error:
-        await message.reply(error)
+    claimed: dict[str, list[int]] = {}  # batch → 認領成功的編號
+    failed = []
+    for no in nos:
+        state = find_state(no)
+        error = f"找不到還沒人認領的 #{no} 🙅" if state is None else settle.claim(state, no, target.name)
+        if error:
+            failed.append(error)
+        else:
+            claimed.setdefault(state["batch"], []).append(no)
+
+    if not claimed:
+        if len(failed) == 1 and failed[0].startswith("找不到"):
+            failed[0] += "\n要認領的話，請直接回覆在那則結算訊息底下。"
+        await message.reply("\n".join(failed) if len(failed) == 1 else "沒有認領到任何一件：\n" + "\n".join(f"- {e}" for e in failed))
         return
 
-    state["mentions"][target.name] = target.mention
-    _, item = settle.find_item(state, no)
-    tail = (
-        f"{state['payer']} 按 🏁 可以結束認領，剩下的算 {state['payer']} 自己的"
-        if settle.has_unclassified(state)
-        else f"全部都有人認領了，{state['payer']} 按 🏁 公布最終金額並通知大家"
-    )
-    reply = await message.reply(
-        f"#{no} {item['name']} 算在 {target.mention} 名下 ✅\n\n"
-        f"**結算 {state['batch']} 更新後：**\n{settle.render_totals(state, state['mentions'])}\n\n{tail}",
-        allowed_mentions=discord.AllowedMentions(users=[target]),
-    )
-    state["message_ids"].append(reply.id)  # 回覆這則也能找到同一次結算，在這則按 🏁 也有效
+    for i, (batch, done) in enumerate(claimed.items()):
+        state = SETTLEMENTS[batch]
+        state["mentions"][target.name] = target.mention
+        items = [settle.find_item(state, no)[1] for no in done]
+        if len(items) == 1:
+            head = f"#{done[0]} {items[0]['name']} 算在 {target.mention} 名下 ✅"
+        else:
+            head = f"{len(items)} 件算在 {target.mention} 名下 ✅\n" + "\n".join(f"#{it['no']} {it['name']}" for it in items)
+        if failed and i == len(claimed) - 1:
+            head += "\n\n沒有認領到：\n" + "\n".join(f"- {e}" for e in failed)
+        tail = (
+            f"{state['payer']} 按 🏁 可以結束認領，剩下的算 {state['payer']} 自己的"
+            if settle.has_unclassified(state)
+            else f"全部都有人認領了，{state['payer']} 按 🏁 公布最終金額並通知大家"
+        )
+        text = f"{head}\n\n**結算 {batch} 更新後：**\n{settle.render_totals(state, state['mentions'])}\n\n{tail}"
+        chunks = settle.split_message(text)
+        reply = await message.reply(chunks[0], allowed_mentions=discord.AllowedMentions(users=[target]))
+        for chunk in chunks[1:]:
+            reply = await message.channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+        state["message_ids"].append(reply.id)  # 回覆這則也能找到同一次結算，在這則按 🏁 也有效
+        await safe_react(reply, CLOSE_EMOJI)
     save_settlements()
-    await safe_react(reply, CLOSE_EMOJI)
 
 
 @bot.event
@@ -677,7 +708,7 @@ async def on_message(message: discord.Message):
 
     claim_match = CLAIM_RE.match(text)
     if claim_match:
-        await handle_claim(message, int(claim_match.group(2)))
+        await handle_claim(message, claim_numbers(text))
         await bot.process_commands(message)
         return
 

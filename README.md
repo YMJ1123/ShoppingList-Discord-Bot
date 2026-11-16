@@ -1,15 +1,16 @@
 
 # Shopping List Discord Bot
 
-Discord 購物清單 bot，使用 **AI（Groq / Llama 3.3 70B）** 自然語言解析 `買` 指令，將商品資訊送到 n8n Webhook，再由 n8n 寫入 Google 試算表。  
-A Discord bot that uses **AI-powered natural language processing (Groq / Llama 3.3 70B)** to parse `買` commands and forward structured data to an n8n webhook, which appends rows to a Google Sheet.
+Discord 購物清單 bot，使用 **AI（Groq，預設 `openai/gpt-oss-120b`）** 自然語言解析 `買` 指令，將商品資訊送到 n8n Webhook，再由 n8n 寫入 Google 試算表。
+下單的人付款後傳淘寶 App 截圖，bot 會算出每個人應付的台幣。
+A Discord bot that uses **AI-powered natural language processing (Groq, `openai/gpt-oss-120b` by default)** to parse `買` commands and forward structured data to an n8n webhook, which appends rows to a Google Sheet. It can also read order screenshots and split the bill.
 
 ---
 
 ## Features / 功能簡介
 
 - 在指定的 Discord 頻道監聽指令（不用 @ bot，直接打指令即可）
-- **AI 自然語言解析**（透過 Groq API + Llama 3.3 70B）：
+- **AI 自然語言解析**（透過 Groq API，預設 `openai/gpt-oss-120b`，可用 `GROQ_MODEL` 更換）：
   - 不需要嚴格格式，用自然語言即可
   - `買 兩台白色的小米風扇 https://...`
   - `買 【淘宝】... https://e.tb.cn/h.xxx 「電動牙刷」`
@@ -25,11 +26,15 @@ A Discord bot that uses **AI-powered natural language processing (Groq / Llama 3
   - 使用 `Code` 節點解析 payload（優先使用 AI 預解析的欄位）
   - 使用 `Switch` 節點依 `platform` 分流
   - 將 **淘寶訂單寫入 Sheet「淘寶」**、**京東訂單寫入 Sheet「京東」**
-- 支援 `~刪除` 指令：貼上商品連結或原分享文字，bot 會依第一個 URL 尋找並刪除對應的清單紀錄
-- 429 rate limit 自動重試機制（最多 3 次）
-- **結算**：下單的人把淘寶 App 截圖和「結算」一起傳上來，bot 讀出品項和價格、對到清單上的登記人、
-  用「實付台幣 ÷ 商品人民幣合計」回算匯率，算出每個人應付的台幣；對不到人的商品列為 unclassified 讓人 `認領`。
-  詳見 [USAGE.md](USAGE.md) 的「結算」一節
+- **刪除**：自然語言（`刪除電動牙刷`、`小米風扇不用買了`）或 `~刪除 <網址>`。只能刪自己加的；
+  網址用**商品 ID** 比對，所以追蹤參數不同的連結也認得出是同一件
+- 429 rate limit 自動重試機制
+- **結算**（詳見 [USAGE.md](USAGE.md) 的「結算」一節）：
+  - 下單的人把淘寶 App 截圖和「結算」一起傳上來，bot 用視覺模型讀出品項和價格，對到清單上的登記人
+  - 用「實付台幣 ÷ 商品人民幣合計」回算匯率，算出每個人應付的台幣，加總剛好等於實付金額
+  - 先貼草稿，下單人按 ✅ 才寫回表格（「實際價格」「結算批次」）並公布；按 ✅ 前追加的截圖會併進同一張草稿
+  - 對不到人的商品列為 unclassified，用 `認領 N` 認領；下單人按 🏁 結束認領，剩下的算下單人自己的
+  - `結算 @某人` 可以幫付錢的人代傳；同一件商品之前結算過時，草稿會提醒可能重複結算
 
 ---
 
@@ -88,7 +93,7 @@ GROQ_API_KEY=gsk_your_groq_api_key
 * `GROQ_API_KEY`
 
   * 到 [console.groq.com](https://console.groq.com) 註冊後，在 API Keys 頁面建立
-  * 免費方案：每分鐘 1,000 請求、每日約 14,000 請求，不需信用卡
+  * 免費方案不需信用卡，但有每分鐘的 token 上限；多人同時使用或結算截圖較多時會撞到 429，bot 會自動等待重試
 
 以下都是選填：
 
@@ -111,6 +116,49 @@ python -m pip install -r requirements.txt
 ```bash
 python bot.py
 ```
+
+### 部署（Docker Compose）
+
+正式環境把 n8n 和 bot 放在同一個 compose 專案，開機自動啟動，bot 用 compose 網路裡的 `n8n` 主機名連 webhook。
+compose 檔不在 repo 裡（放在 repo 的上一層），以下是目前使用的內容：
+
+```yaml
+name: shoppinglist
+services:
+  n8n:
+    image: n8nio/n8n:2.16.0          # 鎖版本，避免自動升級觸發資料庫遷移
+    restart: unless-stopped
+    ports: ["127.0.0.1:5678:5678"]
+    volumes: [n8n_storage:/home/node/.n8n]
+  bot:
+    build:
+      context: ./ShoppingList-Discord-Bot
+      dockerfile_inline: |
+        FROM python:3.11-slim
+        RUN pip install --no-cache-dir discord.py==2.6.4 openai==1.57.4 requests==2.31.0 python-dotenv==0.21.0 opencc-python-reimplemented==0.1.7
+    image: shoppinglist-bot
+    working_dir: /app
+    command: python -u bot.py
+    restart: unless-stopped
+    volumes:
+      - ./ShoppingList-Discord-Bot:/app:ro   # 程式碼唯讀掛載：git pull 後 restart 就生效
+      - bot_state:/data                      # 結算紀錄
+    env_file: ./ShoppingList-Discord-Bot/.env
+    environment:
+      N8N_WEBHOOK_URL: http://n8n:5678/webhook/discord-shopping
+      PYTHONDONTWRITEBYTECODE: "1"
+      STATE_DIR: /data
+      TZ: Asia/Taipei
+    depends_on: [n8n]
+volumes:
+  n8n_storage:
+  bot_state:
+```
+
+更新程式碼：在 repo 裡 `git pull`，再 `docker compose restart bot`。
+在容器裡跑測試：`docker compose run --rm -T --no-deps bot python test_bot.py`。
+
+> ⚠️ 同一個 `DISCORD_TOKEN` 只能有一個 bot 在跑，兩邊同時跑的話每則訊息都會被處理兩次。
 
 ---
 
@@ -137,16 +185,39 @@ AI 會自動辨識：
 
 唯一的硬性要求：**訊息中必須包含至少一個 `https://` 開頭的購物網址**。
 
-### ~刪除（Regex 解析，不使用 AI）
+### 刪除
+
+自然語言（AI 判斷刪除意圖）：
+
+```text
+刪除電動牙刷
+幫我把小米風扇刪掉
+電動牙刷不用買了
+取消 https://e.tb.cn/h.xxx
+```
+
+或舊格式（不經過 AI，直接用訊息裡第一個網址）：
 
 ```text
 ~刪除 https://e.tb.cn/h.xxx
 ~刪除 【淘宝】7天无理由退货 https://e.tb.cn/h.xxx 「電動牙刷」
 ```
 
-- 只要在分享文字最前面加上 `~刪除`，bot 會抓取第一個 URL 並刪除對應的訂單。
-- 若僅有連結也可行：`~刪除 <URL>`。
-- 找不到符合 URL 的紀錄或格式錯誤時，bot 會回覆失敗提示。
+- 只會在「購買人是自己」的列裡找。
+- 有網址就先用**商品 ID** 比對（淘寶／天貓的 `id=`、京東的 `item.jd.com/<ID>`），抓不到 ID 的短連結比去掉參數的網址；
+  沒有網址或網址對不到時，再比商品名稱（完全相同優先，其次互相包含）。
+- 找不到時回覆「在你加入的清單裡找不到這筆商品」。
+
+### 結算／認領／結束認領
+
+```text
+結算                ← 附上淘寶 App 截圖（确认订单頁或訂單詳情頁）；按 ✅ 前可以再傳圖追加
+結算 @付錢的人       ← 幫別人代傳
+認領 3              ← 沒對到人的 #3 是我的
+認領 3 @某人         ← 幫別人認領
+```
+
+草稿上按 ✅ 確認、❌ 取消；正式結果上按 🏁 結束認領。完整說明見 [USAGE.md](USAGE.md)。
 
 ---
 
@@ -155,10 +226,17 @@ AI 會自動辨識：
 整體流程示意：
 
 ```text
-Discord Bot (AI 解析) → n8n Webhook → Code → Switch(platform)
-                                                 ├─ 淘寶 → Google Sheets (Sheet: 淘寶)
-                                                 └─ 京東 → Google Sheets (Sheet: 京東)
+ShoppingListBot（webhook: discord-shopping）
+Discord Bot (AI 解析) → n8n Webhook → Code → Switch(action)
+                                              ├─ add    → Switch(platform) → 淘寶／京東 Sheet 新增一列
+                                              └─ delete → 讀「購買人＝自己」的列 → Find Delete Target → 刪除該列
+
+ShoppingListSettle（webhook: discord-shopping-settle）
+Discord Bot（讀截圖、比對、算金額）→ n8n Webhook → 讀兩個分頁 → Plan → 寫回「實際價格」「結算批次」
 ```
+
+> 💡 n8n 2.x 在編輯器按 Ctrl+S 只會存草稿，正在跑的是「已發布」的版本。改完一定要按 **Publish**
+> （用 CLI 的話是 `n8n publish:workflow --id=…`，然後重啟 n8n）。
 
 ### ⚡ Quick Start：從 repo 匯入現成 workflow / Import the pre-built workflow from the repo
 
@@ -626,6 +704,20 @@ git push -u origin main
   * 確認 `GROQ_API_KEY` 是否正確設定在 `.env` 中
   * 到 [console.groq.com/settings/limits](https://console.groq.com/settings/limits) 確認 API 額度
   * Bot 有內建 429 rate limit 自動重試（最多 3 次），正常使用不太會撞到限制
+* **改了 n8n workflow 但沒生效**
+
+  * Ctrl+S 只存草稿，要按 **Publish**；用 CLI 發布的話要重啟 n8n
+* **回覆「請求已送出，但 n8n 超過 30 秒沒回應」**
+
+  * Google Sheets 偶爾很慢，這筆通常其實已經寫進去了，先看表格再決定要不要重送
+* **結算沒反應或讀不到金額**
+
+  * 截圖要拍到「立即支付 TWD」或「实付款 TWD」那一行；一張圖不能超過 3MB
+  * Groq 免費額度撞到 429 時 bot 會等待重試，截圖多的話要等一兩分鐘
+* **按了 ✅ 沒反應**
+
+  * 只有下單人（或代傳的人）按的才算，而且要按在**最新**那張草稿上；追加截圖後舊草稿會被刪掉換新的
+  * 草稿只存在記憶體，bot 重啟後沒確認的草稿就沒了，要重新傳
 * **n8n 沒有任何執行紀錄**
 
   * 確認 workflow 狀態是 Active
@@ -640,8 +732,4 @@ git push -u origin main
 
 ---
 
-歡迎 fork / PR，如果你增加了更多平台（蝦皮、拼多多…）或自動抓價格邏輯，也可以補充在 README 的 n8n 範例中 😄
-
-```
-::contentReference[oaicite:0]{index=0}
-```
+歡迎 fork / PR，如果你增加了更多平台（蝦皮、拼多多…），也可以補充在 README 的 n8n 範例中 😄

@@ -225,7 +225,7 @@ check("離譜的範圍不展開", len(bot.claim_numbers("認領 1-100000")), 2)
 # ------------------------------------------------------------------
 # 結算流程：Discord、n8n、LLM 都用假的，只驗證 bot 這一層怎麼串
 bot.STATE_DIR = None  # 測試不可以寫到正式的結算紀錄（容器裡 STATE_DIR 有設）
-real_post, real_parse = bot.post_to_n8n, bot.parse_with_llm
+real_post, real_parse, real_read, real_llm_json = bot.post_to_n8n, bot.parse_with_llm, bot.read_screenshot, bot.llm_json
 _ids = itertools.count(1000)
 SENT = []  # bot 送出的每則訊息
 CALLS = []  # bot 送給 n8n 的每個請求
@@ -455,6 +455,55 @@ async def race():
     check("在新草稿上按 ✅ 才確認", nos(list(bot.SETTLEMENTS.values())[-1]), [1, 2, 3])
 
 asyncio.run(race())
+
+print("\n讀圖：讀壞了要重讀，還是不行就提醒")
+PENCIL = {"items": [{"name": "适用applepencil笔尖苹果pencil...", "spec": "白色【2 枚装】", "qty": 1, "paid_price": 9.8}],
+          "total_twd": 46, "order_no": "3317017045092056761"}
+
+
+def vision(*replies):
+    """讓讀圖的模型依序回傳 replies（Exception 就丟出），回傳 (讀到的結果, 呼叫次數)。"""
+    calls = []
+
+    async def fake_llm_json(client, **kw):
+        calls.append(kw["model"])
+        r = replies[len(calls) - 1]
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    bot.llm_json = fake_llm_json
+    try:
+        shot = asyncio.run(real_read(b"img", "image/jpeg"))
+    finally:
+        bot.llm_json = real_llm_json
+    return shot, len(calls)
+
+
+shot, n = vision(PENCIL)
+check("一次就讀好 → 不重讀", ([it["name"][:13] for it in shot["items"]], n), (["适用applepencil"], 1))
+shot, n = vision({"items": [], "total_twd": 46, "order_no": "3317017045092056761"}, PENCIL)
+check("第一次沒讀到商品 → 重讀一次就有了", ([it["price"] for it in shot["items"]], shot["total_twd"], n), ([9.8], 46, 2))
+shot, n = vision(json.JSONDecodeError("bad", "{", 0), PENCIL)
+check("第一次回傳的不是 JSON → 重讀", ([it["price"] for it in shot["items"]], n), ([9.8], 2))
+shot, n = vision({"items": [{"name": "甲", "qty": 1, "paid_price": 10}, {"name": "乙", "qty": 1, "paid_price": "?"}], "total_twd": 60},
+                 {"items": [{"name": "甲", "qty": 1, "paid_price": 10}], "total_twd": 60})
+check("兩次都不完整 → 取讀到比較多的那次", ([it["name"] for it in shot["items"]], shot["dropped"], n), (["甲"], 1, 2))
+shot, n = vision({"items": []}, {"items": []})
+check("兩次都讀不到 → 最多讀兩次，回傳空的讓草稿提醒", (shot["items"], n), ([], 2))
+
+stub()
+
+
+async def skipped_shot():
+    await send(AMY, "結算", [SHOT])
+    await send(AMY, "", [order([], 46, "3317017045092056761"), EARBUDS])
+    text = drafts()[-1].content
+    check("追加的第 1 張讀不到 → 草稿提醒「第 2 張截圖」（整張草稿的順序）",
+          "第 2 張截圖沒讀到任何商品，可能讀錯了，請檢查那張或重傳" in text, True)
+    check("同一則的其他圖照常併進來", nos(bot.PENDING[(1, AMY.id)]["state"]), [1, 2, 3])
+
+asyncio.run(skipped_shot())
 
 print("\n編號：同頻道不撞號")
 stub()

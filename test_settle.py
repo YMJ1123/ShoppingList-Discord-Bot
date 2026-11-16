@@ -73,10 +73,29 @@ c = settle.clean_shot({"items": [
     "不是物件",
 ], "total_twd": "164", "order_no": "5127 4811 9047 0077 704"})
 check("只留下完整的商品，並轉成正確型別", c["items"], [{"name": "好的", "spec": "", "qty": 2, "price": 12.5}])
+check("讀不完整的商品有記下件數", c["dropped"], 4)
 check("台幣轉成整數", c["total_twd"], 164)
 check("訂單號只留數字", c["order_no"], "5127481190470077704")
 check("台幣 0 視為沒讀到", settle.clean_shot({"items": [], "total_twd": 0})["total_twd"], None)
 check("太短的數字不當訂單號", settle.clean_shot({"order_no": "12345"})["order_no"], "")
+
+loose = settle.clean_shot({"items": [{"name": "适用applepencil笔尖", "qty": "x1", "paid_price": "¥9.8"},
+                                    {"name": "粘毛器", "qty": "2件", "paid_price": "6.38元"}],
+                          "total_twd": "TWD 1,046", "order_no": "3317017045092056761"})
+check("模型把數字寫成 x1、¥9.8、6.38元、TWD 1,046 也讀得懂",
+      (loose["items"], loose["total_twd"], loose["dropped"]),
+      ([{"name": "适用applepencil笔尖", "spec": "", "qty": 1, "price": 9.8}, {"name": "粘毛器", "spec": "", "qty": 2, "price": 6.38}], 1046, 0))
+check("模型回傳的不是物件也不會出錯", settle.clean_shot(None), {"items": [], "total_twd": None, "order_no": "", "dropped": 0})
+
+print("\nmerge_shots：讀不到的截圖不能默默不見（2026-11-16 applepencil 筆尖被略過）")
+empty = settle.clean_shot({"items": [], "total_twd": 46, "order_no": "3317017045092056761"})
+partial = settle.clean_shot({"items": [{"name": "甲", "qty": 1, "paid_price": 10}, {"name": "乙", "qty": 1, "paid_price": "?"}], "total_twd": 60})
+units, errors, notes = settle.merge_shots([shot([("Wilson篮球", "", 1, 87.22)], 415, "3317017045092038397"), empty, partial])
+check("整張沒讀到 → 提醒是第幾張", notes[0], "第 2 張截圖沒讀到任何商品，可能讀錯了，請檢查那張或重傳（那張本來就沒有商品的話可以忽略）")
+check("部分商品讀不完整 → 提醒件數", notes[1] if len(notes) > 1 else "（沒有提醒）", "第 3 張截圖有 1 件商品讀不完整，被略過了，請檢查那張或重傳")
+check("其他讀到的照常結算", [it["name"] for u in units for it in u["items"]], ["Wilson篮球", "甲"])
+_, _, notes = settle.merge_shots([shot([("甲", "", 1, 10)], 50), settle.clean_shot({"items": []})])
+check("連台幣都沒讀到的也會提醒", notes, ["第 2 張截圖沒讀到任何商品，可能讀錯了，請檢查那張或重傳（那張本來就沒有商品的話可以忽略）"])
 
 print("\nmerge_shots：確認訂單頁（多張截圖共用一個總額）")
 state, writes, payload, errors = build()

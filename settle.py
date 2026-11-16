@@ -41,24 +41,35 @@ def row_id(row: dict) -> str:
 
 # ---------------------------------------------------------------- 截圖 → 訂單
 
+def _number(value):
+    """模型有時把數字寫成 "x1"、"¥9.8"、"9.80元"、"1,234"，取出裡面的數字；沒有數字回 None。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    m = re.search(r"\d+(?:\.\d+)?", str(value or "").replace(",", ""))
+    return float(m.group()) if m else None
+
+
 def clean_shot(raw: dict) -> dict:
-    """把視覺模型的輸出整理成可信任的型別，丟掉讀不完整的商品。"""
-    items = []
-    for it in raw.get("items") or []:
-        try:
-            qty = int(it.get("qty") or 1)
-            price = round(float(it.get("paid_price") or 0), 2)
-        except (TypeError, ValueError, AttributeError):
+    """把視覺模型的輸出整理成可信任的型別。讀不完整的商品不收，但要記下幾件（dropped），不能默默不見。"""
+    raw = raw if isinstance(raw, dict) else {}
+    items, dropped = [], 0
+    for it in raw.get("items") if isinstance(raw.get("items"), list) else []:
+        if not isinstance(it, dict):
+            dropped += 1
             continue
         name = str(it.get("name") or "").strip()
-        if name and qty >= 1 and price > 0:
-            items.append({"name": name, "spec": str(it.get("spec") or "").strip(), "qty": qty, "price": price})
-    try:
-        total = int(round(float(raw.get("total_twd") or 0))) or None
-    except (TypeError, ValueError):
-        total = None
+        qty = 1 if it.get("qty") in (None, "") else _number(it.get("qty"))
+        price = _number(it.get("paid_price"))
+        if name and qty and qty >= 1 and price and price > 0:
+            items.append({"name": name, "spec": str(it.get("spec") or "").strip(), "qty": int(qty), "price": round(price, 2)})
+        else:
+            dropped += 1
+    total = _number(raw.get("total_twd"))
     order_no = re.sub(r"\D", "", str(raw.get("order_no") or ""))
-    return {"items": items, "total_twd": total, "order_no": order_no if len(order_no) >= 10 else ""}
+    return {"items": items, "total_twd": int(round(total)) or None if total else None,
+            "order_no": order_no if len(order_no) >= 10 else "", "dropped": dropped}
 
 
 def merge_shots(shots: list[dict], start: int = 1) -> tuple[list[dict], list[str], list[str]]:
@@ -68,7 +79,7 @@ def merge_shots(shots: list[dict], start: int = 1) -> tuple[list[dict], list[str
     捲動時重疊拍到的商品要去重。商品編號從 start 開始。回傳 (units, errors, notes)，errors 非空就不該繼續。
     """
     groups: dict[str, dict] = {}
-    orphans, errors = [], []
+    orphans, errors, notes = [], [], []
 
     def add(unit, shot):
         for it in shot["items"]:
@@ -78,6 +89,11 @@ def merge_shots(shots: list[dict], start: int = 1) -> tuple[list[dict], list[str
                 unit["items"].append(dict(it))
 
     for idx, shot in enumerate(shots, 1):
+        label = f"第 {idx} 張截圖"  # 草稿裡所有截圖照傳的順序排，追加的接在後面
+        if not shot["items"]:
+            notes.append(f"{label}沒讀到任何商品，可能讀錯了，請檢查那張或重傳（那張本來就沒有商品的話可以忽略）")
+        elif shot.get("dropped"):
+            notes.append(f"{label}有 {shot['dropped']} 件商品讀不完整，被略過了，請檢查那張或重傳")
         if shot["order_no"]:
             key = "order:" + shot["order_no"]
         elif shot["total_twd"]:
@@ -88,7 +104,7 @@ def merge_shots(shots: list[dict], start: int = 1) -> tuple[list[dict], list[str
         unit = groups.setdefault(key, {"order_no": shot["order_no"], "total_twd": None, "items": [], "_seen": set()})
         if shot["total_twd"]:
             if unit["total_twd"] and unit["total_twd"] != shot["total_twd"]:
-                errors.append(f"第 {idx} 張截圖和同一張訂單的其他截圖，台幣金額不一樣")
+                errors.append(f"{label}和同一張訂單的其他截圖，台幣金額不一樣")
             unit["total_twd"] = unit["total_twd"] or shot["total_twd"]
         add(unit, shot)
 
@@ -115,7 +131,6 @@ def merge_shots(shots: list[dict], start: int = 1) -> tuple[list[dict], list[str
         unit["rate"] = unit["total_twd"] / unit["cny"]
         units.append(unit)
 
-    notes = []
     shared_totals = [u["total_twd"] for u in units if not u["order_no"]]
     if len(shared_totals) > 1:
         notes.append("截圖裡讀到 " + "、".join(f"TWD {t:,}" for t in shared_totals)

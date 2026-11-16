@@ -325,17 +325,31 @@ async def llm_json(client, **kwargs) -> dict:
 
 
 async def read_screenshot(data: bytes, mime: str) -> dict:
+    """讀一張截圖。模型偶爾回傳讀不完整或不是 JSON 的結果，這時重讀一次，取比較完整的那次。"""
     url = f"data:{mime};base64,{base64.b64encode(data).decode()}"
-    raw = await llm_json(
-        vision_client,
-        model=VISION_MODEL,
-        max_tokens=2048,
-        messages=[{"role": "user", "content": [
-            {"type": "text", "text": settle.EXTRACT_PROMPT},
-            {"type": "image_url", "image_url": {"url": url}},
-        ]}],
-    )
-    return settle.clean_shot(raw)
+    best = None
+    for _ in range(2):
+        try:
+            raw = await llm_json(
+                vision_client,
+                model=VISION_MODEL,
+                max_tokens=2048,
+                messages=[{"role": "user", "content": [
+                    {"type": "text", "text": settle.EXTRACT_PROMPT},
+                    {"type": "image_url", "image_url": {"url": url}},
+                ]}],
+            )
+        except json.JSONDecodeError as e:
+            print("[WARN] 讀圖回傳的不是 JSON，重讀:", e)
+            raw = {}
+        shot = settle.clean_shot(raw)
+        # 讀到的商品多的優先；一樣多就留「看到的東西」多的那次，讀不完整的件數才不會被另一次蓋掉而默默不見
+        seen = lambda x: (len(x["items"]), len(x["items"]) + x["dropped"])
+        if best is None or seen(shot) > seen(best):
+            best = shot
+        if shot["items"] and not shot["dropped"]:
+            break
+    return best
 
 
 async def match_rows(payload: list[dict]) -> list[dict]:
@@ -366,9 +380,10 @@ async def market_rate() -> float | None:
         return None
 
 
-async def read_images(images: list) -> list[dict]:
+async def read_images(images: list, first: int = 1) -> list[dict]:
+    """first：這批第一張在整張草稿裡是第幾張，錯誤訊息裡的「第 N 張」才對得上使用者傳的順序。"""
     shots = []
-    for i, att in enumerate(images, 1):
+    for i, att in enumerate(images, first):
         if att.size > MAX_IMAGE_BYTES:
             raise SettleError(f"第 {i} 張圖超過 3MB，請改傳手機截圖（不要傳原始相片檔）")
         shots.append(await read_screenshot(await att.read(), att.content_type.split(";")[0]))
@@ -482,7 +497,7 @@ async def handle_settle(message: discord.Message):
             if PENDING.get(key) is not session:
                 await message.reply("剛剛那張草稿已經確認或取消了，這幾張沒有算進去。要另外結算的話，請重新傳並打「結算」。")
                 return
-            shots = session["shots"] + await read_images(images)
+            shots = session["shots"] + await read_images(images, first=len(session["shots"]) + 1)
             state, writes = await build_settlement(session, shots)
             sent = await send_chunks(message, settle.render(state, final=False))
             old = session["drafts"]

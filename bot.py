@@ -114,15 +114,18 @@ groq_client = AsyncOpenAI(
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_MAX_RETRIES = 3
 
-# 結算時讀截圖用的視覺模型。預設走 Groq；設了 VISION_BASE_URL 就改用那個
-# OpenAI 相容的服務（例如本地的 Ollama），截圖就不會離開自己的機器。
+# 結算時讀截圖用的視覺模型。有設 LOCAL_VISION_URL 就先用本地模型（截圖不離開自己的機器），
+# 太慢、失敗或讀不完整時才退回 Groq 的 VISION_MODEL。
 VISION_MODEL = os.getenv("VISION_MODEL", "qwen/qwen3.8-27b")
-VISION_BASE_URL = os.getenv("VISION_BASE_URL")
-vision_client = (
-    AsyncOpenAI(base_url=VISION_BASE_URL, api_key=os.getenv("VISION_API_KEY", "none"))
-    if VISION_BASE_URL
-    else groq_client
+LOCAL_VISION_URL = os.getenv("LOCAL_VISION_URL")  # OpenAI 相容的服務，例如 Ollama：http://host:11434/v1
+LOCAL_VISION_MODEL = os.getenv("LOCAL_VISION_MODEL", "qwen3-vl:8b-instruct")
+# 正常一張約 4 秒，模型剛載入約 25 秒。顯示卡記憶體被別的程式擠滿時一張要好幾分鐘，那就不等了
+LOCAL_VISION_TIMEOUT = float(os.getenv("LOCAL_VISION_TIMEOUT", "45"))
+LOCAL_VISION_COOLDOWN = 300  # 本地連不上或逾時後，這段時間直接用 Groq，不讓每張圖都等到逾時
+local_vision_client = (
+    AsyncOpenAI(base_url=LOCAL_VISION_URL, api_key="local", max_retries=0) if LOCAL_VISION_URL else None
 )
+local_vision_down_until = 0.0
 N8N_SETTLE_WEBHOOK_URL = os.getenv("N8N_SETTLE_WEBHOOK_URL", N8N_WEBHOOK_URL + "-settle")
 STATE_DIR = os.getenv("STATE_DIR")  # 有設才會把結算紀錄存檔，重啟後還能認領
 
@@ -457,32 +460,58 @@ async def llm_json(client, **kwargs) -> dict:
             await asyncio.sleep(LLM_RETRY_WAIT)
 
 
-async def read_screenshot(data: bytes, mime: str) -> dict:
-    """讀一張截圖。模型偶爾回傳讀不完整或不是 JSON 的結果，這時重讀一次，取比較完整的那次。"""
-    url = f"data:{mime};base64,{base64.b64encode(data).decode()}"
+def _seen(shot: dict) -> tuple:
+    """讀到的商品多的優先；一樣多就留「看到的東西」多的那次，讀不完整的件數才不會被另一次蓋掉而默默不見。"""
+    return len(shot["items"]), len(shot["items"]) + shot["dropped"]
+
+
+async def _read_with(client, model: str, url: str, timeout: float | None = None) -> dict:
+    """用指定的模型讀一張截圖。回傳讀不完整或不是 JSON 時重讀一次，取比較完整的那次。"""
     best = None
     for _ in range(2):
+        call = llm_json(
+            client,
+            model=model,
+            max_tokens=2048,
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": settle.EXTRACT_PROMPT},
+                {"type": "image_url", "image_url": {"url": url}},
+            ]}],
+        )
         try:
-            raw = await llm_json(
-                vision_client,
-                model=VISION_MODEL,
-                max_tokens=2048,
-                messages=[{"role": "user", "content": [
-                    {"type": "text", "text": settle.EXTRACT_PROMPT},
-                    {"type": "image_url", "image_url": {"url": url}},
-                ]}],
-            )
+            raw = await (asyncio.wait_for(call, timeout) if timeout else call)
         except json.JSONDecodeError as e:
             print("[WARN] 讀圖回傳的不是 JSON，重讀:", e)
             raw = {}
         shot = settle.clean_shot(raw)
-        # 讀到的商品多的優先；一樣多就留「看到的東西」多的那次，讀不完整的件數才不會被另一次蓋掉而默默不見
-        seen = lambda x: (len(x["items"]), len(x["items"]) + x["dropped"])
-        if best is None or seen(shot) > seen(best):
+        if best is None or _seen(shot) > _seen(best):
             best = shot
         if shot["items"] and not shot["dropped"]:
             break
     return best
+
+
+async def read_screenshot(data: bytes, mime: str) -> dict:
+    """讀一張截圖：先用本地模型，連不上、太慢或讀不完整才把截圖送到 Groq。"""
+    global local_vision_down_until
+    url = f"data:{mime};base64,{base64.b64encode(data).decode()}"
+    local = None
+    if local_vision_client is not None and time.monotonic() >= local_vision_down_until:
+        started = time.monotonic()
+        try:
+            local = await _read_with(local_vision_client, LOCAL_VISION_MODEL, url, LOCAL_VISION_TIMEOUT)
+        except Exception as e:
+            local_vision_down_until = time.monotonic() + LOCAL_VISION_COOLDOWN
+            print(f"[WARN] 本地讀圖失敗（{type(e).__name__}: {e}），接下來 {LOCAL_VISION_COOLDOWN} 秒改用 Groq")
+        else:
+            if local["items"] and not local["dropped"]:
+                print(f"讀圖: 本地 {LOCAL_VISION_MODEL} {time.monotonic() - started:.1f}s")
+                return local
+            print("[WARN] 本地讀圖讀不完整，改用 Groq 再讀一次")
+    started = time.monotonic()
+    remote = await _read_with(groq_client, VISION_MODEL, url)
+    print(f"讀圖: Groq {VISION_MODEL} {time.monotonic() - started:.1f}s")
+    return remote if local is None or _seen(remote) > _seen(local) else local
 
 
 async def match_rows(payload: list[dict]) -> list[dict]:
@@ -982,7 +1011,8 @@ async def on_ready():
     else:
         print("Allowed channel IDs: 不限制（所有頻道都會處理）")
     print(f"LLM: Groq {GROQ_MODEL} ✓")
-    print(f"結算: 讀圖 {VISION_MODEL} @ {VISION_BASE_URL or 'Groq'}，已載入 {len(SETTLEMENTS)} 筆結算紀錄")
+    reader = f"本地 {LOCAL_VISION_MODEL} @ {LOCAL_VISION_URL}（失敗退回 Groq {VISION_MODEL}）" if LOCAL_VISION_URL else f"Groq {VISION_MODEL}"
+    print(f"結算: 讀圖 {reader}，已載入 {len(SETTLEMENTS)} 筆結算紀錄")
     await recover_appends()
 
 

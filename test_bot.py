@@ -465,6 +465,7 @@ async def race():
 asyncio.run(race())
 
 print("\n讀圖：讀壞了要重讀，還是不行就提醒")
+bot.local_vision_client = None
 PENCIL = {"items": [{"name": "适用applepencil笔尖苹果pencil...", "spec": "白色【2 枚装】", "qty": 1, "paid_price": 9.8}],
           "total_twd": 46, "order_no": "3317017045092056761"}
 
@@ -499,6 +500,60 @@ shot, n = vision({"items": [{"name": "甲", "qty": 1, "paid_price": 10}, {"name"
 check("兩次都不完整 → 取讀到比較多的那次", ([it["name"] for it in shot["items"]], shot["dropped"], n), (["甲"], 1, 2))
 shot, n = vision({"items": []}, {"items": []})
 check("兩次都讀不到 → 最多讀兩次，回傳空的讓草稿提醒", (shot["items"], n), ([], 2))
+
+print("\n讀圖：本地模型優先，太慢或失敗退回 Groq")
+LOCAL = object()  # 假的本地 client，只用來分辨是哪一邊被呼叫
+EMPTY = {"items": [], "total_twd": 46, "order_no": "3317017045092056761"}
+
+
+def vision2(local=(), groq=(), slow=0.0):
+    """本地和 Groq 各自依序回傳的內容（Exception 就丟出）。回傳 (讀到的結果, 依序被呼叫的是哪一邊)。"""
+    calls, queues = [], {"local": list(local), "groq": list(groq)}
+
+    async def fake_llm_json(client, **kw):
+        side = "local" if client is LOCAL else "groq"
+        calls.append(side)
+        if side == "local":
+            await asyncio.sleep(slow)
+        r = queues[side].pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    bot.llm_json = fake_llm_json
+    try:
+        shot = asyncio.run(real_read(b"img", "image/jpeg"))
+    finally:
+        bot.llm_json = real_llm_json
+    return shot, calls
+
+
+bot.local_vision_client, bot.local_vision_down_until, bot.LOCAL_VISION_TIMEOUT = LOCAL, 0.0, 5
+shot, calls = vision2(local=[PENCIL])
+check("本地讀得好 → 截圖不會送到 Groq", ([it["price"] for it in shot["items"]], calls), ([9.8], ["local"]))
+
+shot, calls = vision2(local=[ConnectionError("refused")], groq=[PENCIL])
+check("本地連不上 → 退回 Groq，照樣讀到", ([it["price"] for it in shot["items"]], calls), ([9.8], ["local", "groq"]))
+shot, calls = vision2(groq=[PENCIL])
+check("本地剛失敗過 → 接下來幾分鐘直接用 Groq，不讓每張圖都等", calls, ["groq"])
+bot.local_vision_down_until = 0.0
+shot, calls = vision2(local=[PENCIL])
+check("冷卻時間過了 → 又先試本地", calls, ["local"])
+
+bot.LOCAL_VISION_TIMEOUT = 0.05
+shot, calls = vision2(local=[PENCIL], groq=[PENCIL], slow=0.5)
+check("本地太慢（逾時）→ 退回 Groq", ([it["price"] for it in shot["items"]], calls, bot.local_vision_down_until > 0), ([9.8], ["local", "groq"], True))
+bot.LOCAL_VISION_TIMEOUT, bot.local_vision_down_until = 5, 0.0
+
+shot, calls = vision2(local=[EMPTY, EMPTY], groq=[PENCIL])
+check("本地兩次都沒讀到商品 → 交給 Groq 再讀", ([it["price"] for it in shot["items"]], calls), ([9.8], ["local", "local", "groq"]))
+check("本地只是讀不好、不是壞掉 → 下一張還是先試本地", bot.local_vision_down_until, 0.0)
+PARTIAL = {"items": [{"name": "甲", "qty": 1, "paid_price": 10}, {"name": "乙", "qty": 1, "paid_price": "?"}], "total_twd": 60}
+shot, calls = vision2(local=[PARTIAL, PARTIAL], groq=[{"items": []}, {"items": []}])
+check("Groq 讀得更差 → 留本地讀到的", ([it["name"] for it in shot["items"]], shot["dropped"]), (["甲"], 1))
+bot.local_vision_client, bot.local_vision_down_until = None, 0.0
+shot, calls = vision2(groq=[PENCIL])
+check("沒設定本地模型 → 只用 Groq", calls, ["groq"])
 
 stub()
 

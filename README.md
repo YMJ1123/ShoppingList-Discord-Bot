@@ -100,8 +100,10 @@ GROQ_API_KEY=gsk_your_groq_api_key
 | 變數 | 預設 | 用途 |
 |------|------|------|
 | `GROQ_MODEL` | `openai/gpt-oss-120b` | 解析訊息、結算時比對商品用的文字模型 |
-| `VISION_MODEL` | `qwen/qwen3.8-27b` | 結算時讀截圖用的視覺模型 |
-| `VISION_BASE_URL` / `VISION_API_KEY` | （用 Groq） | 改用其他 OpenAI 相容的服務讀截圖，例如本地 Ollama：`http://host:11434/v1` |
+| `VISION_MODEL` | `qwen/qwen3.8-27b` | 結算時讀截圖用的 Groq 視覺模型（沒設本地模型時使用，或本地失敗時的後備） |
+| `LOCAL_VISION_URL` | （不用本地） | 本地視覺模型的 OpenAI 相容網址，例如 Ollama：`http://host.docker.internal:11434/v1`。有設就先用本地讀截圖，截圖不會離開自己的機器 |
+| `LOCAL_VISION_MODEL` | `qwen3-vl:8b-instruct` | 本地視覺模型的名稱 |
+| `LOCAL_VISION_TIMEOUT` | `45` | 本地讀一張圖最多等幾秒，超過就退回 Groq |
 | `N8N_SETTLE_WEBHOOK_URL` | `N8N_WEBHOOK_URL` 加上 `-settle` | 結算用 workflow 的 webhook |
 | `STATE_DIR` | （不存檔） | 存結算紀錄的資料夾。有設的話 bot 重啟後還能 `認領` |
 
@@ -146,9 +148,11 @@ services:
     env_file: ./ShoppingList-Discord-Bot/.env
     environment:
       N8N_WEBHOOK_URL: http://n8n:5678/webhook/discord-shopping
+      LOCAL_VISION_URL: http://host.docker.internal:11434/v1   # 主機上的 Ollama；連不上時 bot 會自動退回 Groq
       PYTHONDONTWRITEBYTECODE: "1"
       STATE_DIR: /data
       TZ: Asia/Taipei
+    extra_hosts: ["host.docker.internal:host-gateway"]
     depends_on: [n8n]
 volumes:
   n8n_storage:
@@ -157,6 +161,9 @@ volumes:
 
 更新程式碼：在 repo 裡 `git pull`，再 `docker compose restart bot`。
 在容器裡跑測試：`docker compose run --rm -T --no-deps bot python test_bot.py`。
+
+讀截圖的順序：本地模型（`LOCAL_VISION_URL`）→ 連不上、超過 `LOCAL_VISION_TIMEOUT` 秒、或讀不完整 → Groq。
+本地連不上或逾時之後的 5 分鐘內會直接用 Groq，不會每張圖都等到逾時。bot 的 log 會寫每張圖是哪一邊讀的（`讀圖: 本地 …` / `讀圖: Groq …`）。
 
 > ⚠️ 同一個 `DISCORD_TOKEN` 只能有一個 bot 在跑，兩邊同時跑的話每則訊息都會被處理兩次。
 

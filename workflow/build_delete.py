@@ -64,7 +64,13 @@ for node in wf["nodes"]:
         if "rowNumber: payload.rowNumber" not in code:
             if old not in code:
                 raise SystemExit("Code 節點裡找不到刪除欄位，沒有寫入 rowNumber")
-            node["parameters"]["jsCode"] = code.replace(old, new, 1)
+            code = code.replace(old, new, 1)
+        if "expect: payload.expect" not in code:
+            anchor = "        sheet: payload.sheet || '',\n"
+            if anchor not in code:
+                raise SystemExit("Code 節點裡找不到 sheet 欄位，沒有寫入 expect")
+            code = code.replace(anchor, anchor + "        expect: payload.expect || null,\n", 1)
+        node["parameters"]["jsCode"] = code
     elif node.get("name") == "Respond(404)":
         node["parameters"]["responseBody"] = (
             "={{ JSON.stringify($json.status ? $json : {status: 'not_found'}) }}"

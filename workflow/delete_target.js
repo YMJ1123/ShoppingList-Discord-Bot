@@ -29,14 +29,24 @@ function findDeleteTarget(req, rows) {
       itemName: row.name || '',
       spec: row.spec || '',
       qty: row.qty ?? '',
+      url: row.url || '',
     })),
   });
 
+  // 使用者從選項裡選好的那一筆。列號只是提示：等他選的時候如果有人新增或刪除別的列，
+  // 列號會位移，原本的列號可能已經是別的商品。所以一定要和選項當時的內容對得上才刪。
   const picked = req.rowNumber;
   if (picked !== undefined && picked !== null && String(picked) !== '') {
-    const row = rows.find((r) => String(r.row_number) === String(picked)
-      && (!req.sheet || r.sheet === req.sheet));
-    return row ? one(row) : { found: false };
+    const want = req.expect;
+    if (!want) return { found: false, status: 'changed' };
+    const same = (r) => norm(r.name) === norm(want.itemName) && norm(r.spec) === norm(want.spec)
+      && String(r.qty ?? '') === String(want.qty ?? '') && norm(r.url) === norm(want.url);
+    const inSheet = rows.filter((r) => !req.sheet || r.sheet === req.sheet);
+    const at = inSheet.find((r) => String(r.row_number) === String(picked));
+    if (at && same(at)) return one(at);
+    const moved = inSheet.filter(same);
+    if (moved.length === 1) return one(moved[0]);
+    return { found: false, status: 'changed' };
   }
 
   const key = urlKey(req.url);

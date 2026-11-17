@@ -1309,16 +1309,19 @@ print("\n刪除：多筆先選編號")
 async def delete_choices():
     stub()
     fans = [
-        {"n": 1, "sheet": "TB", "row_number": 4, "itemName": "小米風扇", "spec": "白色", "qty": 1},
-        {"n": 2, "sheet": "TB", "row_number": 9, "itemName": "USB風扇", "spec": "", "qty": 2},
+        {"n": 1, "sheet": "TB", "row_number": 4, "itemName": "小米風扇", "spec": "白色", "qty": 1, "url": "https://e.tb.cn/a"},
+        {"n": 2, "sheet": "TB", "row_number": 9, "itemName": "USB風扇", "spec": "", "qty": 2, "url": "https://e.tb.cn/b"},
     ]
     seen = []
+    moved = []  # 非空時，模擬表格在等待選擇期間被改過
 
     async def fake_parse(text):
         return {"action": "delete", "itemName": "風扇", "quantity": 1, "modelSpec": "", "url": ""}
 
     async def fake_n8n(payload, url=None):
         seen.append(dict(payload))
+        if payload.get("rowNumber") and moved:
+            return FakeResp(404, {"status": "changed", "found": False})
         if payload.get("rowNumber"):
             name = next(c["itemName"] for c in fans if c["row_number"] == payload["rowNumber"])
             return FakeResp(200, {"status": "deleted", "itemName": name})
@@ -1331,6 +1334,8 @@ async def delete_choices():
     check("多筆先列出編號，而且還沒指定列", ("1." in prompt.content and "USB風扇" in prompt.content, seen[-1].get("rowNumber")), (True, None))
     await send(AMY, "刪除 2")
     check("「刪除 2」帶第二列的列號", (seen[-1].get("rowNumber"), seen[-1].get("sheet")), (9, "TB"))
+    check("也帶上選項當時的內容，讓 n8n 核對是不是同一筆", seen[-1].get("expect"),
+          {"itemName": "USB風扇", "spec": "", "qty": 2, "url": "https://e.tb.cn/b"})
     check("選完回報刪掉的名稱", "USB風扇" in SENT[-1].content, True)
     check("選完清掉選項", bot.DELETE_CHOICES, {})
 
@@ -1353,6 +1358,15 @@ async def delete_choices():
     calls = len(seen)
     await send(AMY, "刪除 1")
     check("過期不再刪，並請他重說", (len(seen), "過期" in SENT[-1].content), (calls, True))
+
+    bot.DELETE_CHOICES.clear()
+    await send(AMY, "刪除風扇")
+    moved.append(True)
+    await send(AMY, "刪除 2")
+    check("等待選擇時表格被改過（n8n 回 changed）→ 說明沒有刪、請他重說", SENT[-1].content,
+          "清單在你選的這段時間有變動，我不確定你選的是哪一筆，所以**沒有刪任何東西**。\n請重新說一次要刪什麼。")
+    check("選項作廢，不能拿舊編號再試", bot.DELETE_CHOICES, {})
+    moved.clear()
 
     await send(AMY, "刪除風扇")
     first_id = bot.DELETE_CHOICES[(CHAN.id, AMY.id)]["id"]

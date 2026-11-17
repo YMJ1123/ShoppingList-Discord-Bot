@@ -302,9 +302,12 @@ async def confirm_delete_choice(message: discord.Message, number: int):
         choice = choices[number - 1]
         choice_id = pending["id"]
         row_number, sheet = choice["row_number"], choice["sheet"]
+        # 列號可能在等他選的這段時間位移，所以連選項當時的內容一起送，讓 n8n 核對是不是同一筆
+        expect = {"itemName": choice.get("itemName", ""), "spec": choice.get("spec", ""),
+                  "qty": choice.get("qty", ""), "url": choice.get("url", "")}
     await send_delete(
         message, "", "", message.content,
-        row_number=row_number, sheet=sheet, choice_id=choice_id,
+        row_number=row_number, sheet=sheet, choice_id=choice_id, expect=expect,
     )
 
 
@@ -316,6 +319,7 @@ async def send_delete(
     row_number: str | int = "",
     sheet: str = "",
     choice_id: int | None = None,
+    expect: dict | None = None,
 ):
     """送刪除請求到 n8n 並回覆結果。可用網址、商品名稱，或使用者選好的列號。"""
     key = (message.channel.id, message.author.id)
@@ -336,6 +340,7 @@ async def send_delete(
     if row_number != "" and row_number is not None:
         payload["rowNumber"] = row_number
         payload["sheet"] = sheet
+        payload["expect"] = expect
 
     try:
         resp = await post_to_n8n(payload)
@@ -349,6 +354,13 @@ async def send_delete(
 
         if resp.status_code == 404 and body.get("status") == "choose" and body.get("choices"):
             await offer_delete_choices(message, body["choices"])
+            return
+        if resp.status_code == 404 and body.get("status") == "changed":
+            _drop_delete_choice(key, choice_id)
+            await message.reply(
+                "清單在你選的這段時間有變動，我不確定你選的是哪一筆，所以**沒有刪任何東西**。\n"
+                "請重新說一次要刪什麼。"
+            )
             return
 
         if resp.status_code == 200:

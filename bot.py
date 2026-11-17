@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import time
 import base64
 import asyncio
 from copy import deepcopy
@@ -228,8 +229,100 @@ async def safe_react(message: discord.Message, emoji: str, remove: bool = False)
         print(f"[WARN] 無法{'移除' if remove else '加上'}反應 {emoji}: {e}")
 
 
-async def send_delete(message: discord.Message, url: str, item_name: str, full_text: str):
-    """送刪除請求到 n8n 並回覆結果。可用網址或商品名稱其中之一辨識。"""
+# (頻道, 使用者) → 還沒選編號的刪除選項。只在記憶體，重啟就消失。
+DELETE_CHOICES: dict[tuple[int, int], dict] = {}
+DELETE_CHOICE_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
+DELETE_CHOICE_SECONDS = 600
+DELETE_CHOICE_SEQ = 0
+# 「刪除 2」「第2個」「2」；純數字只在回覆選項那則訊息時算數
+DELETE_PICK_RE = re.compile(r"^(?:(?:刪除|刪掉|移除|選)\s*)?(?:第\s*)?#?\s*(\d{1,2})\s*(?:個)?$")
+
+
+def delete_choice_lock(key: tuple[int, int]) -> asyncio.Lock:
+    return DELETE_CHOICE_LOCKS.setdefault(key, asyncio.Lock())
+
+
+def delete_pick_number(text: str, message: discord.Message) -> int | None:
+    """有待選的刪除時，认出選編號。沒有待選就回 None，讓原本的刪除流程繼續。"""
+    pending = DELETE_CHOICES.get((message.channel.id, message.author.id))
+    if not pending:
+        return None
+    matched = DELETE_PICK_RE.fullmatch(text.strip())
+    if not matched:
+        return None
+    raw = text.strip()
+    replied = bool(message.reference and message.reference.message_id == pending.get("prompt_id"))
+    explicit = bool(re.match(r"^(?:刪除|刪掉|移除|選|第)", raw))
+    if replied or explicit:
+        return int(matched.group(1))
+    return None
+
+
+def _drop_delete_choice(key: tuple[int, int], choice_id: int | None):
+    pending = DELETE_CHOICES.get(key)
+    if pending and choice_id is not None and pending["id"] == choice_id:
+        DELETE_CHOICES.pop(key, None)
+
+
+async def offer_delete_choices(message: discord.Message, choices: list[dict]):
+    """多筆對得上時列出編號。新的一輪會取代舊的，編號用只增不減的序號。"""
+    global DELETE_CHOICE_SEQ
+    key = (message.channel.id, message.author.id)
+    lines = []
+    for choice in choices:
+        extra = f"（{choice['spec']}）" if choice.get("spec") else ""
+        qty = choice.get("qty")
+        qty_text = f" ×{qty}" if qty not in ("", None) else ""
+        lines.append(f"{choice['n']}. 「{choice['itemName']}」{extra}{qty_text}")
+    prompt = await message.reply(
+        "你有好幾筆對得上，我先不刪。回覆這則訊息的編號，或打「刪除 2」：\n" + "\n".join(lines)
+    )
+    async with delete_choice_lock(key):
+        DELETE_CHOICE_SEQ += 1
+        DELETE_CHOICES[key] = {
+            "id": DELETE_CHOICE_SEQ,
+            "expires": time.monotonic() + DELETE_CHOICE_SECONDS,
+            "choices": choices,
+            "prompt_id": prompt.id,
+        }
+
+
+async def confirm_delete_choice(message: discord.Message, number: int):
+    key = (message.channel.id, message.author.id)
+    async with delete_choice_lock(key):
+        pending = DELETE_CHOICES.get(key)
+        if not pending or pending["expires"] <= time.monotonic():
+            DELETE_CHOICES.pop(key, None)
+            await message.reply("這次的刪除選項已經過期，請重新說一次要刪什麼。")
+            return
+        choices = pending["choices"]
+        if not 1 <= number <= len(choices):
+            await message.reply(f"請回 1 到 {len(choices)} 的編號。")
+            return
+        choice = choices[number - 1]
+        choice_id = pending["id"]
+        row_number, sheet = choice["row_number"], choice["sheet"]
+    await send_delete(
+        message, "", "", message.content,
+        row_number=row_number, sheet=sheet, choice_id=choice_id,
+    )
+
+
+async def send_delete(
+    message: discord.Message,
+    url: str,
+    item_name: str,
+    full_text: str,
+    row_number: str | int = "",
+    sheet: str = "",
+    choice_id: int | None = None,
+):
+    """送刪除請求到 n8n 並回覆結果。可用網址、商品名稱，或使用者選好的列號。"""
+    key = (message.channel.id, message.author.id)
+    if choice_id is None:
+        pending = DELETE_CHOICES.get(key)
+        choice_id = pending["id"] if pending else None
+    stamp = getattr(message, "created_at", None)
     payload = {
         "action": "delete",
         "url": url,
@@ -238,24 +331,35 @@ async def send_delete(message: discord.Message, url: str, item_name: str, full_t
         "senderId": str(message.author.id),
         "senderName": message.author.name,
         "channelId": str(message.channel.id),
-        "createdAt": message.created_at.isoformat(),
+        "createdAt": stamp.isoformat() if stamp is not None else "",
     }
+    if row_number != "" and row_number is not None:
+        payload["rowNumber"] = row_number
+        payload["sheet"] = sheet
 
     try:
         resp = await post_to_n8n(payload)
-        print("Sent DELETE to n8n:", resp.status_code, resp.text[:200])
+        body_text = getattr(resp, "text", "") or ""
+        print("Sent DELETE to n8n:", resp.status_code, body_text[:200])
+        body = {}
+        try:
+            body = resp.json() or {}
+        except Exception:
+            body = {}
+
+        if resp.status_code == 404 and body.get("status") == "choose" and body.get("choices"):
+            await offer_delete_choices(message, body["choices"])
+            return
 
         if resp.status_code == 200:
-            deleted_name = ""
-            try:
-                deleted_name = str(resp.json().get("itemName", ""))
-            except Exception:
-                pass
+            _drop_delete_choice(key, choice_id)
+            deleted_name = str(body.get("itemName", ""))
             if deleted_name:
                 await message.reply(f"已把「{deleted_name}」從購物清單刪掉 🗑️")
             else:
                 await message.reply("已刪除你加進清單的那筆商品 🗑️")
         elif resp.status_code in (403, 404):
+            _drop_delete_choice(key, choice_id)
             await message.reply(
                 "在你加入的清單裡找不到這筆商品 🙅\n"
                 "（只能刪自己加的，名稱也要對得上喔）"
@@ -928,6 +1032,13 @@ async def on_message(message: discord.Message):
     claim_match = CLAIM_RE.match(text)
     if claim_match:
         await handle_claim(message, claim_numbers(text))
+        await bot.process_commands(message)
+        return
+
+    # 多筆刪除的編號。要排在「刪除」送 LLM 之前，不然「刪除 2」會被當成商品名稱。
+    pick = delete_pick_number(text, message)
+    if pick is not None:
+        await confirm_delete_choice(message, pick)
         await bot.process_commands(message)
         return
 

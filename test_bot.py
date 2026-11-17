@@ -273,6 +273,7 @@ class FakeMsg:
 class FakeResp:
     def __init__(self, status, body):
         self.status_code, self.ok, self._body = status, status < 400, body
+        self.text = json.dumps(body, ensure_ascii=False)
 
     def json(self):
         return self._body
@@ -302,7 +303,8 @@ def stub(settle_status=200, read_delay=0.0, sheet=None):
     CALLS.clear()
     bot.SETTLEMENTS.clear()
     bot.PENDING.clear()
-    for lock_name in ("SETTLEMENT_LOCKS", "CHANNEL_LOCKS"):
+    bot.DELETE_CHOICES.clear()
+    for lock_name in ("SETTLEMENT_LOCKS", "CHANNEL_LOCKS", "DELETE_CHOICE_LOCKS"):
         getattr(bot, lock_name, {}).clear()
     bot.ALLOWED_CHANNEL_IDS = set()
     bot.SETTLE_CONFIRM_SECONDS = 600
@@ -723,7 +725,9 @@ check("下單人按別的表情 → 沒反應", (press("👍", AMY, final_id), s
 check("在不相干的訊息按 🏁 → 沒反應", (press("🏁", AMY, 424242), state.get("closed")), ([], None))
 out = press("🏁", AMY, final_id)
 check("下單人按 🏁 → 公布最終金額", [m.content for m in out],
-      [f"🏁 **結算 {batch} 結束認領**｜請轉帳給 <@100>\n\n**bob　TWD 495**\n\n下單人自己的 TWD 495 不用轉，含沒人認領的 #2"])
+      [f"🏁 **結算 {batch} 結束認領**｜請轉帳給 <@100>\n\n"
+       "**bob　TWD 495**\n　#1 小米風扇 ×1　¥100.00\n\n"
+       "下單人自己的 TWD 495 不用轉，含沒人認領的 #2\n　#2 神秘商品 ×2　¥100.00"])
 check("回覆在被按的那則訊息底下，而且只 ping 人", (out[0].kw["reference"].message_id, out[0].kw["allowed_mentions"].to_dict()["parse"]), (final_id, ["users"]))
 check("沒人領的算給下單人，總額不變", bot.settle.totals(state)["twd"], {"bob": 495, "amy": 495})
 check("再按一次不會重發", press("🏁", AMY, final_id), [])
@@ -737,7 +741,9 @@ claim_reply = SENT[-1]
 check("認領的回覆上也有 🏁，而且記進這次結算", (claim_reply.reactions, claim_reply.id in state["message_ids"]), (["🏁"], True))
 out = press("🏁", AMY, claim_reply.id)
 check("全部認領完，在認領回覆上按 🏁 → 公布並 ping 每個要付錢的人", out[0].content,
-      f"🏁 **結算 {state['batch']} 結束認領**｜請轉帳給 <@100>\n\n**bob　TWD 495**\n**<@300>　TWD 495**")
+      f"🏁 **結算 {state['batch']} 結束認領**｜請轉帳給 <@100>\n\n"
+      "**bob　TWD 495**\n　#1 小米風扇 ×1　¥100.00\n"
+      "**<@300>　TWD 495**\n　#2 神秘商品 ×2　¥100.00")
 
 stub()
 asyncio.run(settle_and_confirm(AMY, [order([("小米風扇", 1, 100.0)], 495)]))
@@ -746,9 +752,10 @@ check("全部都對到人 → 不放 🏁", published()[-1].reactions, [])
 stub()
 state = asyncio.run(settle_and_confirm(AMY, [SHOT], text="結算 <@300>", mentions=[CAROL], confirmer=CAROL))
 out = press("🏁", AMY, published()[-1].id)
-lines = out[0].content.split("\n") if out else ["（沒有送出任何訊息）"]
-check("代傳：代傳的人也能按 🏁，剩下的算給被幫忙的人", (lines[0], lines[-1]),
-      (f"🏁 **結算 {state['batch']} 結束認領**｜請轉帳給 <@300>", "下單人自己的 TWD 495 不用轉，含沒人認領的 #2"))
+text = out[0].content if out else ""
+check("代傳：代傳的人也能按 🏁，剩下的算給被幫忙的人",
+      (text.split("\n")[0], "下單人自己的 TWD 495 不用轉，含沒人認領的 #2" in text, "　#2 神秘商品 ×2　¥100.00" in text),
+      (f"🏁 **結算 {state['batch']} 結束認領**｜請轉帳給 <@300>", True, True))
 
 print("\n已公布結算：回覆附圖追加")
 stub()
@@ -1295,6 +1302,66 @@ with tempfile.TemporaryDirectory() as d:
     bot.STATE_DIR = None
 bot.post_to_n8n, bot.parse_with_llm = real_post, real_parse
 bot.SETTLE_CONFIRM_SECONDS = 600
+
+print("\n刪除：多筆先選編號")
+
+
+async def delete_choices():
+    stub()
+    fans = [
+        {"n": 1, "sheet": "TB", "row_number": 4, "itemName": "小米風扇", "spec": "白色", "qty": 1},
+        {"n": 2, "sheet": "TB", "row_number": 9, "itemName": "USB風扇", "spec": "", "qty": 2},
+    ]
+    seen = []
+
+    async def fake_parse(text):
+        return {"action": "delete", "itemName": "風扇", "quantity": 1, "modelSpec": "", "url": ""}
+
+    async def fake_n8n(payload, url=None):
+        seen.append(dict(payload))
+        if payload.get("rowNumber"):
+            name = next(c["itemName"] for c in fans if c["row_number"] == payload["rowNumber"])
+            return FakeResp(200, {"status": "deleted", "itemName": name})
+        return FakeResp(404, {"status": "choose", "found": False, "choices": fans})
+
+    bot.parse_with_llm = fake_parse
+    bot.post_to_n8n = fake_n8n
+    await send(AMY, "刪除風扇")
+    prompt = SENT[-1]
+    check("多筆先列出編號，而且還沒指定列", ("1." in prompt.content and "USB風扇" in prompt.content, seen[-1].get("rowNumber")), (True, None))
+    await send(AMY, "刪除 2")
+    check("「刪除 2」帶第二列的列號", (seen[-1].get("rowNumber"), seen[-1].get("sheet")), (9, "TB"))
+    check("選完回報刪掉的名稱", "USB風扇" in SENT[-1].content, True)
+    check("選完清掉選項", bot.DELETE_CHOICES, {})
+
+    before = len(SENT)
+    await send(AMY, "2")
+    check("沒有選項時，純數字不刪", len(SENT), before)
+
+    await send(AMY, "刪除風扇")
+    old_prompt = SENT[-1]
+    await send(AMY, "刪除風扇")
+    new_prompt = SENT[-1]
+    calls = len(seen)
+    await send(AMY, "1", reply_to=old_prompt.id)
+    check("回覆舊選項的數字不算", len(seen), calls)
+    await send(AMY, "2", reply_to=new_prompt.id)
+    check("回覆目前選項的 2 才刪", seen[-1].get("rowNumber"), 9)
+
+    await send(AMY, "刪除風扇")
+    bot.DELETE_CHOICES[(CHAN.id, AMY.id)]["expires"] = time.monotonic() - 1
+    calls = len(seen)
+    await send(AMY, "刪除 1")
+    check("過期不再刪，並請他重說", (len(seen), "過期" in SENT[-1].content), (calls, True))
+
+    await send(AMY, "刪除風扇")
+    first_id = bot.DELETE_CHOICES[(CHAN.id, AMY.id)]["id"]
+    await send(AMY, "刪除風扇")
+    check("新的一輪序號只會變大", bot.DELETE_CHOICES[(CHAN.id, AMY.id)]["id"] > first_id, True)
+
+
+asyncio.run(delete_choices())
+bot.post_to_n8n, bot.parse_with_llm = real_post, real_parse
 
 print("\nllm_json：429 重試")
 

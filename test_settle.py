@@ -206,13 +206,25 @@ check("其他人的金額不變", (t["twd"]["chezz1025"], t["twd"]["wakaru_0216"
 check("結束後沒有沒人領的", settle.has_unclassified(closing), False)
 check("結束後不能再認領", settle.claim(closing, 1, "erictw13"), "結算 20261112-1510 已經結束認領了，有問題請直接找下單的人")
 check("最終訊息", settle.render_closed(closing, {"ymj1123": "<@1>", "chezz1025": "<@2>"}),
-      "🏁 **結算 20261112-1510 結束認領**｜請轉帳給 <@1>\n\n**<@2>　TWD 821**\n**wakaru_0216　TWD 328**\n\n下單人自己的 TWD 3,391 不用轉，含沒人認領的 #1")
+      "🏁 **結算 20261112-1510 結束認領**｜請轉帳給 <@1>\n"
+      "\n"
+      "**<@2>　TWD 821**\n"
+      "　#3 盲盒收纳展示架手办亚克力柜 ×2　¥49.20\n"
+      "　#4 chiikawa乌萨奇公仔收纳盒棉花娃 ×4　¥105.08\n"
+      "**wakaru_0216　TWD 328**\n"
+      "　#2 【除尘秒贴】闪魔iPad耐刮钢化膜 ×1　¥61.58\n"
+      "\n"
+      "下單人自己的 TWD 3,391 不用轉，含沒人認領的 #1\n"
+      "　#1 轻奢钛架男士高清防蓝光眼镜 ×1　¥284.66\n"
+      "　#5 TANZ 002 夜侠361男鞋运动鞋20 ×1　¥352.33")
 nothing_left = copy.deepcopy(closing); nothing_left["leftover"] = []
-check("沒有剩下的就不寫「含沒人認領」", settle.render_closed(nothing_left).split("\n")[-1], "下單人自己的 TWD 3,391 不用轉")
+closed_text = settle.render_closed(nothing_left)
+check("沒有剩下的就不寫「含沒人認領」", ("含沒人認領" in closed_text, "下單人自己的 TWD 3,391 不用轉" in closed_text), (False, True))
 solo = {"batch": "B", "payer": "p", "units": [{"order_no": "", "total_twd": 50, "cny": 10.0, "rate": 5.0, "items": [
     {"no": 1, "name": "n", "qty": 1, "line": 10.0, "shares": [{"owner": UNCLASSIFIED, "cny": 10.0}]}]}]}
 settle.close(solo)
-check("全部都是下單人自己的", settle.render_closed(solo), "🏁 **結算 B 結束認領**｜請轉帳給 p\n\n沒有人需要轉帳。\n\n下單人自己的 TWD 50 不用轉，含沒人認領的 #1")
+check("全部都是下單人自己的", settle.render_closed(solo),
+      "🏁 **結算 B 結束認領**｜請轉帳給 p\n\n沒有人需要轉帳。\n\n下單人自己的 TWD 50 不用轉，含沒人認領的 #1\n　#1 n ×1　¥10.00")
 
 print("\nduplicate_notes：重複結算")
 # 2026-11-16 的真實情況：11/12 用確認頁結算過，11/16 又用訂單頁結算同一批（標題寫法不同、OCR 也有錯字）

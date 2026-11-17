@@ -412,6 +412,8 @@ def render(state: dict, final: bool, mentions: dict | None = None) -> str:
     lines = [head, f"{paid} **TWD {t['total_twd']:,}**｜商品合計 ¥{t['total_cny']:.2f}｜1 CNY ≈ {t['rate']:.3f} TWD", ""]
 
     def item_lines(owner):
+        if owner != UNCLASSIFIED:
+            return buyer_lines(state, owner)
         out = []
         for unit in state["units"]:
             for it in unit["items"]:
@@ -419,10 +421,9 @@ def render(state: dict, final: bool, mentions: dict | None = None) -> str:
                     if share["owner"] != owner:
                         continue
                     line = f"　#{it['no']} {_short(it['name'])} ×{it['qty']}　¥{share['cny']:.2f}"
-                    if owner == UNCLASSIFIED:
-                        line += f" ≈ TWD {share['cny'] * unit['rate']:,.0f}"
-                        if it.get("hint"):
-                            line += f"（{it['hint']}）"
+                    line += f" ≈ TWD {share['cny'] * unit['rate']:,.0f}"
+                    if it.get("hint"):
+                        line += f"（{it['hint']}）"
                     out.append(line)
         return out
 
@@ -452,19 +453,36 @@ def render(state: dict, final: bool, mentions: dict | None = None) -> str:
     return "\n".join(lines)
 
 
+def buyer_lines(state: dict, owner: str) -> list[str]:
+    """一個人名下的商品明細。"""
+    out = []
+    for unit in state["units"]:
+        for it in unit["items"]:
+            for share in it["shares"]:
+                if share["owner"] != owner:
+                    continue
+                out.append(f"　#{it['no']} {_short(it['name'])} ×{it['qty']}　¥{share['cny']:.2f}")
+    return out
+
+
 def render_closed(state: dict, mentions: dict | None = None) -> str:
-    """結束認領後的最終金額。只列要轉帳的人，下單人自己的另外寫一行。"""
+    """結束認領後的最終金額。每個人下面列出他買的商品。"""
     mentions = mentions or {}
     t = totals(state)
     payer = state["payer"]
     who = lambda name: mentions.get(name, name)
     lines = [f"🏁 **結算 {state['batch']} 結束認領**｜請轉帳給 {who(payer)}", ""]
     owe = sorted(o for o in t["twd"] if o != payer)
-    lines += [f"**{who(o)}　TWD {t['twd'][o]:,}**" for o in owe] or ["沒有人需要轉帳。"]
+    if not owe:
+        lines.append("沒有人需要轉帳。")
+    for owner in owe:
+        lines.append(f"**{who(owner)}　TWD {t['twd'][owner]:,}**")
+        lines += buyer_lines(state, owner)
     left = state.get("leftover") or []
     if payer in t["twd"]:
         note = f"，含沒人認領的 {'、'.join(f'#{n}' for n in left)}" if left else ""
         lines += ["", f"下單人自己的 TWD {t['twd'][payer]:,} 不用轉{note}"]
+        lines += buyer_lines(state, payer)
     return "\n".join(lines)
 
 

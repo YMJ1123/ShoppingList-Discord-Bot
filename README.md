@@ -206,6 +206,9 @@ AI 會自動辨識：
 - 只會在「購買人是自己」的列裡找。
 - 有網址就先用**商品 ID** 比對（淘寶／天貓的 `id=`、京東的 `item.jd.com/<ID>`），抓不到 ID 的短連結比去掉參數的網址；
   沒有網址或網址對不到時，再比商品名稱（完全相同優先，其次互相包含）。
+- 同一層對到好幾筆時不會刪第一筆：workflow 回 `status: "choose"` 和候選清單，bot 列出編號讓使用者選
+  （`刪除 2`，或回覆那則訊息打 `2`），再帶著列號和那一列當時的內容去刪。列號位移時 workflow 會用內容找回同一筆，
+  認不出來就回 `changed`、什麼都不刪。邏輯在 `workflow/delete_target.js`，改完跑 `python3 workflow/build_delete.py`。
 - 找不到時回覆「在你加入的清單裡找不到這筆商品」。
 
 ### 結算／認領／結束認領
@@ -280,7 +283,7 @@ n8n import:workflow --input=ShoppingListSettle.json
 n8n publish:workflow --id=SLsettle20261112   # 發布後要重啟 n8n 才會生效
 ```
 
-測試：`python3 test_bot.py`、`python3 test_settle.py`、`node workflow/test_settle_plan.js`。
+測試：`python3 test_bot.py`、`python3 test_settle.py`、`node workflow/test_settle_plan.js`、`node workflow/test_delete_target.js`。
 
 ---
 

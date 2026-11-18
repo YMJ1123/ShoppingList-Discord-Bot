@@ -1,7 +1,7 @@
 # 📦 購物清單 Bot 使用指南
 
-在這個頻道打字，Bot 會幫大家把要買的東西記到購物清單（Google Sheet），付款後還能算出每個人要轉多少錢：
-https://docs.google.com/spreadsheets/d/1lHVZo7mhJt_1jA_shrHjrEMjVzFt8JX5NhB3n3Z-jBM/edit?usp=sharing
+在這個頻道打字，Bot 會幫大家把要買的東西記到購物清單（Google Sheet），付款後還能算出每個人要轉多少錢。
+表單網址請看頻道的釘選訊息，找不到的話問開團的人。
 
 不用 @ Bot，直接打字就可以。
 

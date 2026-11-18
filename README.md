@@ -113,6 +113,7 @@ GOOGLE_CREDENTIALS=/run/secrets/google-oauth.json
 | `LOCAL_VISION_URL` | （不用本地） | 本地視覺模型的 OpenAI 相容網址，例如 Ollama `http://host.docker.internal:11434/v1`。本地失敗、逾時或讀不完整時，截圖會送到 Groq 後備模型 |
 | `LOCAL_VISION_MODEL` | `qwen3-vl:8b-instruct` | 本地視覺模型的名稱 |
 | `LOCAL_VISION_TIMEOUT` | `45` | 本地讀一張圖最多等幾秒，超過就退回 Groq |
+| `LOCAL_VISION_KEEP_ALIVE` | `2m` | 讀完後本地模型在顯示卡上留多久。和別的模型共用顯示卡時別設成永久，否則顯示記憶體不夠、整台機器會卡死 |
 | `STATE_DIR` | （不存本機快取） | 本機結算快取資料夾。完整結算狀態也會寫入試算表的 `_bot` 分頁 |
 
 ### 2. 安裝相依套件

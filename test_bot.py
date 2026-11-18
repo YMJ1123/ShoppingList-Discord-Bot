@@ -447,6 +447,7 @@ check("兩次都讀不到 → 最多讀兩次，回傳空的讓草稿提醒", (s
 
 print("\n讀圖：本地模型優先，太慢或失敗退回 Groq")
 LOCAL = object()  # 假的本地 client，只用來分辨是哪一邊被呼叫
+KEEP_ALIVE = []  # 每次呼叫帶了什麼 extra_body
 EMPTY = {"items": [], "total_twd": 46, "order_no": "3317017045092056761"}
 
 
@@ -457,6 +458,7 @@ def vision2(local=(), groq=(), slow=0.0):
     async def fake_llm_json(client, **kw):
         side = "local" if client is LOCAL else "groq"
         calls.append(side)
+        KEEP_ALIVE.append((side, kw.get("extra_body")))
         if side == "local":
             await asyncio.sleep(slow)
         r = queues[side].pop(0)
@@ -476,7 +478,11 @@ bot.local_vision_client, bot.local_vision_down_until, bot.LOCAL_VISION_TIMEOUT =
 shot, calls = vision2(local=[PENCIL])
 check("本地讀得好 → 截圖不會送到 Groq", ([it["price"] for it in shot["items"]], calls), ([9.8], ["local"]))
 
+check("本地模型讀完只在顯示卡留 2 分鐘，不跟著 Ollama 預設永遠常駐", KEEP_ALIVE, [("local", {"keep_alive": "2m"})])
+
+KEEP_ALIVE.clear()
 shot, calls = vision2(local=[ConnectionError("refused")], groq=[PENCIL])
+check("Groq 那邊不帶 Ollama 專用的參數", KEEP_ALIVE, [("local", {"keep_alive": "2m"}), ("groq", None)])
 check("本地連不上 → 退回 Groq，照樣讀到", ([it["price"] for it in shot["items"]], calls), ([9.8], ["local", "groq"]))
 shot, calls = vision2(groq=[PENCIL])
 check("本地剛失敗過 → 接下來幾分鐘直接用 Groq，不讓每張圖都等", calls, ["groq"])

@@ -214,6 +214,9 @@ LOCAL_VISION_MODEL = os.getenv("LOCAL_VISION_MODEL", "qwen3-vl:8b-instruct")
 # 正常一張約 4 秒，模型剛載入約 25 秒。顯示卡記憶體被別的程式擠滿時一張要好幾分鐘，那就不等了
 LOCAL_VISION_TIMEOUT = float(os.getenv("LOCAL_VISION_TIMEOUT", "45"))
 LOCAL_VISION_COOLDOWN = 300  # 本地連不上或逾時後，這段時間直接用 Groq，不讓每張圖都等到逾時
+# 讀完後模型在顯示卡上留多久。Ollama 主機預設可能是永遠不卸載（OLLAMA_KEEP_ALIVE=-1），
+# 和別的模型擠在同一張顯示卡時，桌面程式要用顯示記憶體就會被搬到主記憶體，整台機器卡死
+LOCAL_VISION_KEEP_ALIVE = os.getenv("LOCAL_VISION_KEEP_ALIVE", "2m")
 local_vision_client = (
     AsyncOpenAI(base_url=LOCAL_VISION_URL, api_key="local", max_retries=0) if LOCAL_VISION_URL else None
 )
@@ -765,7 +768,7 @@ def _seen(shot: dict) -> tuple:
     return len(shot["items"]), len(shot["items"]) + shot["dropped"]
 
 
-async def _read_with(client, model: str, url: str, timeout: float | None = None) -> dict:
+async def _read_with(client, model: str, url: str, timeout: float | None = None, **extra) -> dict:
     """用指定的模型讀一張截圖。回傳讀不完整或不是 JSON 時重讀一次，取比較完整的那次。"""
     best = None
     for _ in range(2):
@@ -773,6 +776,7 @@ async def _read_with(client, model: str, url: str, timeout: float | None = None)
             client,
             model=model,
             max_tokens=2048,
+            **extra,
             messages=[{"role": "user", "content": [
                 {"type": "text", "text": settle.EXTRACT_PROMPT},
                 {"type": "image_url", "image_url": {"url": url}},
@@ -799,7 +803,8 @@ async def read_screenshot(data: bytes, mime: str) -> dict:
     if local_vision_client is not None and time.monotonic() >= local_vision_down_until:
         started = time.monotonic()
         try:
-            local = await _read_with(local_vision_client, LOCAL_VISION_MODEL, url, LOCAL_VISION_TIMEOUT)
+            local = await _read_with(local_vision_client, LOCAL_VISION_MODEL, url, LOCAL_VISION_TIMEOUT,
+                                     extra_body={"keep_alive": LOCAL_VISION_KEEP_ALIVE})
         except Exception as e:
             local_vision_down_until = time.monotonic() + LOCAL_VISION_COOLDOWN
             print(f"[WARN] 本地讀圖失敗（{type(e).__name__}: {e}），接下來 {LOCAL_VISION_COOLDOWN} 秒改用 Groq")

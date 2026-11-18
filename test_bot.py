@@ -9,11 +9,9 @@ import json
 import re
 import sys
 import tempfile
-import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import aiohttp
 import httpx
@@ -145,74 +143,15 @@ check(
 check("加反應遇到等待逾時 → 不丟例外", run_safe_react(asyncio.TimeoutError()), None)
 check("移除反應遇到網路錯誤 → 不丟例外", run_safe_react(aiohttp.ClientConnectionError("x"), remove=True), None)
 
-print("\nn8n 逾時：慢不等於失敗")
+print("\n表格回應逾時：慢不等於失敗")
+check("逾時 → 告知請求已送出、可能已經寫入",
+      bot.sheet_failure_reply("新增", "寫進表格", requests.exceptions.ReadTimeout()),
+      "新增請求已送出，但 Google 表格太久沒回應 ⏱️\n這筆**可能已經寫進表格**，請先看一下清單，沒有再重送一次。")
+check("刪除逾時 → 講的是「可能已經刪掉」",
+      "可能已經從表格刪掉" in bot.sheet_failure_reply("刪除", "從表格刪掉", requests.exceptions.ReadTimeout()), True)
+check("其他錯誤 → 請他看 log，不說「可能已經」",
+      bot.sheet_failure_reply("新增", "寫進表格", requests.exceptions.ConnectionError()), "新增時我撞牆了 QQ 請幫我看一下 log")
 
-
-class SlowN8n(BaseHTTPRequestHandler):
-    delay = 0.0
-
-    def do_POST(self):
-        self.rfile.read(int(self.headers.get("content-length", 0)))
-        time.sleep(self.delay)
-        body = b'{"status":"added"}'
-        try:
-            self.send_response(200)
-            self.send_header("content-length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        except OSError:
-            pass
-
-    def log_message(self, *args):
-        pass
-
-
-def post_to_slow_n8n(delay: float):
-    SlowN8n.delay = delay
-    try:
-        return asyncio.run(bot.post_to_n8n({"action": "add"}))
-    except requests.exceptions.RequestException as e:
-        return e
-
-
-server = ThreadingHTTPServer(("127.0.0.1", 0), SlowN8n)
-server.daemon_threads = True
-threading.Thread(target=server.serve_forever, daemon=True).start()
-prod_url, prod_timeout = bot.N8N_WEBHOOK_URL, bot.N8N_READ_TIMEOUT
-bot.N8N_WEBHOOK_URL = f"http://127.0.0.1:{server.server_port}/"
-bot.N8N_READ_TIMEOUT = 1
-try:
-    slow_ok = post_to_slow_n8n(0.4)
-    check("慢但在時限內 → 照常拿到 200", getattr(slow_ok, "status_code", slow_ok), 200)
-
-    timed_out = post_to_slow_n8n(2.0)
-    check("超過時限 → ReadTimeout", type(timed_out).__name__, "ReadTimeout")
-    msg = bot.n8n_failure_reply("新增", "寫進表格", timed_out)
-    check("新增逾時 → 告知請求已送出、可能已寫入", "可能已經寫進表格" in msg, True)
-    check("逾時訊息帶的秒數 = 實際設定值", "超過 1 秒" in msg, True)
-finally:
-    bot.N8N_WEBHOOK_URL, bot.N8N_READ_TIMEOUT = prod_url, prod_timeout
-    server.shutdown()
-
-check("正式的讀取逾時比實測最慢的 10.8 秒寬鬆", bot.N8N_READ_TIMEOUT > 10.8, True)
-check(
-    "刪除逾時 → 講的是「可能已經刪掉」",
-    "可能已經從表格刪掉" in bot.n8n_failure_reply("刪除", "從表格刪掉", requests.exceptions.ReadTimeout()),
-    True,
-)
-check(
-    "連不上 n8n → 維持原本的訊息",
-    bot.n8n_failure_reply("新增", "寫進表格", requests.exceptions.ConnectionError()),
-    "新增時我撞牆了 QQ 請幫我看一下 log",
-)
-check(
-    "連線逾時（請求根本沒送出）→ 不能說「可能已經」",
-    "可能已經" in bot.n8n_failure_reply("新增", "寫進表格", requests.exceptions.ConnectTimeout()),
-    False,
-)
-
-# ============================================================
-# 結算流程：Discord、n8n、LLM 都用假的，只驗證 bot 這一層怎麼串
 print("\n結算：觸發關鍵字")
 
 check("「結算」開頭才觸發", [bool(bot.SETTLE_RE.match(t)) for t in ("結算", "结算 這批", "幫我結算", "買 結算")], [True, True, False, False])
@@ -226,7 +165,7 @@ check("離譜的範圍不展開", len(bot.claim_numbers("認領 1-100000")), 2)
 # ------------------------------------------------------------------
 # 結算流程：Discord、n8n、LLM 都用假的，只驗證 bot 這一層怎麼串
 bot.STATE_DIR = None  # 測試不可以寫到正式的結算紀錄（容器裡 STATE_DIR 有設）
-real_post, real_parse, real_read, real_llm_json = bot.post_to_n8n, bot.parse_with_llm, bot.read_screenshot, bot.llm_json
+real_post, real_parse, real_read, real_llm_json = bot.sheet_call, bot.parse_with_llm, bot.read_screenshot, bot.llm_json
 _ids = itertools.count(1000)
 SENT = []  # bot 送出的每則訊息
 CALLS = []  # bot 送給 n8n 的每個請求
@@ -254,6 +193,7 @@ class FakeMsg:
         self.attachments, self.mentions, self.reference, self.guild, self.kw = list(attachments), list(mentions), reference, None, kw or {}
         self.raw_mentions = [int(i) for i in re.findall(r"<@!?(\d+)>", text)]
         self.reactions, self.deleted = [], False
+        self.buttons = [getattr(c, "custom_id", "") for c in (self.kw.get("view").children if self.kw.get("view") else [])]
         if record:
             SENT.append(self)
 
@@ -304,6 +244,10 @@ def stub(settle_status=200, read_delay=0.0, sheet=None):
     bot.SETTLEMENTS.clear()
     bot.PENDING.clear()
     bot.DELETE_CHOICES.clear()
+    bot.ADD_PENDING.clear()
+    bot._ledger_synced.clear()
+    bot._ledger_uncertain.clear()
+    bot.LEDGER_SYNC = False  # 寫「結算紀錄」分頁另外測，免得每個測試的表格呼叫紀錄裡都多一筆
     for lock_name in ("SETTLEMENT_LOCKS", "CHANNEL_LOCKS", "DELETE_CHOICE_LOCKS"):
         getattr(bot, lock_name, {}).clear()
     bot.ALLOWED_CHANNEL_IDS = set()
@@ -335,7 +279,7 @@ def stub(settle_status=200, read_delay=0.0, sheet=None):
         return None
 
     bot.parse_with_llm = no_llm
-    bot.read_screenshot, bot.post_to_n8n, bot.match_rows, bot.market_rate = fake_read, fake_n8n, fake_match, fake_rate
+    bot.read_screenshot, bot.sheet_call, bot.match_rows, bot.market_rate = fake_read, fake_n8n, fake_match, fake_rate
     bot.bot.process_commands = noop
     bot.bot.get_channel = lambda cid: CHAN
 
@@ -381,8 +325,8 @@ stub()
 async def basic():
     await send(AMY, "結算", [SHOT])
     d = drafts()[-1]
-    check("草稿不 ping 任何人，有 ✅ ❌", (d.content.split("\n")[0], d.kw["allowed_mentions"].to_dict()["parse"], d.reactions),
-          ("🧾 **結算草稿**｜下單人 amy", [], ["✅", "❌"]))
+    check("草稿不 ping 任何人，有確認／取消按鈕", (d.content.split("\n")[0], d.kw["allowed_mentions"].to_dict()["parse"], d.buttons),
+          ("🧾 **結算草稿**｜下單人 amy", [], ["sl:draft:ok", "sl:draft:no"]))
     check("先向結算用的 webhook 要清單", CALLS[0], {"action": "list"})
     await react("✅", BOB, d)
     check("別人按 ✅ → 不算", (settle_calls(), len(bot.PENDING)), ([], 1))
@@ -391,7 +335,7 @@ async def basic():
     await react("✅", AMY, d)
     batch = settle_calls()[0]["batch"]
     check("下單人按 ✅ → 把對到的列寫回表格", settle_calls()[0],
-          {"action": "settle", "batch": batch, "rows": [{"tab": "淘寶", "row": 2, "name": "小米風扇落地扇", "buyer": "bob", "price": 100.0}]})
+          {"action": "settle", "batch": batch, "rows": [{"id": "", "tab": "淘寶", "row": 2, "name": "小米風扇落地扇", "buyer": "bob", "price": 100.0}]})
     f = published()[-1]
     check("正式結果 @ 下單人、有每人金額", (f.content.split("\n")[0], "**bob　TWD 495**" in f.content, "unclassified　TWD 495" in f.content),
           (f"🧾 **結算 {batch}**｜請轉帳給 <@100>", True, True))
@@ -503,6 +447,7 @@ check("兩次都讀不到 → 最多讀兩次，回傳空的讓草稿提醒", (s
 
 print("\n讀圖：本地模型優先，太慢或失敗退回 Groq")
 LOCAL = object()  # 假的本地 client，只用來分辨是哪一邊被呼叫
+KEEP_ALIVE = []  # 每次呼叫帶了什麼 extra_body
 EMPTY = {"items": [], "total_twd": 46, "order_no": "3317017045092056761"}
 
 
@@ -513,6 +458,7 @@ def vision2(local=(), groq=(), slow=0.0):
     async def fake_llm_json(client, **kw):
         side = "local" if client is LOCAL else "groq"
         calls.append(side)
+        KEEP_ALIVE.append((side, kw.get("extra_body")))
         if side == "local":
             await asyncio.sleep(slow)
         r = queues[side].pop(0)
@@ -532,7 +478,11 @@ bot.local_vision_client, bot.local_vision_down_until, bot.LOCAL_VISION_TIMEOUT =
 shot, calls = vision2(local=[PENCIL])
 check("本地讀得好 → 截圖不會送到 Groq", ([it["price"] for it in shot["items"]], calls), ([9.8], ["local"]))
 
+check("本地模型讀完只在顯示卡留 2 分鐘，不跟著 Ollama 預設永遠常駐", KEEP_ALIVE, [("local", {"keep_alive": "2m"})])
+
+KEEP_ALIVE.clear()
 shot, calls = vision2(local=[ConnectionError("refused")], groq=[PENCIL])
+check("Groq 那邊不帶 Ollama 專用的參數", KEEP_ALIVE, [("local", {"keep_alive": "2m"}), ("groq", None)])
 check("本地連不上 → 退回 Groq，照樣讀到", ([it["price"] for it in shot["items"]], calls), ([9.8], ["local", "groq"]))
 shot, calls = vision2(groq=[PENCIL])
 check("本地剛失敗過 → 接下來幾分鐘直接用 Groq，不讓每張圖都等", calls, ["groq"])
@@ -710,7 +660,7 @@ check("一次認領兩件 → 一則回覆列出全部", out.split("\n\n")[0], "
 check("金額一起更新（匯率 5：¥40 → 200，剩 ¥20 → 100）", bot.settle.totals(state)["twd"], {"carol": 200, "unclassified": 100})
 check("兩件都算在 carol", [bot.settle.find_item(state, n)[1]["shares"][0]["owner"] for n in (1, 2, 3)], ["carol", "unclassified", "carol"])
 reply = SENT[-1]
-check("回覆上有 🏁、記進這次結算", (reply.reactions, reply.id in state["message_ids"]), (["🏁"], True))
+check("回覆上有結束認領按鈕、記進這次結算", (f"sl:close:{state['batch']}" in reply.buttons, reply.id in state["message_ids"]), (True, True))
 out = run_claim(BOB, "認領 1-2")
 check("部分成功：成功的照領，失敗的說明原因", out.split("\n\n")[:2], ["#2 乙乙乙 算在 <@200> 名下 ✅", "沒有認領到：\n- #1 已經算在 carol 名下了"])
 check("部分成功後金額正確", bot.settle.totals(state)["twd"], {"carol": 200, "bob": 100})
@@ -774,7 +724,7 @@ stub()
 state = asyncio.run(settle_and_confirm(AMY, [SHOT]))
 batch, final = state["batch"], published()[-1]
 final_id = final.id
-check("有沒人認領的商品 → 正式結果上有 🏁", final.reactions, ["🏁"])
+check("有沒人認領的商品 → 正式結果上有認領、改歸屬、結束認領按鈕", final.buttons, [f"sl:claim:{batch}", f"sl:re:{batch}", f"sl:close:{batch}"])
 check("別人按 🏁 → 沒反應", (press("🏁", BOB, final_id), state.get("closed")), ([], None))
 check("下單人按別的表情 → 沒反應", (press("👍", AMY, final_id), state.get("closed")), ([], None))
 check("在不相干的訊息按 🏁 → 沒反應", (press("🏁", AMY, 424242), state.get("closed")), ([], None))
@@ -793,7 +743,7 @@ stub()
 state = asyncio.run(settle_and_confirm(AMY, [SHOT]))
 run_claim(CAROL, "認領 2")
 claim_reply = SENT[-1]
-check("認領的回覆上也有 🏁，而且記進這次結算", (claim_reply.reactions, claim_reply.id in state["message_ids"]), (["🏁"], True))
+check("認領的回覆上也有按鈕，而且記進這次結算", (f"sl:close:{state['batch']}" in claim_reply.buttons, claim_reply.id in state["message_ids"]), (True, True))
 out = press("🏁", AMY, claim_reply.id)
 check("全部認領完，在認領回覆上按 🏁 → 公布並 ping 每個要付錢的人", out[0].content,
       f"🏁 **結算 {state['batch']} 結束認領**｜請轉帳給 <@100>\n\n"
@@ -802,7 +752,7 @@ check("全部認領完，在認領回覆上按 🏁 → 公布並 ping 每個要
 
 stub()
 asyncio.run(settle_and_confirm(AMY, [order([("小米風扇", 1, 100.0)], 495)]))
-check("全部都對到人 → 不放 🏁", published()[-1].reactions, [])
+check("全部都對到人 → 沒有認領按鈕，但仍可改歸屬（AI 可能配錯）和結束", [b.split(":")[1] for b in published()[-1].buttons], ["re", "close"])
 
 stub()
 state = asyncio.run(settle_and_confirm(AMY, [SHOT], text="結算 <@300>", mentions=[CAROL], confirmer=CAROL))
@@ -854,7 +804,7 @@ async def append_unmatched():
     check("新訂單實付只加一次", bot.settle.totals(current)["total_twd"], 1140)
     check("沒對到表格的追加不呼叫寫入", len(settle_calls()), writes_before)
     check("追加保留原結算訊息、登記更新訊息", (original_id in current["message_ids"], SENT[-1].id in current["message_ids"]), (True, True))
-    check("追加公布可繼續結束認領", "🏁" in SENT[-1].reactions, True)
+    check("追加公布可繼續結束認領", any(b.startswith("sl:close:") for b in SENT[-1].buttons), True)
     writes_after = len(settle_calls())
     await react("✅", AMY, draft)
     check("同一張追加草稿重按不重複加入", (nos(bot.SETTLEMENTS[batch]), len(settle_calls())), ([1, 2, 3], writes_after))
@@ -920,7 +870,7 @@ stub()
 async def append_matched():
     state = await settle_and_confirm(AMY, [SHOT])
     batch = state["batch"]
-    original_post = bot.post_to_n8n
+    original_post = bot.sheet_call
     new_row = {"tab": "淘寶", "row": 3, "name": "藍牙耳機", "spec": "", "url": "", "qty": 1, "buyer": "carol"}
 
     async def changed_sheet(payload, url=None):
@@ -929,10 +879,10 @@ async def append_matched():
             return FakeResp(200, {"rows": [new_row]})
         return await original_post(payload, url)
 
-    bot.post_to_n8n = changed_sheet
+    bot.sheet_call = changed_sheet
     await send(AMY, "", [EARBUDS], reply_to=state["message_ids"][0])
     await react("✅", AMY, append_draft())
-    check("追加配對的新列用原 batch 寫回", settle_calls()[-1], {"action": "settle", "batch": batch, "rows": [{"tab": "淘寶", "row": 3, "name": "藍牙耳機", "buyer": "carol", "price": 30.0}]})
+    check("追加配對的新列用原 batch 寫回", settle_calls()[-1], {"action": "settle", "batch": batch, "rows": [{"id": "", "tab": "淘寶", "row": 3, "name": "藍牙耳機", "buyer": "carol", "price": 30.0}]})
     check("追加只回寫新列，舊列維持原價", len(settle_calls()), 2)
     check("新增配對人取得新增金額", bot.settle.totals(bot.SETTLEMENTS[batch])["twd"], {"bob": 495, "unclassified": 495, "carol": 150})
 
@@ -1047,7 +997,7 @@ for failure in (409, 500, "timeout"):
     async def append_write_failure(failure=failure):
         state = await settle_and_confirm(AMY, [EARBUDS])
         before = copy_state(state)
-        original_post = bot.post_to_n8n
+        original_post = bot.sheet_call
 
         async def failing_write(payload, url=None):
             if payload["action"] != "settle":
@@ -1057,7 +1007,7 @@ for failure in (409, 500, "timeout"):
                 raise requests.exceptions.ReadTimeout()
             return FakeResp(failure, {"problems": [{"tab": "淘寶", "row": 2, "reason": "這一列已經不存在"}]})
 
-        bot.post_to_n8n = failing_write
+        bot.sheet_call = failing_write
         await send(AMY, "", [SHOT], reply_to=state["message_ids"][0])
         await react("✅", AMY, append_draft())
         current = {key: value for key, value in bot.SETTLEMENTS[state["batch"]].items() if key != "append_attempt"}
@@ -1073,7 +1023,7 @@ stub()
 async def append_write_retry():
     state = await settle_and_confirm(AMY, [EARBUDS])
     batch = state["batch"]
-    original_post = bot.post_to_n8n
+    original_post = bot.sheet_call
     attempts = []
 
     async def uncertain_first_write(payload, url=None):
@@ -1084,7 +1034,7 @@ async def append_write_retry():
                 raise requests.exceptions.ReadTimeout()
         return await original_post(payload, url)
 
-    bot.post_to_n8n = uncertain_first_write
+    bot.sheet_call = uncertain_first_write
     bot.SETTLE_CONFIRM_SECONDS = 0.02
     await send(AMY, "", [SHOT], reply_to=state["message_ids"][0])
     draft = append_draft()
@@ -1114,7 +1064,7 @@ async def recover_approved_append():
         try:
             state = await settle_and_confirm(AMY, [EARBUDS])
             batch, original_id = state["batch"], state["message_ids"][0]
-            original_post = bot.post_to_n8n
+            original_post = bot.sheet_call
             attempts = []
 
             async def uncertain_first_write(payload, url=None):
@@ -1125,7 +1075,7 @@ async def recover_approved_append():
                         raise requests.exceptions.ReadTimeout()
                 return await original_post(payload, url)
 
-            bot.post_to_n8n = uncertain_first_write
+            bot.sheet_call = uncertain_first_write
             await send(AMY, "", [SHOT], reply_to=original_id)
             await react("✅", AMY, append_draft())
             saved = json.loads((Path(state_dir) / "settlements.json").read_text())
@@ -1153,7 +1103,7 @@ stub()
 
 async def restarting_append_reserves_numbers():
     state = await settle_and_confirm(AMY, [EARBUDS])
-    original_post = bot.post_to_n8n
+    original_post = bot.sheet_call
 
     async def uncertain_write(payload, url=None):
         if payload["action"] == "settle":
@@ -1161,7 +1111,7 @@ async def restarting_append_reserves_numbers():
             raise requests.exceptions.ReadTimeout()
         return await original_post(payload, url)
 
-    bot.post_to_n8n = uncertain_write
+    bot.sheet_call = uncertain_write
     await send(AMY, "", [SHOT], reply_to=state["message_ids"][0])
     await react("✅", AMY, append_draft())
     reserved = [item["no"] for unit in bot.SETTLEMENTS[state["batch"]]["append_attempt"]["added_units"] for item in unit["items"]]
@@ -1255,7 +1205,7 @@ stub()
 async def claim_while_append_writes():
     state = await settle_and_confirm(AMY, [EARBUDS])
     batch = state["batch"]
-    original_post = bot.post_to_n8n
+    original_post = bot.sheet_call
     writing, release = asyncio.Event(), asyncio.Event()
 
     async def delayed_write(payload, url=None):
@@ -1264,7 +1214,7 @@ async def claim_while_append_writes():
             await release.wait()
         return await original_post(payload, url)
 
-    bot.post_to_n8n = delayed_write
+    bot.sheet_call = delayed_write
     await send(AMY, "", [SHOT], reply_to=state["message_ids"][0])
     confirming = asyncio.create_task(react("✅", AMY, append_draft()))
     await writing.wait()
@@ -1285,7 +1235,7 @@ stub()
 async def close_while_append_writes():
     state = await settle_and_confirm(AMY, [EARBUDS])
     batch, original_id = state["batch"], state["message_ids"][0]
-    original_post = bot.post_to_n8n
+    original_post = bot.sheet_call
     writing, release = asyncio.Event(), asyncio.Event()
 
     async def delayed_write(payload, url=None):
@@ -1294,7 +1244,7 @@ async def close_while_append_writes():
             await release.wait()
         return await original_post(payload, url)
 
-    bot.post_to_n8n = delayed_write
+    bot.sheet_call = delayed_write
     await send(AMY, "", [SHOT], reply_to=original_id)
     confirming = asyncio.create_task(react("✅", AMY, append_draft()))
     await writing.wait()
@@ -1355,7 +1305,7 @@ with tempfile.TemporaryDirectory() as d:
     bot.load_settlements()
     check("結束狀態有存檔，重啟後不會被重開", (bot.SETTLEMENTS[batch]["closed"], press("🏁", AMY, final_id)), (True, []))
     bot.STATE_DIR = None
-bot.post_to_n8n, bot.parse_with_llm = real_post, real_parse
+bot.sheet_call, bot.parse_with_llm = real_post, real_parse
 bot.SETTLE_CONFIRM_SECONDS = 600
 
 print("\n刪除：多筆先選編號")
@@ -1364,8 +1314,8 @@ print("\n刪除：多筆先選編號")
 async def delete_choices():
     stub()
     fans = [
-        {"n": 1, "sheet": "TB", "row_number": 4, "itemName": "小米風扇", "spec": "白色", "qty": 1, "url": "https://e.tb.cn/a"},
-        {"n": 2, "sheet": "TB", "row_number": 9, "itemName": "USB風扇", "spec": "", "qty": 2, "url": "https://e.tb.cn/b"},
+        {"n": 1, "id": "fan-white", "sheet": "淘寶", "itemName": "小米風扇", "spec": "白色", "qty": 1, "url": "https://e.tb.cn/a"},
+        {"n": 2, "id": "fan-usb", "sheet": "淘寶", "itemName": "USB風扇", "spec": "", "qty": 2, "url": "https://e.tb.cn/b"},
     ]
     seen = []
     moved = []  # 非空時，模擬表格在等待選擇期間被改過
@@ -1375,22 +1325,21 @@ async def delete_choices():
 
     async def fake_n8n(payload, url=None):
         seen.append(dict(payload))
-        if payload.get("rowNumber") and moved:
+        if payload.get("rowId") and moved:
             return FakeResp(404, {"status": "changed", "found": False})
-        if payload.get("rowNumber"):
-            name = next(c["itemName"] for c in fans if c["row_number"] == payload["rowNumber"])
+        if payload.get("rowId"):
+            name = next(c["itemName"] for c in fans if c["id"] == payload["rowId"])
             return FakeResp(200, {"status": "deleted", "itemName": name})
         return FakeResp(404, {"status": "choose", "found": False, "choices": fans})
 
     bot.parse_with_llm = fake_parse
-    bot.post_to_n8n = fake_n8n
+    bot.sheet_call = fake_n8n
     await send(AMY, "刪除風扇")
     prompt = SENT[-1]
-    check("多筆先列出編號，而且還沒指定列", ("1." in prompt.content and "USB風扇" in prompt.content, seen[-1].get("rowNumber")), (True, None))
+    check("多筆先列出編號，而且還沒指定列", ("1." in prompt.content and "USB風扇" in prompt.content, seen[-1].get("rowId")), (True, None))
     await send(AMY, "刪除 2")
-    check("「刪除 2」帶第二列的列號", (seen[-1].get("rowNumber"), seen[-1].get("sheet")), (9, "TB"))
-    check("也帶上選項當時的內容，讓 n8n 核對是不是同一筆", seen[-1].get("expect"),
-          {"itemName": "USB風扇", "spec": "", "qty": 2, "url": "https://e.tb.cn/b"})
+    check("「刪除 2」使用第二筆固定 ID", seen[-1].get("rowId"), "fan-usb")
+    check("選擇不再依賴當時的列號", "rowNumber" in seen[-1], False)
     check("選完回報刪掉的名稱", "USB風扇" in SENT[-1].content, True)
     check("選完清掉選項", bot.DELETE_CHOICES, {})
 
@@ -1406,7 +1355,7 @@ async def delete_choices():
     await send(AMY, "1", reply_to=old_prompt.id)
     check("回覆舊選項的數字不算", len(seen), calls)
     await send(AMY, "2", reply_to=new_prompt.id)
-    check("回覆目前選項的 2 才刪", seen[-1].get("rowNumber"), 9)
+    check("回覆目前選項的 2 才刪", seen[-1].get("rowId"), "fan-usb")
 
     await send(AMY, "刪除風扇")
     bot.DELETE_CHOICES[(CHAN.id, AMY.id)]["expires"] = time.monotonic() - 1
@@ -1418,19 +1367,1028 @@ async def delete_choices():
     await send(AMY, "刪除風扇")
     moved.append(True)
     await send(AMY, "刪除 2")
-    check("等待選擇時表格被改過（n8n 回 changed）→ 說明沒有刪、請他重說", SENT[-1].content,
-          "清單在你選的這段時間有變動，我不確定你選的是哪一筆，所以**沒有刪任何東西**。\n請重新說一次要刪什麼。")
+    check("選擇的固定 ID 已不存在 → 說明沒有刪、請他重說", SENT[-1].content,
+          "你選的那一筆已經不在清單裡了（可能剛被刪掉），所以**沒有刪任何東西**。\n還要刪的話請重新說一次。")
     check("選項作廢，不能拿舊編號再試", bot.DELETE_CHOICES, {})
     moved.clear()
 
     await send(AMY, "刪除風扇")
     first_id = bot.DELETE_CHOICES[(CHAN.id, AMY.id)]["id"]
     await send(AMY, "刪除風扇")
-    check("新的一輪序號只會變大", bot.DELETE_CHOICES[(CHAN.id, AMY.id)]["id"] > first_id, True)
+    check("新的一輪識別碼不會重用", bot.DELETE_CHOICES[(CHAN.id, AMY.id)]["id"] != first_id, True)
 
 
 asyncio.run(delete_choices())
-bot.post_to_n8n, bot.parse_with_llm = real_post, real_parse
+bot.sheet_call, bot.parse_with_llm = real_post, real_parse
+
+print("\n按鈕與選單：真實 dispatcher 路徑")
+
+
+class FakeInteractionResponse:
+    def __init__(self):
+        self.done, self.events = False, []
+
+    def is_done(self):
+        return self.done
+
+    async def _ack(self, kind, text=None, **kwargs):
+        if self.done:
+            raise RuntimeError("同一個 Discord interaction 被回覆兩次")
+        self.done = True
+        self.events.append({"kind": kind, "content": text, **kwargs})
+
+    async def send_message(self, text, **kwargs):
+        await self._ack("send", text, **kwargs)
+
+    async def edit_message(self, content=None, **kwargs):
+        await self._ack("edit", content, **kwargs)
+
+    async def defer(self, **kwargs):
+        await self._ack("defer", **kwargs)
+
+
+class FakeInteraction:
+    def __init__(self, user, message, channel=None):
+        self.user, self.message = user, message
+        self.channel = channel or message.channel
+        self.guild = self.channel.guild
+        self.response = FakeInteractionResponse()
+        self.edits, self.followups = [], []
+        self.followup = SimpleNamespace(send=self.followup_send)
+
+    async def edit_original_response(self, **kwargs):
+        self.edits.append(kwargs)
+
+    async def followup_send(self, content=None, **kwargs):
+        self.followups.append({"content": content, **kwargs})
+
+
+async def component(user, message, custom_id, values=()):
+    interaction = FakeInteraction(user, message)
+    await bot.on_component(interaction, custom_id, list(values))
+    return interaction
+
+
+def ui_events(interaction):
+    return interaction.response.events + interaction.edits + interaction.followups
+
+
+async def component_settlement_after_reload():
+    stub()
+    await send(AMY, "結算", [SHOT])
+    draft = drafts()[-1]
+    denied = await component(BOB, draft, "sl:draft:ok")
+    check("別人按確認按鈕只收到私人權限說明", (len(bot.PENDING), denied.response.events[0]["ephemeral"]), (1, True))
+    accepted = await component(AMY, draft, "sl:draft:ok")
+    state = next(iter(bot.SETTLEMENTS.values()))
+    batch, published_message = state["batch"], published()[-1]
+    check("確認按鈕會先 acknowledgement 再寫表", (accepted.response.events[0]["kind"], len(settle_calls())), ("defer", 1))
+    stale = await component(AMY, draft, "sl:draft:ok")
+    check("重按已確認草稿不會重寫表格", (len(settle_calls()), "已經確認" in stale.response.events[0]["content"]), (1, True))
+
+    saved = copy_state(bot.SETTLEMENTS)
+    bot.PENDING.clear()
+    bot.SETTLEMENTS.clear()
+    bot.SETTLEMENTS.update(saved)
+    state = bot.SETTLEMENTS[batch]
+    original = published_message.kw["view"].children[0]
+    rebuilt = await bot.SLButton.from_custom_id(None, original.item, None)
+    chooser = FakeInteraction(CAROL, published_message)
+    await rebuilt.callback(chooser)
+    event = chooser.response.events[0]
+    menu = event["view"].children[0]
+    check("重啟後舊結算按鈕仍可重建認領選單", (event["ephemeral"], menu.custom_id, [o.value for o in menu.item.options]),
+          (True, f"sls:claim:{batch}", ["2"]))
+    rebuilt_menu = await bot.SLSelect.from_custom_id(None, menu.item, None)
+    check("認領選單重建保留可選商品與上限", ([o.value for o in rebuilt_menu.item.options], rebuilt_menu.item.max_values), (["2"], 1))
+    claimed = await component(CAROL, published_message, f"sls:claim:{batch}", ["2"])
+    check("認領選單實際更新歸屬與每人金額", bot.settle.totals(state)["twd"], {"bob": 495, "carol": 495})
+    check("認領選單完成後公布可繼續操作的訊息", ("認領好了" in "".join(e.get("content") or "" for e in ui_events(claimed)),
+                                               SENT[-1].id in state["message_ids"]), (True, True))
+    denied = await component(BOB, published_message, f"sl:close:{batch}")
+    check("第三人不能按結束認領", (state.get("closed", False), denied.response.events[0]["ephemeral"]), (False, True))
+    closed = await component(AMY, published_message, f"sl:close:{batch}")
+    check("重啟後原下單人仍可從舊按鈕結束認領", (state["closed"], closed.response.events[0]["kind"]), (True, "defer"))
+    again = await component(CAROL, published_message, f"sl:claim:{batch}")
+    check("已結束結算的舊認領按鈕會告知結束", "已經結束認領" in again.response.events[0]["content"], True)
+
+
+asyncio.run(component_settlement_after_reload())
+
+
+async def component_claim_long_names_splits_notifications():
+    stub(sheet=[])
+    shot = order([("長" * 78 + f"{i:02d}", 1, 1.0) for i in range(25)], 2500)
+    await send(AMY, "結算", [shot])
+    draft = bot.PENDING[(CHAN.id, AMY.id)]["drafts"][-1]
+    await component(AMY, draft, "sl:draft:ok")
+    state = next(iter(bot.SETTLEMENTS.values()))
+    message = await CHAN.fetch_message(state["message_ids"][-1])
+    original_send = CHAN.send
+
+    async def limited_send(text, **kwargs):
+        if len(text) > 2000:
+            raise ValueError("Discord message exceeds 2000 characters")
+        return await original_send(text, **kwargs)
+
+    CHAN.send = limited_send
+    sent_before = len(SENT)
+    try:
+        await component(CAROL, message, f"sls:claim:{state['batch']}", [str(i) for i in range(1, 26)])
+        notifications = SENT[sent_before:]
+        check("按鈕一次認領 25 件長名稱商品時通知自動分段",
+              (len(notifications) > 1, all(len(m.content) <= 2000 for m in notifications)), (True, True))
+        check("長認領通知每一段都可回覆且管理按鈕放在末段",
+              (all(m.id in state["message_ids"] for m in notifications),
+               ["view" in m.kw for m in notifications]),
+              (True, [False] * (len(notifications) - 1) + [True]))
+        check("長認領通知保留正確認領金額並只允許認領者通知",
+              (bot.settle.totals(state)["twd"], [m.kw["allowed_mentions"].users for m in notifications]),
+              ({"carol": 2500}, [[CAROL]] * len(notifications)))
+    finally:
+        CHAN.send = original_send
+
+
+asyncio.run(component_claim_long_names_splits_notifications())
+
+
+async def component_reassign():
+    stub()
+    state = await settle_and_confirm(AMY, [SHOT])
+    batch, message = state["batch"], published()[-1]
+    bot.settle.find_item(state, 1)[1]["row_ids"] = ["stable-fan-id"]
+    denied = await component(CAROL, message, f"sl:re:{batch}")
+    check("改歸屬按鈕限制原下單人或代傳人", denied.response.events[0]["ephemeral"], True)
+    asked = await component(AMY, message, f"sl:re:{batch}")
+    menu = asked.response.events[0]["view"].children[0]
+    check("改歸屬先讓下單人選商品", [o.value for o in menu.item.options], ["1", "2"])
+    picked = await component(AMY, message, f"sls:re:{batch}", ["1"])
+    user_menu = picked.response.events[0]["view"].children[0]
+    check("選完商品接著選新歸屬人", user_menu.custom_id, f"slu:re:{batch}:1")
+    rebuilt = await bot.SLUserSelect.from_custom_id(None, user_menu.item, None)
+    check("選人元件識別碼可從舊訊息還原", rebuilt.item.custom_id, f"slu:re:{batch}:1")
+    await component(AMY, message, f"slu:re:{batch}:1", [CAROL])
+    check("選人後更改歸屬並以帳本交易釋放舊配對列", (bot.settle.find_item(state, 1)[1]["shares"],
+                                               {key: CALLS[-1][key] for key in ("action", "batch", "released_ids")}),
+          ([{"owner": "carol", "cny": 100.0}], {"action": "ledger", "batch": batch, "released_ids": ["stable-fan-id"]}))
+    check("改歸屬結果訊息可繼續追加與管理", SENT[-1].id in state["message_ids"], True)
+    before = copy_state(state)
+    refused = await component(AMY, message, f"slu:re:{batch}:1", [BOT_USER])
+    check("選人元件拒絕將商品改給 bot", (state == before, "不能改給機器人" in refused.response.events[0]["content"]), (True, True))
+
+
+asyncio.run(component_reassign())
+
+
+async def component_duplicate_add():
+    stub()
+    requests_seen = []
+
+    async def duplicate_store(payload):
+        requests_seen.append(copy_state(payload))
+        if payload.get("force"):
+            return FakeResp(200, {"status": "added"})
+        return FakeResp(409, {"status": "duplicate", "rows": [
+            {"itemName": "小米風扇", "spec": "白色", "qty": 1, "id": "existing-fan"}]})
+
+    bot.sheet_call = duplicate_store
+    request = {"action": "add", "senderName": AMY.name, "senderId": str(AMY.id), "itemName": "小米風扇",
+               "modelSpec": "白色", "quantity": 1, "url": "https://e.tb.cn/fan", "shareText": "買風扇"}
+    await bot.send_add(FakeMsg(AMY, CHAN), request)
+    prompt = SENT[-1]
+    token = next(iter(bot.ADD_PENDING))
+    check("重複登記會先提供再加一筆與取消按鈕", prompt.buttons, [f"sl:dup:{token}:y", f"sl:dup:{token}:n"])
+    denied = await component(BOB, prompt, f"sl:dup:{token}:y")
+    check("其他人不能替登記者確認重複新增", (len(requests_seen), denied.response.events[0]["ephemeral"]), (1, True))
+    await component(AMY, prompt, f"sl:dup:{token}:y")
+    check("原登記者按再加一筆才送 force 新增", (len(requests_seen), requests_seen[-1]["force"], bot.ADD_PENDING), (2, True, {}))
+    await component(AMY, prompt, f"sl:dup:{token}:y")
+    check("再按舊重複新增按鈕不會再寫一次", len(requests_seen), 2)
+    await bot.send_add(FakeMsg(AMY, CHAN), request)
+    token = next(iter(bot.ADD_PENDING))
+    await component(AMY, SENT[-1], f"sl:dup:{token}:n")
+    check("不用了會清除待確認新增", (bot.ADD_PENDING, len(requests_seen)), ({}, 3))
+    await bot.send_add(FakeMsg(AMY, CHAN), request)
+    token = next(iter(bot.ADD_PENDING))
+    bot.ADD_PENDING[token]["expires"] = time.monotonic() - 1
+    expired = await component(AMY, SENT[-1], f"sl:dup:{token}:y")
+    check("過期重複新增按鈕不寫表格", (len(requests_seen), "過期" in expired.response.events[0]["content"]), (4, True))
+
+
+asyncio.run(component_duplicate_add())
+
+
+async def component_delete_buttons():
+    stub()
+    choices = [{"n": 1, "id": "fan-white", "itemName": "小米風扇", "spec": "白色", "qty": 1},
+               {"n": 2, "id": "fan-black", "itemName": "小米風扇", "spec": "黑色", "qty": 1}]
+    await bot.offer_delete_choices(FakeMsg(AMY, CHAN), choices)
+    prompt = SENT[-1]
+    token = bot.DELETE_CHOICES[(CHAN.id, AMY.id)]["id"]
+    calls = []
+
+    async def delete_store(payload):
+        calls.append(payload)
+        return FakeResp(200, {"status": "deleted", "itemName": "小米風扇"})
+
+    bot.sheet_call = delete_store
+    denied = await component(BOB, prompt, f"sl:del:{token}:2")
+    check("他人不能選刪除按鈕", (calls, denied.response.events[0]["ephemeral"]), ([], True))
+    await component(AMY, prompt, f"sl:del:{token}:2")
+    check("刪除按鈕送出所選固定 ID", (calls[0]["rowId"], bot.DELETE_CHOICES), ("fan-black", {}))
+    await component(AMY, prompt, f"sl:del:{token}:2")
+    check("重按已完成刪除按鈕不重刪", len(calls), 1)
+    await bot.offer_delete_choices(FakeMsg(AMY, CHAN), choices)
+    token = bot.DELETE_CHOICES[(CHAN.id, AMY.id)]["id"]
+    await component(AMY, SENT[-1], f"sl:del:{token}:0")
+    check("都不要刪會清除待選且不寫表格", (bot.DELETE_CHOICES, len(calls)), ({}, 1))
+
+
+asyncio.run(component_delete_buttons())
+
+
+async def old_delete_button_after_restart():
+    stub()
+    choices = [{"n": 1, "id": "old-fan", "itemName": "舊風扇", "spec": "", "qty": 1}]
+    await bot.offer_delete_choices(FakeMsg(AMY, CHAN), choices)
+    old_prompt = SENT[-1]
+    old_button = old_prompt.buttons[0]
+    bot.DELETE_CHOICES.clear()  # 重啟後待選狀態消失
+    replacement = [{"n": 1, "id": "new-toothbrush", "itemName": "新牙刷", "spec": "", "qty": 1}]
+    await bot.offer_delete_choices(FakeMsg(AMY, CHAN), replacement)
+    writes = []
+
+    async def delete_store(payload):
+        writes.append(payload)
+        return FakeResp(200, {"status": "deleted", "itemName": "新牙刷"})
+
+    bot.sheet_call = delete_store
+    await component(AMY, old_prompt, old_button)
+    check("重啟後舊刪除按鈕不能核准新的一筆刪除", writes, [])
+    check("舊按鈕不會收掉新的待選刪除", bot.DELETE_CHOICES[(CHAN.id, AMY.id)]["choices"][0]["id"], "new-toothbrush")
+
+
+asyncio.run(old_delete_button_after_restart())
+
+
+async def delete_choice_replaced_during_acknowledgement():
+    stub()
+    await bot.offer_delete_choices(FakeMsg(AMY, CHAN), [
+        {"n": 1, "id": "old-fan", "itemName": "舊風扇", "spec": "", "qty": 1}])
+    old_prompt, old_button = SENT[-1], SENT[-1].buttons[0]
+    interaction = FakeInteraction(AMY, old_prompt)
+    acknowledge = interaction.response.defer
+
+    async def replace_while_acknowledging(**kwargs):
+        await acknowledge(**kwargs)
+        await bot.offer_delete_choices(FakeMsg(AMY, CHAN), [
+            {"n": 1, "id": "new-toothbrush", "itemName": "新牙刷", "spec": "", "qty": 1}])
+
+    interaction.response.defer = replace_while_acknowledging
+    writes = []
+
+    async def delete_store(payload):
+        writes.append(payload)
+        return FakeResp(200, {"status": "deleted", "itemName": "新牙刷"})
+
+    bot.sheet_call = delete_store
+    await bot.on_component(interaction, old_button, [])
+    check("刪除按鈕 acknowledgement 期間換了一輪選項不會刪新資料", writes, [])
+    check("舊刪除操作保留 acknowledgement 期間建立的新選項", bot.DELETE_CHOICES[(CHAN.id, AMY.id)]["choices"][0]["id"], "new-toothbrush")
+
+
+asyncio.run(delete_choice_replaced_during_acknowledgement())
+
+
+async def old_duplicate_button_after_restart():
+    stub()
+    writes = []
+
+    async def duplicate_store(payload):
+        writes.append(copy_state(payload))
+        if payload.get("force"):
+            return FakeResp(200, {"status": "added"})
+        return FakeResp(409, {"status": "duplicate", "rows": [
+            {"itemName": payload["itemName"], "spec": "", "qty": 1, "id": "existing-item"}]})
+
+    bot.sheet_call = duplicate_store
+    request = {"action": "add", "senderName": AMY.name, "senderId": str(AMY.id), "itemName": "舊風扇",
+               "modelSpec": "", "quantity": 1, "url": "https://e.tb.cn/fan", "shareText": "買風扇"}
+    await bot.send_add(FakeMsg(AMY, CHAN), request)
+    old_prompt, old_button = SENT[-1], SENT[-1].buttons[0]
+    bot.ADD_PENDING.clear()
+    await bot.send_add(FakeMsg(AMY, CHAN), {**request, "itemName": "新牙刷", "url": "https://e.tb.cn/brush"})
+    await component(AMY, old_prompt, old_button)
+    check("重啟後舊重複登記按鈕不能核准另一件商品", [p for p in writes if p.get("force")], [])
+    check("舊新增按鈕保留目前待確認商品", next(iter(bot.ADD_PENDING.values()))["payload"]["itemName"], "新牙刷")
+
+
+asyncio.run(old_duplicate_button_after_restart())
+
+
+async def mutation_acknowledged_before_waiting(kind):
+    stub()
+    state = await settle_and_confirm(AMY, [SHOT])
+    batch, message = state["batch"], published()[-1]
+    entered, released = asyncio.Event(), asyncio.Event()
+    interaction = FakeInteraction(AMY if kind == "reassign" else CAROL, message)
+    function_name = "apply_reassign" if kind == "reassign" else "apply_claims"
+    original = getattr(bot, function_name)
+
+    async def delayed(*args, **kwargs):
+        entered.set()
+        await released.wait()
+        return await original(*args, **kwargs)
+
+    setattr(bot, function_name, delayed)
+    try:
+        custom_id = f"slu:re:{batch}:1" if kind == "reassign" else f"sls:claim:{batch}"
+        values = [CAROL] if kind == "reassign" else ["2"]
+        operation = asyncio.create_task(bot.on_component(interaction, custom_id, values))
+        await entered.wait()
+        acknowledged = interaction.response.is_done()
+        released.set()
+        await operation
+        check(f"{kind} 選單在等待表格或批次鎖前已回覆 Discord", acknowledged, True)
+    finally:
+        setattr(bot, function_name, original)
+
+
+asyncio.run(mutation_acknowledged_before_waiting("reassign"))
+asyncio.run(mutation_acknowledged_before_waiting("claim"))
+
+print("\n雲端結算正本：先成功存檔才提交操作")
+
+
+async def stop_test_ledger_sync():
+    task = bot._ledger_task
+    if task is not None and not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    bot._ledger_task = None
+    bot._sheet_ready = False
+    bot.LEDGER_SYNC = False
+
+
+async def cloud_claim_failure_and_retry():
+    stub()
+    state = await settle_and_confirm(AMY, [SHOT])
+    batch, before = state["batch"], copy_state(state)
+    bot.LEDGER_SYNC, bot._sheet_ready = True, False
+    bot._ledger_synced.clear()
+    attempts = []
+    fail = True
+
+    async def cloud(payload):
+        attempts.append(copy_state(payload))
+        if payload["action"] == "states":
+            return FakeResp(200, {"states": {batch: before}})
+        return FakeResp(500 if fail else 200, {"status": "error" if fail else "ok"})
+
+    bot.sheet_call = cloud
+    try:
+        claimed, errors = await bot.apply_claims([state], state, [2], CAROL)
+        check("認領的雲端交易失敗時歸屬保持原狀", (claimed, state), ({}, before))
+        check("認領失敗會告知重試且不標為已同步", (len(errors), batch in bot._ledger_synced), (1, False))
+        check("認領寫入的雲端候選狀態包含新歸屬", bot.settle.find_item(attempts[0]["state"], 2)[1]["shares"],
+              [{"owner": "carol", "cny": 100.0}])
+        check("認領雲端請求的公開明細同步歸屬與台幣金額",
+              [(row[6], row[7], row[9]) for row in attempts[0]["block"] if row[1] == 2],
+              [("carol", 495, "認領中")])
+        fail = False
+        claimed, errors = await bot.apply_claims([state], state, [2], CAROL)
+        check("雲端恢復後同一次認領可重試成功", (claimed, errors, state["_version"]), ({batch: [2]}, [], 1))
+        check("成功後記憶體狀態等於已寫入的雲端狀態", state, attempts[-1]["state"])
+    finally:
+        await stop_test_ledger_sync()
+
+
+asyncio.run(cloud_claim_failure_and_retry())
+
+
+async def cloud_reassign_failure_retains_row_ids():
+    stub()
+    state = await settle_and_confirm(AMY, [SHOT])
+    item = bot.settle.find_item(state, 1)[1]
+    item["row_ids"] = ["stable-fan-id"]
+    before = copy_state(state)
+    bot.LEDGER_SYNC, bot._sheet_ready = True, False
+    attempts = []
+
+    async def failing_cloud(payload):
+        attempts.append(copy_state(payload))
+        raise requests.exceptions.ReadTimeout()
+
+    bot.sheet_call = failing_cloud
+    try:
+        done, explanation = await bot.apply_reassign(state, [1], CAROL)
+        check("改歸屬的雲端交易失敗保留原歸屬與固定列 ID", (done, state), (False, before))
+        check("改歸屬把清理列和新狀態放在同一個雲端請求", (attempts[0]["action"], attempts[0]["released_ids"],
+                                                            bot.settle.find_item(attempts[0]["state"], 1)[1]["row_ids"]),
+              ("ledger", ["stable-fan-id"], []))
+        check("失敗的改歸屬可明確重試", "重試" in explanation, True)
+    finally:
+        await stop_test_ledger_sync()
+
+
+asyncio.run(cloud_reassign_failure_retains_row_ids())
+
+
+async def cloud_close_failure_keeps_settlement_open():
+    stub()
+    state = await settle_and_confirm(AMY, [SHOT])
+    before, sent = copy_state(state), len(SENT)
+    bot.LEDGER_SYNC, bot._sheet_ready = True, False
+    attempts = []
+    fail = True
+
+    async def failing_cloud(payload):
+        attempts.append(copy_state(payload))
+        if payload["action"] == "states":
+            return FakeResp(200, {"states": {state["batch"]: before}})
+        return FakeResp(503 if fail else 200, {"status": "error" if fail else "ok"})
+
+    bot.sheet_call = failing_cloud
+    try:
+        reason = await bot.close_settlement(state, CHAN, state["message_ids"][0])
+        check("結束認領存檔失敗時保留開放狀態及原有歸屬", state, before)
+        check("結束認領存檔失敗會回覆原因且不公布最終款項", (bool(reason), len(SENT)), (True, sent))
+        check("結束認領的雲端候選紀錄包含封單狀態與下單人承接商品",
+              (attempts[0]["state"]["closed"], attempts[0]["state"]["leftover"],
+               bot.settle.find_item(attempts[0]["state"], 2)[1]["shares"]),
+              (True, [2], [{"owner": "amy", "cny": 100.0}]))
+        check("結束認領的公開帳本每列均標為已結束", {row[9] for row in attempts[0]["block"]}, {"已結束"})
+        fail = False
+        reason = await bot.close_settlement(state, CHAN, state["message_ids"][0])
+        check("結束認領重試成功後才公布且記憶體等於雲端正本",
+              (reason, len(SENT) > sent, state), ("", True, attempts[-1]["state"]))
+    finally:
+        await stop_test_ledger_sync()
+
+
+asyncio.run(cloud_close_failure_keeps_settlement_open())
+
+
+async def cloud_accepts_mutation_despite_lost_response(operation):
+    stub()
+    state = await settle_and_confirm(AMY, [SHOT])
+    state["_version"] = 7
+    bot.settle.find_item(state, 1)[1]["row_ids"] = ["stable-fan-id"]
+    bot.LEDGER_SYNC, bot._sheet_ready = True, False
+    cloud_states, requests_seen = {}, []
+
+    async def cloud(payload):
+        requests_seen.append(copy_state(payload))
+        if payload["action"] == "states":
+            return FakeResp(200, {"states": copy_state(cloud_states)})
+        cloud_states[payload["batch"]] = copy_state(payload["state"])
+        raise requests.exceptions.ReadTimeout("accepted cloud mutation response lost")
+
+    bot.sheet_call = cloud
+    try:
+        if operation == "claim":
+            done, errors = await bot.apply_claims([state], state, [2], CAROL)
+            success = done == {state["batch"]: [2]} and not errors
+        elif operation == "reassign":
+            success, reason = await bot.apply_reassign(state, [1], CAROL)
+        else:
+            success = not await bot.close_settlement(state, CHAN, state["message_ids"][0])
+        check(f"{operation} 寫入逾時後讀回相同雲端狀態可確認成功",
+              (success, [p["action"] for p in requests_seen], state["_version"], state),
+              (True, ["ledger", "states"], 8, cloud_states[state["batch"]]))
+        if operation == "reassign":
+            check("改歸屬逾時讀回確認的交易包含原列釋放", requests_seen[0]["released_ids"], ["stable-fan-id"])
+    finally:
+        await stop_test_ledger_sync()
+
+
+for operation in ("claim", "reassign", "close"):
+    asyncio.run(cloud_accepts_mutation_despite_lost_response(operation))
+
+
+async def cloud_readback_requires_matching_contents():
+    stub()
+    state = await settle_and_confirm(AMY, [SHOT])
+    before = copy_state(state)
+    bot.LEDGER_SYNC, bot._sheet_ready = True, False
+    written = {}
+
+    async def cloud(payload):
+        if payload["action"] == "ledger":
+            written.update(copy_state(payload["state"]))
+            raise requests.exceptions.ReadTimeout("cloud result uncertain")
+        stale = copy_state(written)
+        bot.settle.find_item(stale, 2)[1]["shares"] = copy_state(bot.settle.find_item(before, 2)[1]["shares"])
+        return FakeResp(200, {"states": {state["batch"]: stale}})
+
+    bot.sheet_call = cloud
+    try:
+        done, errors = await bot.apply_claims([state], state, [2], CAROL)
+        check("雲端讀回版本相同但歸屬不同時不可誤當成功", (done, bool(errors), state), ({}, True, before))
+    finally:
+        await stop_test_ledger_sync()
+
+
+asyncio.run(cloud_readback_requires_matching_contents())
+
+
+async def uncertain_claim_blocks_stale_overwrite(accepted):
+    stub(sheet=[])
+    shot = order([("待認領商品 A", 1, 100.0), ("待認領商品 B", 1, 100.0)], 990)
+    state = await settle_and_confirm(AMY, [shot])
+    batch, before = state["batch"], copy_state(state)
+    bot.LEDGER_SYNC, bot._sheet_ready = True, False
+    cloud_states, ledger_requests = {batch: copy_state(before)}, []
+    readback_available = False
+
+    async def cloud(payload):
+        if payload["action"] == "states":
+            if not readback_available:
+                raise requests.exceptions.ConnectionError("canonical state unavailable")
+            return FakeResp(200, {"states": copy_state(cloud_states)})
+        ledger_requests.append(copy_state(payload))
+        if len(ledger_requests) == 1:
+            if accepted:
+                cloud_states[batch] = copy_state(payload["state"])
+            raise requests.exceptions.ReadTimeout("first claim response lost")
+        cloud_states[batch] = copy_state(payload["state"])
+        return FakeResp(200, {"status": "ok"})
+
+    bot.sheet_call = cloud
+    try:
+        done, errors = await bot.apply_claims([state], state, [1], CAROL)
+        check(f"初次認領 accepted={accepted} 且結果無法讀回時保留不確定紀錄",
+              (done, bool(errors), state, batch in bot._ledger_uncertain), ({}, True, before, True))
+        done, errors = await bot.apply_claims([state], state, [2], BOB)
+        check(f"前次認領 accepted={accepted} 尚無法確認時擋住另一筆舊快照覆寫",
+              (done, bool(errors), len(ledger_requests), state), ({}, True, 1, before))
+        readback_available = True
+        done, errors = await bot.apply_claims([state], state, [2], BOB)
+        if accepted:
+            check("讀回已接受認領後原地還原正本且拒絕這次舊快照",
+                  (done, bool(errors), state is bot.SETTLEMENTS[batch], state,
+                   len(ledger_requests), batch in bot._ledger_uncertain),
+                  ({}, True, True, cloud_states[batch], 1, False))
+            done, errors = await bot.apply_claims([state], state, [2], BOB)
+        expected = [{"owner": "carol" if accepted else "unclassified", "cny": 100.0}]
+        check(f"canonical 確認 accepted={accepted} 後新認領保留前一件正確歸屬",
+              (done, errors, bot.settle.find_item(state, 1)[1]["shares"],
+               bot.settle.find_item(state, 2)[1]["shares"], state, len(ledger_requests),
+               batch in bot._ledger_uncertain),
+              ({batch: [2]}, [], expected, [{"owner": "bob", "cny": 100.0}], cloud_states[batch], 2, False))
+    finally:
+        await stop_test_ledger_sync()
+
+
+for accepted in (True, False):
+    asyncio.run(uncertain_claim_blocks_stale_overwrite(accepted))
+
+
+async def prepare_sheet_uploads_existing_settlements():
+    stub()
+    state = await settle_and_confirm(AMY, [SHOT])
+    batch = state["batch"]
+    bot.settle.find_item(state, 1)[1].pop("row_ids", None)  # v1 已公布紀錄尚未存過固定 ID
+    bot.LEDGER_SYNC, bot._sheet_ready = True, False
+    bot._ledger_synced.clear()
+    writes = []
+
+    async def initial_cloud(payload):
+        action = payload["action"]
+        if action == "layout":
+            return FakeResp(200, {"done": []})
+        if action == "states":
+            return FakeResp(200, {"states": {}})
+        if action == "all_rows":
+            return FakeResp(200, {"rows": [{**SHEET[0], "id": "stable-fan-id", "batch": batch, "price": 100.0}]})
+        if action == "ledger":
+            writes.append(copy_state(payload))
+            return FakeResp(200, {"status": "ok"})
+        raise AssertionError(f"Unexpected cloud request {action}")
+
+    bot.sheet_call = initial_cloud
+    try:
+        await bot.prepare_sheet()
+        check("首次部署會把既有本機結算寫入雲端正本", [p["batch"] for p in writes], [batch])
+        check("首次同步保留原商品與原認領資料", nos(writes[0]["state"]), [1, 2])
+        check("舊版配對列可唯一對應時補固定 ID", bot.settle.find_item(state, 1)[1]["row_ids"], ["stable-fan-id"])
+        check("啟動同步完成的狀態標記與記憶體一致", bot._ledger_synced[batch], bot._snapshot(state))
+    finally:
+        await stop_test_ledger_sync()
+
+
+asyncio.run(prepare_sheet_uploads_existing_settlements())
+
+
+async def prepare_sheet_prefers_newer_cloud_state():
+    stub()
+    state = await settle_and_confirm(AMY, [SHOT])
+    batch = state["batch"]
+    state["_version"] = 2
+    remote = copy_state(state)
+    remote["_version"] = 4
+    bot.settle.claim(remote, 2, CAROL.name)
+    remote["mentions"][CAROL.name] = CAROL.mention
+    bot.LEDGER_SYNC, bot._sheet_ready = True, False
+    bot._ledger_synced.clear()
+    writes = []
+
+    async def restored_cloud(payload):
+        action = payload["action"]
+        if action == "layout":
+            return FakeResp(200, {"done": []})
+        if action == "states":
+            return FakeResp(200, {"states": {batch: copy_state(remote)}})
+        if action == "all_rows":
+            return FakeResp(200, {"rows": []})
+        if action == "ledger":
+            writes.append(copy_state(payload))
+            return FakeResp(200, {"status": "ok"})
+        raise AssertionError(f"Unexpected cloud request {action}")
+
+    bot.sheet_call = restored_cloud
+    try:
+        await bot.prepare_sheet()
+        restored = bot.SETTLEMENTS[batch]
+        check("重啟以較新版雲端狀態蓋過過時本機快取", (restored["_version"], bot.settle.find_item(restored, 2)[1]["shares"]),
+              (4, [{"owner": "carol", "cny": 100.0}]))
+        check("較舊的本機狀態不會反向覆寫雲端", writes, [])
+    finally:
+        await stop_test_ledger_sync()
+
+
+asyncio.run(prepare_sheet_prefers_newer_cloud_state())
+
+
+async def background_ledger_retries_transient_failure():
+    stub()
+    state = await settle_and_confirm(AMY, [SHOT])
+    batch = state["batch"]
+    bot.LEDGER_SYNC, bot._sheet_ready = True, False
+    bot._ledger_synced.clear()
+    previous_retry = getattr(bot, "LEDGER_RETRY_SECONDS", 5)
+    bot.LEDGER_RETRY_SECONDS = 0
+    attempts = []
+
+    async def transient_cloud(payload):
+        if payload["action"] == "states":
+            return FakeResp(200, {"states": {}})
+        attempts.append(copy_state(payload))
+        if len(attempts) == 1:
+            raise requests.exceptions.ConnectionError("temporary outage")
+        return FakeResp(200, {"status": "ok"})
+
+    bot.sheet_call = transient_cloud
+    try:
+        await bot.sync_ledger(delay=0)
+        check("背景帳本同步會自行重試暫時連線錯誤", len(attempts), 2)
+        check("背景同步重試保留原批次及正確版本", ([p["batch"] for p in attempts], state["_version"]), ([batch, batch], 1))
+        check("背景重試成功後才標記為已同步", bot._ledger_synced[batch], bot._snapshot(state))
+    finally:
+        bot.LEDGER_RETRY_SECONDS = previous_retry
+        await stop_test_ledger_sync()
+
+
+asyncio.run(background_ledger_retries_transient_failure())
+
+print("\n舊資料固定 ID 遷移與追加核准快取失敗")
+
+
+def legacy_row_id_migration_commits_only_complete_items():
+    def legacy_item(no, labels, row_ids=None):
+        item = {"no": no, "rows": labels, "shares": [{"owner": "bob", "cny": 100.0}], "line": 100.0}
+        if row_ids is not None:
+            item["row_ids"] = row_ids
+        return item
+
+    rows = [{"tab": "淘寶", "batch": "legacy", "buyer": "bob", "price": 100.0, "id": "stable-fan-id"}]
+    failed = legacy_item(1, ["淘寶第 2 列", "京東第 2 列"])
+    complete = legacy_item(2, ["淘寶第 3 列"])
+    state = {"batch": "legacy", "units": [{"items": [failed, complete]}]}
+    bot.migrate_row_ids(state, rows)
+    check("一件商品只有部分列可遷移時不提交固定 ID", failed.get("row_ids"), None)
+    check("遷移失敗的商品不占用下一件可唯一確認的固定 ID", complete.get("row_ids"), ["stable-fan-id"])
+
+    blank = legacy_item(3, ["淘寶第 4 列"], [""])
+    state["units"][0]["items"] = [blank]
+    bot.migrate_row_ids(state, rows)
+    check("舊快取裡空字串固定 ID 仍會補齊", blank.get("row_ids"), ["stable-fan-id"])
+
+    partial = legacy_item(4, ["淘寶第 5 列", "京東第 5 列"], ["stable-fan-id", ""])
+    state["units"][0]["items"] = [partial]
+    rows.append({"tab": "京東", "batch": "legacy", "buyer": "bob", "price": 100.0, "id": "stable-earbuds-id"})
+    bot.migrate_row_ids(state, rows)
+    check("部分已知的固定 ID 保留原值並補齊其餘列", partial.get("row_ids"), ["stable-fan-id", "stable-earbuds-id"])
+
+
+legacy_row_id_migration_commits_only_complete_items()
+
+
+async def reassign_requires_complete_row_ids():
+    for row_ids in ([""], ["stable-fan-id", ""]):
+        stub()
+        state = await settle_and_confirm(AMY, [SHOT])
+        item = bot.settle.find_item(state, 1)[1]
+        item["rows"] = [f"淘寶第 {i + 2} 列" for i in range(len(row_ids))]
+        item["row_ids"] = list(row_ids)
+        before, writes = copy_state(state), len(CALLS)
+        done, reason = await bot.apply_reassign(state, [1], CAROL)
+        check(f"固定 ID 未完整補齊 {row_ids!r} 時不更改歸屬或遺失原表格配對",
+              (done, "無法唯一確認" in reason, state, len(CALLS)), (False, True, before, writes))
+
+
+asyncio.run(reassign_requires_complete_row_ids())
+
+
+async def approved_append_recovers_when_local_cache_write_fails():
+    stable_rows = [{**SHEET[0], "id": "stable-fan-id"}]
+    stub(sheet=stable_rows)
+    state = await settle_and_confirm(AMY, [EARBUDS])
+    batch, original_id = state["batch"], state["message_ids"][0]
+    bot.LEDGER_SYNC, bot._sheet_ready = True, False
+    bot._ledger_synced.clear()
+    original_save = bot.save_settlements
+    cloud_states, write_attempts = {}, []
+
+    async def cloud(payload):
+        action = payload["action"]
+        if action == "list":
+            return FakeResp(200, {"rows": stable_rows})
+        if action == "ledger":
+            cloud_states[payload["batch"]] = copy_state(payload["state"])
+            return FakeResp(200, {"status": "ok"})
+        if action == "settle":
+            write_attempts.append(copy_state(payload))
+            if len(write_attempts) == 1:
+                raise requests.exceptions.ReadTimeout("accepted append response lost")
+            return FakeResp(200, {"status": "settled"})
+        raise AssertionError(f"Unexpected cloud request {action}")
+
+    bot.sheet_call = cloud
+    bot.save_settlements = lambda: False
+    try:
+        await send(AMY, "", [SHOT], reply_to=original_id)
+        draft = append_draft()
+        await react("✅", AMY, draft)
+        pending = bot.PENDING[(CHAN.id, AMY.id)]
+        check("追加雲端核准成功而本機快取失敗仍保留核准紀錄並開始原寫入",
+              ("append_attempt" in state, "append_attempt" in cloud_states[batch],
+               pending.get("write_started"), len(write_attempts), nos(state)), (True, True, True, 1, [1]))
+        await react("❌", AMY, draft)
+        check("本機快取失敗不會讓已核准追加被取消", ("append_attempt" in state, len(bot.PENDING)), (True, 1))
+        timers = [session["timer"] for session in bot.PENDING.values() if session.get("timer")]
+        for timer in timers:
+            timer.cancel()
+        await asyncio.gather(*timers, return_exceptions=True)
+        bot.PENDING.clear()
+        bot.SETTLEMENTS.clear()
+        bot.SETTLEMENTS.update(copy_state(cloud_states))
+        await bot.recover_appends()
+        current = bot.SETTLEMENTS[batch]
+        check("本機快取持續失敗時仍可從雲端核准紀錄接續相同追加",
+              (len(write_attempts), write_attempts[0] == write_attempts[1], nos(current), "append_attempt" in current),
+              (2, True, [1, 2, 3], False))
+        check("追加接續完成後雲端清除核准紀錄且只公布一次更新",
+              ("append_attempt" in cloud_states[batch], bot.PENDING,
+               len([message for message in SENT if message.content.startswith(f"🧾 **結算 {batch} 已追加")])), (False, {}, 1))
+        await bot.recover_appends()
+        check("本機快取失敗後再次 ready 不會重做已完成的追加", len(write_attempts), 2)
+    finally:
+        bot.save_settlements = original_save
+        await stop_test_ledger_sync()
+
+
+asyncio.run(approved_append_recovers_when_local_cache_write_fails())
+
+print("\n新結算核准紀錄：回寫逾時與重啟接續")
+
+
+async def accepted_journal_response_timeout(mode, readback_available):
+    stable_rows = [{**SHEET[0], "id": "stable-fan-id"}]
+    stub(sheet=stable_rows)
+    base = await settle_and_confirm(AMY, [EARBUDS]) if mode == "append" else None
+    bot.LEDGER_SYNC, bot._sheet_ready = True, False
+    bot._ledger_synced.clear()
+    journal_key = "append_attempt" if base else "commit_attempt"
+    cloud_states, row_writes, journals = {}, [], []
+
+    async def cloud(payload):
+        action = payload["action"]
+        if action == "list":
+            return FakeResp(200, {"rows": stable_rows})
+        if action == "validate_settle":
+            return FakeResp(200, {"status": "ok"})
+        if action == "states":
+            if not readback_available:
+                raise requests.exceptions.ConnectionError("readback temporarily unavailable")
+            return FakeResp(200, {"states": copy_state(cloud_states)})
+        if action == "ledger":
+            cloud_states[payload["batch"]] = copy_state(payload["state"])
+            if journal_key in payload["state"]:
+                journals.append(copy_state(payload["state"][journal_key]))
+                raise requests.exceptions.ReadTimeout("accepted journal response lost")
+            return FakeResp(200, {"status": "ok"})
+        if action == "settle":
+            row_writes.append(copy_state(payload))
+            return FakeResp(200, {"status": "settled"})
+        raise AssertionError(f"Unexpected cloud request {action}")
+
+    bot.sheet_call = cloud
+    uncertain = not readback_available
+    try:
+        await send(AMY, "" if base else "結算", [SHOT], reply_to=base["message_ids"][0] if base else None)
+        pending = bot.PENDING[(CHAN.id, AMY.id)]
+        draft, batch = pending["drafts"][-1], pending["state"]["batch"]
+        await react("✅", AMY, draft)
+        if uncertain:
+            check(f"{mode} 核准已接受但讀回失敗時凍結草稿並保留兩端核准紀錄",
+                  (journal_key in bot.SETTLEMENTS[batch], journal_key in cloud_states[batch],
+                   pending.get("write_started"), len(row_writes)), (True, True, True, 0))
+            await react("❌", AMY, draft)
+            shot_count = len(pending["shots"])
+            await send(AMY, "", [EARBUDS])
+            check(f"{mode} 未確認的雲端核准結果不能取消或修改原截圖",
+                  (len(bot.PENDING), len(pending["shots"]), pending["drafts"][-1].id), (1, shot_count, draft.id))
+            readback_available = True
+            await react("✅", AMY, draft)
+            check(f"{mode} 核准逾時重試直接接續已接受的原核准內容",
+                  (len(journals), row_writes[0]["rows"]), (1, journals[0]["writes"]))
+        current = bot.SETTLEMENTS[batch]
+        check(f"{mode} 核准逾時後{'重試' if uncertain else '讀回'}完成且只回寫一次商品列",
+              (journal_key in current, journal_key in cloud_states[batch], len(row_writes),
+               bot.PENDING, nos(current)),
+              (False, False, 1, {}, [1, 2, 3] if base else [1, 2]))
+    finally:
+        await stop_test_ledger_sync()
+
+
+for mode in ("normal", "append"):
+    for readback_available in (True, False):
+        asyncio.run(accepted_journal_response_timeout(mode, readback_available))
+
+
+async def approved_settlement_requires_durable_journal_before_row_write():
+    stable_rows = [{**SHEET[0], "id": "stable-fan-id"}]
+    stub(sheet=stable_rows)
+    bot.LEDGER_SYNC, bot._sheet_ready = True, False
+    bot._ledger_synced.clear()
+    actions = []
+    fail = True
+
+    async def cloud(payload):
+        action = payload["action"]
+        actions.append(action)
+        if action == "list":
+            return FakeResp(200, {"rows": stable_rows})
+        if action == "states":
+            return FakeResp(200, {"states": {}})
+        if action == "ledger" and fail:
+            raise requests.exceptions.ConnectionError("journal unavailable")
+        return FakeResp(200, {"status": "ok"})
+
+    bot.sheet_call = cloud
+    try:
+        await send(AMY, "結算", [SHOT])
+        draft = drafts()[-1]
+        pending = bot.PENDING[(CHAN.id, AMY.id)]
+        before = copy_state(pending["state"])
+        actions.clear()
+        await react("✅", AMY, draft)
+        check("新結算核准紀錄失敗時尚未回寫商品列", actions, ["validate_settle", "ledger", "states"])
+        after = copy_state(pending["state"])
+        after.pop("commit_attempt")
+        check("核准紀錄失敗時保留原金額與草稿並凍結同一筆核准操作",
+              (after, len(bot.PENDING), pending.get("write_started"), len(published())), (before, 1, True, 0))
+        await react("❌", AMY, draft)
+        check("核准紀錄寫入結果未明時無法取消遺失操作", len(bot.PENDING), 1)
+        fail = False
+        actions.clear()
+        await react("✅", AMY, draft)
+        check("新結算重試依序確認核准紀錄、回寫及保存完成狀態",
+              actions, ["states", "ledger", "settle", "ledger"])
+        check("核准紀錄恢復後完成同一張草稿", (bot.PENDING, len(published())), ({}, 1))
+    finally:
+        await stop_test_ledger_sync()
+
+
+asyncio.run(approved_settlement_requires_durable_journal_before_row_write())
+
+
+async def approved_settlement_recovers_after_row_write_timeout(restore_from):
+    stable_rows = [{**SHEET[0], "id": "stable-fan-id"}]
+    stub(sheet=stable_rows)
+    with tempfile.TemporaryDirectory() as state_dir:
+        bot.STATE_DIR = state_dir
+        bot.LEDGER_SYNC, bot._sheet_ready = True, False
+        bot._ledger_synced.clear()
+        cloud_states, write_attempts, applied_rows = {}, [], set()
+
+        async def cloud(payload):
+            action = payload["action"]
+            if action == "list":
+                return FakeResp(200, {"rows": stable_rows})
+            if action == "validate_settle":
+                return FakeResp(200, {"status": "ok"})
+            if action == "ledger":
+                cloud_states[payload["batch"]] = copy_state(payload["state"])
+                return FakeResp(200, {"status": "ok"})
+            if action == "settle":
+                write_attempts.append(copy_state(payload))
+                applied_rows.update(row["id"] for row in payload["rows"])
+                if len(write_attempts) == 1:
+                    raise requests.exceptions.ReadTimeout("response lost after accepted row write")
+                return FakeResp(200, {"status": "settled"})
+            raise AssertionError(f"Unexpected cloud request {action}")
+
+        bot.sheet_call = cloud
+        try:
+            await send(AMY, "結算", [SHOT])
+            draft = drafts()[-1]
+            batch = bot.PENDING[(CHAN.id, AMY.id)]["state"]["batch"]
+            await react("✅", AMY, draft)
+            saved = json.loads((Path(state_dir) / "settlements.json").read_text())
+            check(f"{restore_from} 恢復前的新結算核准紀錄已存本機與雲端",
+                  ("commit_attempt" in saved[batch], "commit_attempt" in cloud_states[batch]), (True, True))
+            check(f"{restore_from} 新結算回寫逾時保留同草稿且尚未公布", (len(bot.PENDING), len(published())), (1, 0))
+            timers = [session["timer"] for session in bot.PENDING.values() if session.get("timer")]
+            for timer in timers:
+                timer.cancel()
+            await asyncio.gather(*timers, return_exceptions=True)
+            bot.PENDING.clear()
+            bot.SETTLEMENTS.clear()
+            if restore_from == "local":
+                bot.load_settlements()
+            else:
+                bot.SETTLEMENTS.update(copy_state(cloud_states))
+            await bot.recover_commits()
+            current = bot.SETTLEMENTS[batch]
+            check(f"{restore_from} 重啟接續新結算使用相同批次與固定列 ID", (len(write_attempts), write_attempts[0] == write_attempts[1]), (2, True))
+            check(f"{restore_from} 重啟後同商品列只保留一筆結算", (applied_rows, list(bot.SETTLEMENTS), nos(current)),
+                  ({"stable-fan-id"}, [batch], [1, 2]))
+            check(f"{restore_from} 恢復成功後清除核准紀錄並只公布一次",
+                  ("commit_attempt" in current, "commit_attempt" in cloud_states[batch], bot.PENDING, len(published())),
+                  (False, False, {}, 1))
+            check(f"{restore_from} 接續新結算的每人金額正確", bot.settle.totals(current)["twd"], {"bob": 495, "unclassified": 495})
+            await bot.recover_commits()
+            check(f"{restore_from} 再次 ready 不會重播已完成新結算", (len(write_attempts), len(published())), (2, 1))
+        finally:
+            bot.STATE_DIR = None
+            await stop_test_ledger_sync()
+
+
+for restore_from in ("local", "cloud"):
+    asyncio.run(approved_settlement_recovers_after_row_write_timeout(restore_from))
+
+
+async def approved_settlement_retains_journal_until_final_ledger_succeeds():
+    stable_rows = [{**SHEET[0], "id": "stable-fan-id"}]
+    stub(sheet=stable_rows)
+    bot.LEDGER_SYNC, bot._sheet_ready = True, False
+    bot._ledger_synced.clear()
+    cloud_states, ledger_attempts, row_attempts = {}, [], []
+
+    async def cloud(payload):
+        action = payload["action"]
+        if action == "list":
+            return FakeResp(200, {"rows": stable_rows})
+        if action == "states":
+            return FakeResp(200, {"states": copy_state(cloud_states)})
+        if action == "validate_settle":
+            return FakeResp(200, {"status": "ok"})
+        if action == "ledger":
+            ledger_attempts.append(copy_state(payload))
+            if len(ledger_attempts) == 2:
+                return FakeResp(503, {"status": "error"})
+            cloud_states[payload["batch"]] = copy_state(payload["state"])
+            return FakeResp(200, {"status": "ok"})
+        if action == "settle":
+            row_attempts.append(copy_state(payload))
+            return FakeResp(200, {"status": "settled"})
+        raise AssertionError(f"Unexpected cloud request {action}")
+
+    bot.sheet_call = cloud
+    try:
+        await send(AMY, "結算", [SHOT])
+        draft = drafts()[-1]
+        batch = bot.PENDING[(CHAN.id, AMY.id)]["state"]["batch"]
+        await react("✅", AMY, draft)
+        current = bot.SETTLEMENTS[batch]
+        check("列回寫成功但最終帳本失敗時保留核准紀錄與草稿",
+              (len(row_attempts), "commit_attempt" in current, "commit_attempt" in cloud_states[batch], len(bot.PENDING), len(published())),
+              (1, True, True, 1, 0))
+        await react("❌", AMY, draft)
+        check("已回寫的新結算無法用取消丟棄核准紀錄", ("commit_attempt" in current, len(bot.PENDING)), (True, 1))
+        await react("✅", AMY, draft)
+        check("最終帳本恢復後可以重試完成新結算",
+              ("commit_attempt" in current, "commit_attempt" in cloud_states[batch], bot.PENDING, len(published())),
+              (False, False, {}, 1))
+        check("新結算的最終帳本重試維持同一列回寫內容", row_attempts[0], row_attempts[1])
+    finally:
+        await stop_test_ledger_sync()
+
+
+asyncio.run(approved_settlement_retains_journal_until_final_ledger_succeeds())
+bot.sheet_call, bot.parse_with_llm = real_post, real_parse
 
 print("\nllm_json：429 重試")
 

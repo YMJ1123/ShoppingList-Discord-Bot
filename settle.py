@@ -280,7 +280,7 @@ def assign(units: list[dict], rows: list[dict], payload: list[dict], results: li
             matched = [by_id[i] for i in ids]
             buyers = list(dict.fromkeys(r["buyer"] for r in matched))
             sheet_qty = sum(r["qty"] for r in matched)
-            it["shares"], it["hint"], it["rows"] = [{"owner": UNCLASSIFIED, "cny": it["line"]}], "", []
+            it["shares"], it["hint"], it["rows"], it["row_ids"] = [{"owner": UNCLASSIFIED, "cny": it["line"]}], "", [], []
 
             if not matched:
                 continue
@@ -301,8 +301,9 @@ def assign(units: list[dict], rows: list[dict], payload: list[dict], results: li
                 continue
 
             it["rows"] = ids
+            it["row_ids"] = [r.get("id", "") for r in matched]  # 表格上不會變的列 ID，寫回和改歸屬時用
             used.update(ids)
-            writes += [{"tab": r["tab"], "row": r["row"], "name": r["name"], "buyer": r["buyer"], "price": p}
+            writes += [{"id": r.get("id", ""), "tab": r["tab"], "row": r["row"], "name": r["name"], "buyer": r["buyer"], "price": p}
                        for r, p in zip(matched, prices)]
     return writes, notes
 
@@ -351,6 +352,51 @@ def claim(state: dict, no: int, owner: str) -> str:
     item["shares"] = [{"owner": owner, "cny": item["line"]}]
     item["hint"] = ""
     return ""
+
+
+def reassign(state: dict, no: int, owner: str) -> tuple[str, list[str]]:
+    """下單人把某件商品改給 owner（對錯人、或幫沒上線的人指定）。
+
+    回傳 (錯誤訊息, 要從表格上取消結算的列 ID)。原本對到的登記列其實不是這次買的，
+    所以要把寫在那些列上的價格和批次清掉，之後它們才會再被拿來比對。
+    """
+    if state.get("closed"):
+        return f"結算 {state['batch']} 已經結束認領了，不能再改", []
+    _, item = find_item(state, no)
+    if item is None:
+        return f"這次結算沒有 #{no} 這個商品", []
+    if [s["owner"] for s in item["shares"]] == [owner]:
+        return f"#{no} 本來就算在 {owner} 名下", []
+    released = [i for i in item.get("row_ids") or [] if i]
+    item["shares"] = [{"owner": owner, "cny": item["line"]}]
+    item["hint"], item["rows"], item["row_ids"] = "", [], []
+    return "", released
+
+
+def ledger_block(state: dict, updated: str) -> list[list]:
+    """這筆結算在「結算紀錄」分頁的內容：每件商品（每個歸屬）一列，最後每個人一列小計。"""
+    t = totals(state)
+    status = "已結束" if state.get("closed") else "認領中"
+    who = lambda o: "（沒人認領）" if o == UNCLASSIFIED else o
+    block, allocations = [], {}
+    for unit in state["units"]:
+        for it in unit["items"]:
+            for share in it["shares"]:
+                qty = it["qty"] if len(it["shares"]) == 1 else round(share["cny"] / it["price"])
+                raw_twd = share["cny"] * unit["rate"]
+                allocations.setdefault(share["owner"], []).append((len(block), raw_twd))
+                block.append([state["batch"], it["no"], it["name"], it.get("spec", ""), qty, share["cny"], who(share["owner"]),
+                              math.floor(raw_twd), state["payer"], status, unit.get("order_no", ""), updated])
+    # 先保留 Discord 已公布的每人小計，再把整數台幣分配到該人的商品明細。
+    for owner, entries in allocations.items():
+        leftover = t["twd"][owner] - sum(block[index][7] for index, _ in entries)
+        by_remainder = sorted(entries, key=lambda entry: entry[1] - math.floor(entry[1]), reverse=True)
+        for index, _ in by_remainder[:leftover]:
+            block[index][7] += 1
+    for owner in sorted(t["twd"], key=lambda o: (o == UNCLASSIFIED, o)):
+        block.append([state["batch"], "", "【小計】", "", "", t["cny"][owner], who(owner), t["twd"][owner],
+                      state["payer"], status, "", updated])
+    return block
 
 
 def has_unclassified(state: dict) -> bool:

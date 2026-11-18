@@ -253,6 +253,61 @@ same_draft, _, _ = settle.merge_shots([
 check("同一張草稿裡確認頁＋訂單頁拍到同一件 → 提醒算了兩次",
       settle.duplicate_notes(same_draft, []), ["#3 盲盒收纳展示架手办子透明防... ×2 ¥24.60 和這張草稿的 #1 看起來是同一件（同一筆訂單的不同頁面？），可能算了兩次"])
 
+print("\nreassign：下單人改歸屬")
+re_state, re_writes, _, _ = build()
+check("對到表格的商品記下了列 ID（測試資料沒有 ID 就是空字串）", re_state["units"][0]["items"][3]["row_ids"], [""])
+for u in re_state["units"]:
+    for it in u["items"]:
+        if it["rows"]:
+            it["row_ids"] = ["id-" + r for r in it["rows"]]
+check("把對錯人的 #4 改給別人 → 回報要取消結算的列", settle.reassign(re_state, 4, "erictw13"), ("", ["id-淘寶78"]))
+t = settle.totals(re_state)
+check("金額移到新的人身上，總額不變", (t["twd"]["erictw13"], t["twd"]["chezz1025"], sum(t["twd"].values())), (559, 262, 4540))
+check("那件不再綁著表格的列", (re_state["units"][0]["items"][3]["rows"], re_state["units"][0]["items"][3]["row_ids"]), ([], []))
+check("沒人認領的也可以直接指定給人", (settle.reassign(re_state, 1, "wakaru_0216"), settle.totals(re_state)["twd"]["wakaru_0216"]), (("", []), 1515))
+check("本來就是他的 → 說明，不重做", settle.reassign(re_state, 1, "wakaru_0216"), ("#1 本來就算在 wakaru_0216 名下", []))
+check("沒有這個編號", settle.reassign(re_state, 99, "x"), ("這次結算沒有 #99 這個商品", []))
+settle.close(re_state)
+check("結束認領後不能改", settle.reassign(re_state, 2, "x"), ("結算 20261112-1510 已經結束認領了，不能再改", []))
+
+print("\nledger_block：結算紀錄分頁的內容")
+lg_state, _, _, _ = build()
+settle.claim(lg_state, 2, "wakaru_0216")
+block = settle.ledger_block(lg_state, "2026-11-17 16:00")
+check("每件商品一列", [(r[1], r[2][:6], r[4], r[5], r[6], r[7]) for r in block[:5]],
+      [(1, "轻奢钛架男士", 1, 284.66, "（沒人認領）", 1515), (2, "【除尘秒贴】", 1, 61.58, "wakaru_0216", 328), (3, "盲盒收纳展示", 2, 49.2, "chezz1025", 262),
+       (4, "chiika", 4, 105.08, "chezz1025", 559), (5, "TANZ 0", 1, 352.33, "ymj1123", 1876)])
+check("最後每人一列小計，金額和 Discord 上公布的一樣", [(r[2], r[6], r[5], r[7]) for r in block[5:]],
+      [("【小計】", "chezz1025", 154.28, 821), ("【小計】", "wakaru_0216", 61.58, 328), ("【小計】", "ymj1123", 352.33, 1876), ("【小計】", "（沒人認領）", 284.66, 1515)])
+check("小計加總等於實付", sum(r[7] for r in block[5:]), 4540)
+check("每列都帶批次、下單人、狀態、時間", {(r[0], r[8], r[9], r[11]) for r in block}, {("20261112-1510", "ymj1123", "認領中", "2026-11-17 16:00")})
+settle.close(lg_state)
+check("結束認領後狀態改成已結束、沒人認領的歸下單人", {(r[9]) for r in settle.ledger_block(lg_state, "t")} | {r[6] for r in settle.ledger_block(lg_state, "t")},
+      {"已結束", "wakaru_0216", "chezz1025", "ymj1123"})
+split_state, _, _, _ = build(split, two, [{"no": 1, "rows": ["淘寶25", "淘寶68"], "confidence": "high"}])
+check("一件商品兩個人分 → 各一列，數量各算各的", [(r[4], r[5], r[6]) for r in settle.ledger_block(split_state, "t")[:2]], [(1, 29.0, "mattmatt1223"), (1, 29.0, "ymj1123")])
+
+half_state, _, _, _ = build([shot([("甲", "", 1, 1), ("乙", "", 1, 1)], 1)], [], [])
+settle.claim(half_state, 1, "bob")
+settle.claim(half_state, 2, "bob")
+half_block = settle.ledger_block(half_state, "t")
+check("兩件各半元的明細依最大餘數分配，不會把小計一元都捨去", [r[7] for r in half_block], [1, 0, 1])
+check("餘數相同時依原商品順序穩定分配", settle.ledger_block(half_state, "t"), half_block)
+
+mixed_state, _, _, _ = build([
+    shot([("第一筆甲", "", 1, 1), ("第一筆乙", "", 1, 1)], 1, "1111111111"),
+    shot([("第二筆甲", "", 1, 1), ("第二筆乙", "", 1, 2)], 1, "2222222222"),
+], [], [])
+for no, owner in ((1, "bob"), (2, "carol"), (3, "bob"), (4, "carol")):
+    settle.claim(mixed_state, no, owner)
+mixed_block = settle.ledger_block(mixed_state, "t")
+check("跨付款匯率的明細加總與每人小計一致",
+      {owner: sum(r[7] for r in mixed_block if r[1] != "" and r[6] == owner) for owner in ("bob", "carol")},
+      settle.totals(mixed_state)["twd"])
+check("所有商品明細加總等於實付台幣", sum(r[7] for r in mixed_block if r[1] != ""), 2)
+check("修正明細分配仍保留每人的原人民幣與台幣小計",
+      [(r[6], r[5], r[7]) for r in mixed_block if r[2] == "【小計】"], [("bob", 2.0, 1), ("carol", 3.0, 1)])
+
 print("\nrate_notes：回算匯率檢查")
 check("比市場匯率高 8% → 提醒可能漏截圖", [n[:28] for n in settle.rate_notes(state["units"], 4.93)], ["TWD 4,540 這筆付款的回算匯率 5.323 比今"])
 check("和市場匯率差不多 → 不提醒", settle.rate_notes(multi["units"], 4.93), [])
@@ -319,7 +374,7 @@ pencil_rows = [{"tab": "淘寶", "row": 90, "name": "适用applepencil笔尖", "
 pencil_payload = settle.match_payload(delta, pencil_rows)
 pencil_writes, _ = settle.assign(delta, pencil_rows, pencil_payload, [{"no": 15, "rows": ["淘寶90"], "confidence": "high"}])
 check("配對 delta 同步更新完整結算的新商品", appended["units"][-1]["items"][0]["shares"], [{"owner": "carol", "cny": 9.8}])
-check("只產生新配對列的表格寫入", pencil_writes, [{"tab": "淘寶", "row": 90, "name": "适用applepencil笔尖", "buyer": "carol", "price": 9.8}])
+check("只產生新配對列的表格寫入", pencil_writes, [{"id": "", "tab": "淘寶", "row": 90, "name": "适用applepencil笔尖", "buyer": "carol", "price": 9.8}])
 
 same_base, _, _, _ = build([shot([("原登記商品", "白色", 1, 10), ("已認領商品", "", 1, 10)], 150, "5127481190470000001")], [], [])
 settle.claim(same_base, 1, "bob")

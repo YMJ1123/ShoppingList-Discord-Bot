@@ -2,10 +2,11 @@ import os
 import re
 import json
 import time
+import secrets
 import base64
 import asyncio
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +17,8 @@ from dotenv import load_dotenv
 from openai import AsyncOpenAI, RateLimitError
 
 import settle
+import sheets
+import shopping
 
 # -------------------------------------------------
 #  載入環境變數 (.env)
@@ -23,12 +26,13 @@ import settle
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
 ALLOWED_CHANNEL_IDS_RAW = os.getenv("ALLOWED_CHANNEL_IDS", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+SHEET_ID = os.getenv("SHEET_ID")  # Google 試算表網址裡 /d/ 後面那一段
+GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")  # OAuth 憑證檔：client_id / client_secret / refresh_token
 
-if not DISCORD_TOKEN or not N8N_WEBHOOK_URL:
-    raise RuntimeError("缺少必要的環境變數：DISCORD_TOKEN 或 N8N_WEBHOOK_URL")
+if not DISCORD_TOKEN:
+    raise RuntimeError("缺少必要的環境變數：DISCORD_TOKEN")
 
 if not GROQ_API_KEY:
     raise RuntimeError("缺少必要的環境變數：GROQ_API_KEY")
@@ -82,22 +86,110 @@ def safe_quantity(value) -> int:
     return qty if qty > 0 else 1
 
 
-# n8n 要等 Google Sheets 寫完才回應，實測單次 4.5~10.8 秒
-N8N_READ_TIMEOUT = 30
+# -------------------------------------------------
+#  Google 試算表
+# -------------------------------------------------
+SHEET_LOCK = asyncio.Lock()  # 表格的每個操作都是「先讀再寫」，一次只做一個才不會互相踩到
+_store = None
 
 
-async def post_to_n8n(payload: dict, url: str | None = None):
-    """在 thread 裡送 webhook，避免卡住 Discord 的 event loop。"""
-    return await asyncio.to_thread(
-        requests.post, url or N8N_WEBHOOK_URL, json=payload, timeout=(5, N8N_READ_TIMEOUT)
-    )
+def get_store() -> sheets.Store:
+    global _store
+    if _store is None:
+        if not SHEET_ID or not GOOGLE_CREDENTIALS:
+            raise RuntimeError("缺少必要的環境變數：SHEET_ID 或 GOOGLE_CREDENTIALS")
+        _store = sheets.Store(sheets.Sheets(SHEET_ID, json.loads(Path(GOOGLE_CREDENTIALS).read_text())))
+    return _store
 
 
-def n8n_failure_reply(verb: str, done: str, err: Exception) -> str:
-    """讀取逾時不等於失敗：請求已送達 n8n，Sheets 通常還是會寫完。"""
-    if isinstance(err, requests.exceptions.ReadTimeout):
+class Reply:
+    """表格操作的結果。status_code 沿用 HTTP 的習慣：200 成功、404 找不到、409 有衝突。"""
+
+    def __init__(self, status: int, body: dict):
+        self.status_code, self.ok, self.body = status, status < 400, body
+        self.text = json.dumps(body, ensure_ascii=False)
+
+    def json(self) -> dict:
+        return self.body
+
+
+def _choice(n: int, row: dict) -> dict:
+    return {"n": n, "id": row["id"], "sheet": row["tab"], "itemName": row["name"],
+            "spec": row["spec"], "qty": row["qty"], "url": row["url"]}
+
+
+def sheet_action(store: sheets.Store, p: dict) -> Reply:
+    """bot 對表格的所有操作都走這裡（同步，在 thread 裡跑）。"""
+    action = p.get("action")
+    if action in ("list", "all_rows"):
+        rows = store.rows()
+        if action == "all_rows":
+            return Reply(200, {"rows": rows})
+        open_rows = [r for r in rows if not r["batch"]]
+        return Reply(200, {"status": "ok", "rows": open_rows, "settled": len(rows) - len(open_rows)})
+
+    if action == "add":
+        mine = [r for r in store.rows() if r["buyer"] == p["senderName"]]
+        dups = shopping.find_duplicates(p["url"], mine)
+        if dups and not p.get("force"):
+            return Reply(409, {"status": "duplicate", "rows": [_choice(i, r) for i, r in enumerate(dups, 1)]})
+        tab = shopping.platform(p.get("shareText", ""), p["url"])
+        row = store.add(tab, {"name": p["itemName"], "spec": p.get("modelSpec", ""), "url": p["url"],
+                              "qty": p.get("quantity", 1), "buyer": p["senderName"]})
+        return Reply(200, {"status": "added", "id": row["id"], "sheet": tab})
+
+    if action == "delete":
+        mine = [r for r in store.rows() if r["buyer"] == p["senderName"]]
+        if p.get("rowId"):  # 使用者從選項裡選好的那一筆
+            hits = [r for r in mine if r["id"] == p["rowId"]]
+            status = "one" if hits else "changed"
+        else:
+            status, hits = shopping.find_delete_target(p.get("url", ""), p.get("itemName", ""), mine)
+        if status == "one":
+            gone = store.delete(hits[0]["id"], expected_buyer=p["senderName"], expected=hits[0])
+            if gone is not None:
+                return Reply(200, {"status": "deleted", "itemName": gone["name"]})
+            status = "changed"
+        if status == "choose":
+            return Reply(404, {"status": "choose", "choices": [_choice(i, r) for i, r in enumerate(hits, 1)]})
+        return Reply(404, {"status": "changed" if status == "changed" else "not_found"})
+
+    if action == "settle":
+        problems = store.settle(p["batch"], p["rows"])
+        if problems:
+            return Reply(409, {"status": "conflict", "problems": problems})
+        return Reply(200, {"status": "settled", "batch": p["batch"], "count": len(p["rows"])})
+
+    if action == "validate_settle":
+        problems = store.validate_settlement(p["batch"], p["rows"])
+        return Reply(409 if problems else 200, {"status": "conflict" if problems else "ok", "problems": problems})
+
+    if action == "unsettle":
+        return Reply(200, {"status": "ok", "count": store.unsettle(p["batch"], p["ids"])})
+
+    if action == "ledger":
+        store.save_settlement(p["batch"], p["state"], p["block"], release_ids=p.get("released_ids", ()))
+        return Reply(200, {"status": "ok"})
+
+    if action == "states":
+        return Reply(200, {"status": "ok", "states": store.read_states()})
+
+    if action == "layout":
+        return Reply(200, {"status": "ok", "done": store.ensure_layout()})
+
+    return Reply(400, {"status": "error", "message": f"不認得的 action：{action}"})
+
+
+async def sheet_call(payload: dict) -> Reply:
+    async with SHEET_LOCK:
+        return await asyncio.to_thread(sheet_action, get_store(), payload)
+
+
+def sheet_failure_reply(verb: str, done: str, err: Exception) -> str:
+    """回應逾時不等於失敗：請求可能已經送到 Google，這筆也許已經寫進去了。"""
+    if isinstance(err, requests.exceptions.Timeout):
         return (
-            f"{verb}請求已送出，但 n8n 超過 {N8N_READ_TIMEOUT} 秒沒回應 ⏱️\n"
+            f"{verb}請求已送出，但 Google 表格太久沒回應 ⏱️\n"
             f"這筆**可能已經{done}**，請先看一下清單，沒有再重送一次。"
         )
     return f"{verb}時我撞牆了 QQ 請幫我看一下 log"
@@ -122,11 +214,13 @@ LOCAL_VISION_MODEL = os.getenv("LOCAL_VISION_MODEL", "qwen3-vl:8b-instruct")
 # 正常一張約 4 秒，模型剛載入約 25 秒。顯示卡記憶體被別的程式擠滿時一張要好幾分鐘，那就不等了
 LOCAL_VISION_TIMEOUT = float(os.getenv("LOCAL_VISION_TIMEOUT", "45"))
 LOCAL_VISION_COOLDOWN = 300  # 本地連不上或逾時後，這段時間直接用 Groq，不讓每張圖都等到逾時
+# 讀完後模型在顯示卡上留多久。Ollama 主機預設可能是永遠不卸載（OLLAMA_KEEP_ALIVE=-1），
+# 和別的模型擠在同一張顯示卡時，桌面程式要用顯示記憶體就會被搬到主記憶體，整台機器卡死
+LOCAL_VISION_KEEP_ALIVE = os.getenv("LOCAL_VISION_KEEP_ALIVE", "2m")
 local_vision_client = (
     AsyncOpenAI(base_url=LOCAL_VISION_URL, api_key="local", max_retries=0) if LOCAL_VISION_URL else None
 )
 local_vision_down_until = 0.0
-N8N_SETTLE_WEBHOOK_URL = os.getenv("N8N_SETTLE_WEBHOOK_URL", N8N_WEBHOOK_URL + "-settle")
 STATE_DIR = os.getenv("STATE_DIR")  # 有設才會把結算紀錄存檔，重啟後還能認領
 
 SYSTEM_PROMPT = (
@@ -221,6 +315,66 @@ intents.message_content = True  # 一定要開，不然讀不到訊息內容
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
+# -------------------------------------------------
+#  按鈕與選單
+# -------------------------------------------------
+# 按下去之後要做什麼，全部寫在識別碼（custom_id）裡，由 on_component 統一處理。
+# 這樣 bot 重啟後，舊訊息上的按鈕照樣有效。
+class SLButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sl:.+"):
+    def __init__(self, label: str, custom_id: str, style=discord.ButtonStyle.secondary):
+        super().__init__(discord.ui.Button(label=label, custom_id=custom_id, style=style))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(item.label, item.custom_id, item.style)
+
+    async def callback(self, interaction):
+        await on_component(interaction, self.item.custom_id, [])
+
+
+class SLSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"sls:.+"):
+    def __init__(self, custom_id: str, options: list, placeholder: str = "", max_values: int = 1):
+        super().__init__(discord.ui.Select(custom_id=custom_id, options=options, placeholder=placeholder or None,
+                                           min_values=1, max_values=max_values))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(item.custom_id, item.options, item.placeholder or "", item.max_values)
+
+    async def callback(self, interaction):
+        await on_component(interaction, self.item.custom_id, list(self.item.values))
+
+
+class SLUserSelect(discord.ui.DynamicItem[discord.ui.UserSelect], template=r"slu:.+"):
+    def __init__(self, custom_id: str, placeholder: str = ""):
+        super().__init__(discord.ui.UserSelect(custom_id=custom_id, placeholder=placeholder or None, min_values=1, max_values=1))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(item.custom_id, item.placeholder or "")
+
+    async def callback(self, interaction):
+        await on_component(interaction, self.item.custom_id, list(self.item.values))
+
+
+bot.add_dynamic_items(SLButton, SLSelect, SLUserSelect)
+GREEN, RED, BLUE, GREY = (discord.ButtonStyle.success, discord.ButtonStyle.danger,
+                          discord.ButtonStyle.primary, discord.ButtonStyle.secondary)
+
+
+def view_of(*items) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    for item in items:
+        view.add_item(item)
+    return view
+
+
+async def ephemeral(interaction, text: str, view=None):
+    """只有按的人看得到的回覆。"""
+    kw = {"view": view} if view is not None else {}
+    await interaction.response.send_message(text, ephemeral=True, **kw)
+
+
 async def safe_react(message: discord.Message, emoji: str, remove: bool = False):
     """加/移除反應失敗（缺權限、網路暫時不通…）時不要讓整個訊息處理中斷。"""
     try:
@@ -232,11 +386,10 @@ async def safe_react(message: discord.Message, emoji: str, remove: bool = False)
         print(f"[WARN] 無法{'移除' if remove else '加上'}反應 {emoji}: {e}")
 
 
-# (頻道, 使用者) → 還沒選編號的刪除選項。只在記憶體，重啟就消失。
+# (頻道, 使用者) → 還沒選的刪除選項。只在記憶體，重啟就消失。
 DELETE_CHOICES: dict[tuple[int, int], dict] = {}
 DELETE_CHOICE_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
 DELETE_CHOICE_SECONDS = 600
-DELETE_CHOICE_SEQ = 0
 # 「刪除 2」「第2個」「2」；純數字只在回覆選項那則訊息時算數
 DELETE_PICK_RE = re.compile(r"^(?:(?:刪除|刪掉|移除|選)\s*)?(?:第\s*)?#?\s*(\d{1,2})\s*(?:個)?$")
 
@@ -246,7 +399,7 @@ def delete_choice_lock(key: tuple[int, int]) -> asyncio.Lock:
 
 
 def delete_pick_number(text: str, message: discord.Message) -> int | None:
-    """有待選的刪除時，认出選編號。沒有待選就回 None，讓原本的刪除流程繼續。"""
+    """有待選的刪除時，認出選編號。沒有待選就回 None，讓原本的刪除流程繼續。"""
     pending = DELETE_CHOICES.get((message.channel.id, message.author.id))
     if not pending:
         return None
@@ -261,109 +414,81 @@ def delete_pick_number(text: str, message: discord.Message) -> int | None:
     return None
 
 
-def _drop_delete_choice(key: tuple[int, int], choice_id: int | None):
+def _drop_delete_choice(key: tuple[int, int], choice_id: str | None):
     pending = DELETE_CHOICES.get(key)
     if pending and choice_id is not None and pending["id"] == choice_id:
         DELETE_CHOICES.pop(key, None)
 
 
 async def offer_delete_choices(message: discord.Message, choices: list[dict]):
-    """多筆對得上時列出編號。新的一輪會取代舊的，編號用只增不減的序號。"""
-    global DELETE_CHOICE_SEQ
+    """多筆對得上時列出來讓他選，每輪使用獨立識別碼並取代舊選項。"""
     key = (message.channel.id, message.author.id)
+    token = secrets.token_hex(8)
     lines = []
     for choice in choices:
         extra = f"（{choice['spec']}）" if choice.get("spec") else ""
         qty = choice.get("qty")
         qty_text = f" ×{qty}" if qty not in ("", None) else ""
         lines.append(f"{choice['n']}. 「{choice['itemName']}」{extra}{qty_text}")
+    view = view_of(*[SLButton(f"刪除 {c['n']}", f"sl:del:{token}:{c['n']}", RED) for c in choices[:20]],
+                   SLButton("都不要刪", f"sl:del:{token}:0", GREY))
     prompt = await message.reply(
-        "你有好幾筆對得上，我先不刪。回覆這則訊息的編號，或打「刪除 2」：\n" + "\n".join(lines)
+        "你有好幾筆對得上，我先不刪。按下面的按鈕選一筆（也可以打「刪除 2」）：\n" + "\n".join(lines), view=view
     )
     async with delete_choice_lock(key):
-        DELETE_CHOICE_SEQ += 1
         DELETE_CHOICES[key] = {
-            "id": DELETE_CHOICE_SEQ,
+            "id": token,
             "expires": time.monotonic() + DELETE_CHOICE_SECONDS,
             "choices": choices,
             "prompt_id": prompt.id,
         }
 
 
-async def confirm_delete_choice(message: discord.Message, number: int):
+async def confirm_delete_choice(message, number: int, expected_choice_id=None):
     key = (message.channel.id, message.author.id)
     async with delete_choice_lock(key):
         pending = DELETE_CHOICES.get(key)
+        if pending and expected_choice_id is not None and str(pending["id"]) != str(expected_choice_id):
+            await message.reply("這張刪除選項已經被新的選項取代，請使用最新的選項。")
+            return
         if not pending or pending["expires"] <= time.monotonic():
             DELETE_CHOICES.pop(key, None)
             await message.reply("這次的刪除選項已經過期，請重新說一次要刪什麼。")
             return
         choices = pending["choices"]
+        if number == 0:
+            DELETE_CHOICES.pop(key, None)
+            await message.reply("好，什麼都沒刪。")
+            return
         if not 1 <= number <= len(choices):
             await message.reply(f"請回 1 到 {len(choices)} 的編號。")
             return
-        choice = choices[number - 1]
-        choice_id = pending["id"]
-        row_number, sheet = choice["row_number"], choice["sheet"]
-        # 列號可能在等他選的這段時間位移，所以連選項當時的內容一起送，讓 n8n 核對是不是同一筆
-        expect = {"itemName": choice.get("itemName", ""), "spec": choice.get("spec", ""),
-                  "qty": choice.get("qty", ""), "url": choice.get("url", "")}
-    await send_delete(
-        message, "", "", message.content,
-        row_number=row_number, sheet=sheet, choice_id=choice_id, expect=expect,
-    )
+        choice_id, row_id = pending["id"], choices[number - 1]["id"]
+    await send_delete(message, "", "", message.content, row_id=row_id, choice_id=choice_id)
 
 
-async def send_delete(
-    message: discord.Message,
-    url: str,
-    item_name: str,
-    full_text: str,
-    row_number: str | int = "",
-    sheet: str = "",
-    choice_id: int | None = None,
-    expect: dict | None = None,
-):
-    """送刪除請求到 n8n 並回覆結果。可用網址、商品名稱，或使用者選好的列號。"""
+async def send_delete(message, url: str, item_name: str, full_text: str, row_id: str = "", choice_id: int | None = None):
+    """刪除並回覆結果。可用網址、商品名稱，或使用者從選項裡選好的列 ID。"""
     key = (message.channel.id, message.author.id)
     if choice_id is None:
         pending = DELETE_CHOICES.get(key)
         choice_id = pending["id"] if pending else None
-    stamp = getattr(message, "created_at", None)
-    payload = {
-        "action": "delete",
-        "url": url,
-        "itemName": item_name,
-        "fullText": full_text,
-        "senderId": str(message.author.id),
-        "senderName": message.author.name,
-        "channelId": str(message.channel.id),
-        "createdAt": stamp.isoformat() if stamp is not None else "",
-    }
-    if row_number != "" and row_number is not None:
-        payload["rowNumber"] = row_number
-        payload["sheet"] = sheet
-        payload["expect"] = expect
+    payload = {"action": "delete", "url": url, "itemName": item_name, "fullText": full_text,
+               "senderId": str(message.author.id), "senderName": message.author.name}
+    if row_id:
+        payload["rowId"] = row_id
 
     try:
-        resp = await post_to_n8n(payload)
-        body_text = getattr(resp, "text", "") or ""
-        print("Sent DELETE to n8n:", resp.status_code, body_text[:200])
-        body = {}
-        try:
-            body = resp.json() or {}
-        except Exception:
-            body = {}
+        resp = await sheet_call(payload)
+        body = resp.json() or {}
+        print("DELETE:", resp.status_code, resp.text[:200])
 
         if resp.status_code == 404 and body.get("status") == "choose" and body.get("choices"):
             await offer_delete_choices(message, body["choices"])
             return
         if resp.status_code == 404 and body.get("status") == "changed":
             _drop_delete_choice(key, choice_id)
-            await message.reply(
-                "清單在你選的這段時間有變動，我不確定你選的是哪一筆，所以**沒有刪任何東西**。\n"
-                "請重新說一次要刪什麼。"
-            )
+            await message.reply("你選的那一筆已經不在清單裡了（可能剛被刪掉），所以**沒有刪任何東西**。\n還要刪的話請重新說一次。")
             return
 
         if resp.status_code == 200:
@@ -380,10 +505,46 @@ async def send_delete(
                 "（只能刪自己加的，名稱也要對得上喔）"
             )
         else:
-            await message.reply("刪除請求傳到 n8n 失敗 QQ")
+            await message.reply("刪除失敗 QQ 表格那邊出錯了，請稍後再試。")
     except Exception as e:
-        print("Error sending delete to n8n:", e)
-        await message.reply(n8n_failure_reply("刪除", "從表格刪掉", e))
+        print("Error deleting:", repr(e))
+        await message.reply(sheet_failure_reply("刪除", "從表格刪掉", e))
+
+
+# -------------------------------------------------
+#  新增：同一件商品已經登記過的話先問一下
+# -------------------------------------------------
+ADD_PENDING: dict[str, dict] = {}  # 序號 → 等使用者決定要不要重複登記的新增
+ADD_PENDING_SECONDS = 600
+
+
+def added_text(payload: dict) -> str:
+    parts = [f"{payload['quantity']} 件"] + ([payload["modelSpec"]] if payload["modelSpec"] else []) + [f"「{payload['itemName']}」"]
+    return f"已把 {' '.join(parts)} 加入購物清單 🧾"
+
+
+async def send_add(message, payload: dict):
+    """寫進清單並回覆。同一個人已經登記過同一件商品（還沒結算）時先問要不要再加一筆。"""
+    try:
+        resp = await sheet_call(payload)
+        print("ADD:", resp.status_code, resp.text[:200])
+        if resp.status_code == 409 and resp.json().get("status") == "duplicate":
+            token = secrets.token_hex(8)
+            had = "\n".join(f"・「{r['itemName']}」{'（' + r['spec'] + '）' if r['spec'] else ''} ×{r['qty']}" for r in resp.json()["rows"])
+            prompt = await message.reply(
+                f"這件商品你已經登記過了：\n{had}\n還要再加一筆嗎？（想改數量的話，請先刪掉舊的再重新登記）",
+                view=view_of(SLButton("再加一筆", f"sl:dup:{token}:y", BLUE), SLButton("不用了", f"sl:dup:{token}:n", GREY)),
+            )
+            ADD_PENDING[token] = {"payload": payload, "user_id": message.author.id,
+                                  "channel_id": message.channel.id, "prompt_id": prompt.id,
+                                  "expires": time.monotonic() + ADD_PENDING_SECONDS}
+        elif resp.ok:
+            await message.reply(added_text(payload))
+        else:
+            await message.reply("新增失敗 QQ 表格那邊出錯了，請稍後再試。")
+    except Exception as e:
+        print("Error adding:", repr(e))
+        await message.reply(sheet_failure_reply("新增", "寫進表格", e))
 
 
 # -------------------------------------------------
@@ -402,6 +563,21 @@ SETTLEMENTS: dict[str, dict] = {}  # batch → 已公布的結算，照建立順
 PENDING: dict[tuple[int, int], dict] = {}  # (頻道, 傳圖的人) → 還沒按 ✅ 的草稿；追加的截圖會併進來
 SETTLEMENT_LOCKS: dict[str, asyncio.Lock] = {}
 CHANNEL_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+def draft_view() -> discord.ui.View:
+    return view_of(SLButton("✅ 確認", "sl:draft:ok", GREEN), SLButton("❌ 取消", "sl:draft:no", GREY))
+
+
+def settlement_view(state: dict) -> discord.ui.View:
+    batch = state["batch"]
+    claim = [SLButton("🙋 認領我的商品", f"sl:claim:{batch}", BLUE)] if settle.has_unclassified(state) else []
+    return view_of(*claim, SLButton("✏️ 改歸屬", f"sl:re:{batch}", GREY), SLButton("🏁 結束認領", f"sl:close:{batch}", RED))
+
+
+def can_manage(state: dict, user_id: int) -> bool:
+    """下單人和代傳的人可以確認、改歸屬、結束認領。"""
+    return user_id in (state["payer_id"], state.get("poster_id", state["payer_id"]))
 
 
 class SettleError(Exception):
@@ -426,22 +602,149 @@ def named_user(message: discord.Message):
 
 def load_settlements():
     if STATE_DIR and (Path(STATE_DIR) / "settlements.json").exists():
-        SETTLEMENTS.update(json.loads((Path(STATE_DIR) / "settlements.json").read_text(encoding="utf-8")))
+        try:
+            SETTLEMENTS.update(json.loads((Path(STATE_DIR) / "settlements.json").read_text(encoding="utf-8")))
+        except (OSError, ValueError, TypeError) as error:
+            print("[WARN] 本機結算快取讀取失敗，啟動時改從表格還原:", repr(error))
+
+
+LEDGER_SYNC = True
+LEDGER_DELAY = 2.0  # 連續幾個動作（一次認領好幾件）併成一次寫入
+LEDGER_RETRY_SECONDS = 5
+_ledger_synced: dict[str, str] = {}  # batch → 上次寫進表格時的內容
+_ledger_uncertain: dict[str, dict] = {}  # batch → 寫入結果待核對的請求及前一版雲端狀態
+_ledger_task = None
+
+
+def _snapshot(state: dict) -> str:
+    return json.dumps(state, ensure_ascii=False, sort_keys=True)
+
+
+def schedule_ledger_sync():
+    global _ledger_task
+    if not LEDGER_SYNC or not _sheet_ready:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _ledger_task is None or _ledger_task.done():
+        _ledger_task = loop.create_task(sync_ledger())
+
+
+async def sync_ledger(delay: float | None = None):
+    """把有變動的結算寫進表格的「結算紀錄」分頁（給人看）和隱藏的狀態分頁（主機壞了可以還原）。
+
+    寫不進去只記 log，不影響 Discord 上的操作；下次有變動時會再試。
+    """
+    if not LEDGER_SYNC:
+        return
+    await asyncio.sleep(LEDGER_DELAY if delay is None else delay)
+    retry_wait = LEDGER_RETRY_SECONDS
+    while True:
+        dirty = [(b, s) for b, s in list(SETTLEMENTS.items())
+                 if b in _ledger_uncertain or _ledger_synced.get(b) != _snapshot(s)]
+        if not dirty:
+            return
+        for batch, state in dirty:
+            try:
+                async with settlement_lock(batch):
+                    if batch not in _ledger_uncertain and _ledger_synced.get(batch) == _snapshot(state):
+                        continue
+                    proposed = deepcopy(state)
+                    await persist_settlement(proposed)
+                    state["_version"] = proposed["_version"]
+                    state["_updated_at"] = proposed["_updated_at"]
+                    save_settlements()
+            except Exception as e:
+                print(f"[WARN] 結算 {batch} 寫不進表格的結算紀錄:", repr(e))
+                await asyncio.sleep(retry_wait)
+                retry_wait = min(60, retry_wait * 2)
+                break
+
+
+async def reconcile_settlement(proposed: dict) -> bool:
+    """先核對前次未確認的寫入，回傳這次核准紀錄是否已在雲端完成。"""
+    batch = proposed["batch"]
+    uncertain = _ledger_uncertain.get(batch)
+    if uncertain is None:
+        return False
+    response = await sheet_call({"action": "states"})
+    if not response.ok:
+        raise sheets.SheetsError("前次結算更新的寫入結果仍待確認，請稍後重試")
+    canonical = response.json()["states"].get(batch)
+    if canonical is None or canonical == uncertain["previous"]:
+        _ledger_uncertain.pop(batch)
+        return False
+    if not isinstance(canonical, dict):
+        raise sheets.SheetsError("雲端結算狀態無法確認，請稍後重試")
+    desired, restored = deepcopy(proposed), deepcopy(canonical)
+    for key in ("_version", "_updated_at"):
+        desired.pop(key, None)
+        restored.pop(key, None)
+    resume_journal = (canonical == uncertain["state"] and desired == restored
+                      and any(key in canonical for key in ("commit_attempt", "append_attempt")))
+    current = SETTLEMENTS.get(batch)
+    if current is not None:
+        current.clear()
+        current.update(deepcopy(canonical))
+    proposed.clear()
+    proposed.update(deepcopy(canonical))
+    _ledger_uncertain.pop(batch)
+    _ledger_synced[batch] = _snapshot(canonical)
+    save_settlements()
+    if resume_journal:
+        return True
+    raise sheets.SheetsError("已從雲端確認前次結算更新，請依最新歸屬重試這次操作")
+
+
+async def persist_settlement(proposed: dict, released_ids=()):
+    """先將帳本、完整狀態與配對清理一起寫入，再由呼叫端提交記憶體變更。"""
+    if not LEDGER_SYNC and not released_ids:
+        return
+    if await reconcile_settlement(proposed):
+        return
+    snapshot = deepcopy(proposed)
+    current = SETTLEMENTS.get(proposed["batch"], {})
+    snapshot["_version"] = max(int(current.get("_version", 0)), int(snapshot.get("_version", 0))) + 1
+    snapshot["_updated_at"] = datetime.now(timezone.utc).isoformat()
+    payload = {"action": "ledger", "batch": snapshot["batch"], "state": snapshot,
+               "block": settle.ledger_block(snapshot, datetime.now().strftime("%Y-%m-%d %H:%M"))}
+    if released_ids:
+        payload["released_ids"] = list(dict.fromkeys(released_ids))
+    try:
+        response = await sheet_call(payload)
+        if not response.ok:
+            raise sheets.SheetsError("結算紀錄寫入失敗")
+    except Exception:
+        confirmed = False
+        try:
+            response = await sheet_call({"action": "states"})
+            confirmed = response.ok and response.json().get("states", {}).get(snapshot["batch"]) == snapshot
+        except Exception:
+            pass
+        if not confirmed:
+            _ledger_uncertain[snapshot["batch"]] = {
+                "state": snapshot,
+                "previous": json.loads(_ledger_synced[snapshot["batch"]])
+                if snapshot["batch"] in _ledger_synced else deepcopy(current),
+            }
+            raise
+    proposed.update(snapshot)
+    _ledger_synced[proposed["batch"]] = _snapshot(proposed)
 
 
 def save_settlements():
+    schedule_ledger_sync()
     if not STATE_DIR:
         return True
-    for old in list(SETTLEMENTS)[:-30]:
-        if not SETTLEMENTS[old].get("append_attempt"):
-            del SETTLEMENTS[old]
     try:
         tmp = Path(STATE_DIR) / "settlements.json.tmp"
         tmp.write_text(json.dumps(SETTLEMENTS, ensure_ascii=False), encoding="utf-8")
         tmp.replace(Path(STATE_DIR) / "settlements.json")
         return True
     except OSError as e:
-        print("[WARN] 結算紀錄存檔失敗（重啟後會無法認領）:", e)
+        print("[WARN] 本機結算快取存檔失敗:", e)
         return False
 
 
@@ -465,7 +768,7 @@ def _seen(shot: dict) -> tuple:
     return len(shot["items"]), len(shot["items"]) + shot["dropped"]
 
 
-async def _read_with(client, model: str, url: str, timeout: float | None = None) -> dict:
+async def _read_with(client, model: str, url: str, timeout: float | None = None, **extra) -> dict:
     """用指定的模型讀一張截圖。回傳讀不完整或不是 JSON 時重讀一次，取比較完整的那次。"""
     best = None
     for _ in range(2):
@@ -473,6 +776,7 @@ async def _read_with(client, model: str, url: str, timeout: float | None = None)
             client,
             model=model,
             max_tokens=2048,
+            **extra,
             messages=[{"role": "user", "content": [
                 {"type": "text", "text": settle.EXTRACT_PROMPT},
                 {"type": "image_url", "image_url": {"url": url}},
@@ -499,7 +803,8 @@ async def read_screenshot(data: bytes, mime: str) -> dict:
     if local_vision_client is not None and time.monotonic() >= local_vision_down_until:
         started = time.monotonic()
         try:
-            local = await _read_with(local_vision_client, LOCAL_VISION_MODEL, url, LOCAL_VISION_TIMEOUT)
+            local = await _read_with(local_vision_client, LOCAL_VISION_MODEL, url, LOCAL_VISION_TIMEOUT,
+                                     extra_body={"keep_alive": LOCAL_VISION_KEEP_ALIVE})
         except Exception as e:
             local_vision_down_until = time.monotonic() + LOCAL_VISION_COOLDOWN
             print(f"[WARN] 本地讀圖失敗（{type(e).__name__}: {e}），接下來 {LOCAL_VISION_COOLDOWN} 秒改用 Groq")
@@ -584,13 +889,13 @@ async def build_settlement(session: dict, shots: list[dict]) -> tuple[dict, list
         if errors:
             raise SettleError("沒辦法追加：\n" + "\n".join(f"- {e}" for e in errors))
 
-    resp = await post_to_n8n({"action": "list"}, N8N_SETTLE_WEBHOOK_URL)
+    resp = await sheet_call({"action": "list"})
     if not resp.ok:
-        raise SettleError(f"讀不到購物清單 QQ（n8n 回 {resp.status_code}）")
+        raise SettleError("讀不到購物清單 QQ")
     rows = resp.json()["rows"]
     if base is not None:
-        used = {row for u in base["units"] for it in u["items"] for row in it.get("rows", [])}
-        rows = [r for r in rows if settle.row_id(r) not in used]
+        used = {row for u in base["units"] for it in u["items"] for row in it.get("row_ids", []) if row}
+        rows = [r for r in rows if not r.get("id") or r["id"] not in used]
 
     payload = settle.match_payload(units, rows)
     writes, more = settle.assign(units, rows, payload, await match_rows(payload))
@@ -622,14 +927,17 @@ async def build_settlement(session: dict, shots: list[dict]) -> tuple[dict, list
     return state, writes, {}
 
 
-async def send_chunks(target: discord.Message, text: str, ping=False, register: dict | None = None) -> list:
+async def send_chunks(target, text: str, ping=False, register: dict | None = None, view=None,
+                      channel_only: bool = False) -> list:
     # 只 ping 人：商品名稱是從截圖讀來的，不能讓它觸發 @everyone 或身分組
     allowed = discord.AllowedMentions(everyone=False, roles=False, users=ping, replied_user=False)
     chunks = settle.split_message(text)
     sent = []
     for i, chunk in enumerate(chunks):
-        message = (await target.reply(chunk, allowed_mentions=allowed) if i == 0
-                   else await target.channel.send(chunk, allowed_mentions=allowed))
+        kw = {"allowed_mentions": allowed}
+        if view is not None and i == len(chunks) - 1:
+            kw["view"] = view  # 按鈕放在最後一段
+        message = await target.reply(chunk, **kw) if i == 0 and not channel_only else await target.channel.send(chunk, **kw)
         sent.append(message)
         if register is not None:
             register["message_ids"].append(message.id)
@@ -706,6 +1014,9 @@ async def handle_settle(message: discord.Message, append_to: dict | None = None)
             if PENDING.get(key) is not session:
                 await message.reply("剛剛那張草稿已經確認或取消了，這幾張沒有算進去。要另外結算的話，請重新傳並打「結算」。")
                 return
+            if session.get("write_started"):
+                await message.reply("這張草稿已經確認，請先在原草稿重試完成寫入，再傳其他截圖。")
+                return
             shots = session["shots"] + await read_images(images, first=len(session["shots"]) + 1)
             async with CHANNEL_LOCKS.setdefault(message.channel.id, asyncio.Lock()):
                 if session.get("append_to"):
@@ -718,7 +1029,7 @@ async def handle_settle(message: discord.Message, append_to: dict | None = None)
                                                       details["append_notes"], session.get("market_rate"))
                 else:
                     text = settle.render(state, final=False)
-                sent = await send_chunks(message, text)
+                sent = await send_chunks(message, text, view=draft_view())
                 old = session["drafts"]
                 session.update(shots=shots, state=state, writes=writes, drafts=sent, **details)
             for draft in old:
@@ -726,8 +1037,6 @@ async def handle_settle(message: discord.Message, append_to: dict | None = None)
                     await draft.delete()
                 except Exception as e:
                     print("[WARN] 刪不掉舊草稿:", e)
-            await safe_react(sent[-1], "✅")
-            await safe_react(sent[-1], "❌")
             restart_timer(key, session)
     except SettleError as e:
         await message.reply(str(e) + ("\n（之前的草稿還在，這幾張沒有併進去）" if session["state"] else ""))
@@ -770,12 +1079,10 @@ async def write_settlement(prompt, state: dict, writes: list[dict], retrying: bo
     if not writes:
         return ""
     try:
-        resp = await post_to_n8n(
-            {"action": "settle", "batch": state["batch"], "rows": writes}, N8N_SETTLE_WEBHOOK_URL
-        )
+        resp = await sheet_call({"action": "settle", "batch": state["batch"], "rows": writes})
     except Exception as e:
-        print("Error sending settle to n8n:", e)
-        await prompt.reply(n8n_failure_reply("結算", "寫進表格", e))
+        print("Error writing settlement to sheet:", repr(e))
+        await prompt.reply(sheet_failure_reply("結算", "寫進表格", e))
         return "retry"
     if resp.status_code == 409:
         problems = resp.json().get("problems", [])
@@ -787,7 +1094,7 @@ async def write_settlement(prompt, state: dict, writes: list[dict], retrying: bo
         )
         return "conflict"
     if not resp.ok:
-        await prompt.reply(f"結算結果寫進表格失敗 QQ（n8n 回 {resp.status_code}），請稍後再試。")
+        await prompt.reply("結算結果寫進表格失敗 QQ，請稍後再試。")
         return "retry"
     return ""
 
@@ -815,20 +1122,33 @@ async def confirm_append(key: tuple, session: dict):
             await prompt.reply("沒辦法追加：\n" + "\n".join(errors))
             return
         if not attempt:
-            state["append_attempt"] = {
+            proposed = deepcopy(state)
+            proposed["append_attempt"] = {
                 "added_units": deepcopy(session["added_units"]), "writes": deepcopy(session["writes"]),
                 "notes": list(session["append_notes"]), "base_revision": session["base_revision"],
                 "prompt_id": prompt.id, "submitter_id": key[1],
             }
-            if not save_settlements():
-                state.pop("append_attempt")
-                await prompt.reply("追加確認紀錄存檔失敗，請稍後按 ✅ 重試。")
-                return
+        else:
+            proposed = deepcopy(state)
         session["write_started"] = True
+        try:
+            await persist_settlement(proposed)
+        except Exception as e:
+            state.update(proposed)
+            save_settlements()
+            print("[WARN] 追加確認紀錄無法確認寫入結果:", repr(e))
+            await prompt.reply("追加確認紀錄的寫入結果仍待確認，已保留這張草稿，請稍後重試。")
+            return
+        state.update(proposed)
+        save_settlements()
         outcome = await write_settlement(prompt, combined, session["writes"], retrying=bool(attempt))
         if outcome:
             if outcome == "conflict" and not attempt:
-                state.pop("append_attempt", None)
+                proposed = deepcopy(state)
+                proposed.pop("append_attempt", None)
+                await persist_settlement(proposed)
+                state.clear()
+                state.update(proposed)
                 save_settlements()
                 discard_draft(key, session)
             else:
@@ -838,6 +1158,14 @@ async def confirm_append(key: tuple, session: dict):
 
         combined["notes"] = list(state.get("notes") or []) + session["append_notes"]
         combined["append_revision"] = state.get("append_revision", 0) + 1
+        combined.pop("append_attempt", None)
+        try:
+            await persist_settlement(combined)
+        except Exception as e:
+            print("[WARN] 追加結果無法寫進帳本:", repr(e))
+            restart_timer(key, session)
+            await prompt.reply("追加已送出，結算紀錄仍在等待寫入，請稍後再按確認完成。")
+            return
         state.update(combined)
         state.pop("append_attempt", None)
         save_settlements()
@@ -848,8 +1176,7 @@ async def confirm_append(key: tuple, session: dict):
             people = [discord.Object(id=int(mention[2:-1].lstrip("!")))
                       for name in changed if (mention := state["mentions"].get(name, "")).startswith("<@")]
             text = settle.render_append_result(before, state, added)
-            sent = await send_chunks(prompt, text, ping=people, register=state)
-            await safe_react(sent[-1], CLOSE_EMOJI)
+            await send_chunks(prompt, text, ping=people, register=state, view=settlement_view(state))
         except Exception as e:
             print(f"[ERROR] 結算 {state['batch']} 已追加，但通知送不出去:", repr(e))
             await prompt.reply("追加已完成並存檔，但更新金額的通知送出失敗，請查看 bot log。")
@@ -871,17 +1198,63 @@ async def confirm_draft(key: tuple, session: dict, message_id: int, ok: bool):
         if session.get("append_to"):
             await confirm_append(key, session)
             return
-        if await write_settlement(prompt, state, writes):
-            discard_draft(key, session)
+        attempt = state.get("commit_attempt")
+        if not attempt:
+            if writes:
+                try:
+                    response = await sheet_call({"action": "validate_settle", "batch": state["batch"], "rows": writes})
+                except Exception as e:
+                    print("[WARN] 結算預檢失敗:", repr(e))
+                    await prompt.reply("暫時讀不到表格，請稍後再按確認。")
+                    return
+                if response.status_code != 409 and not response.ok:
+                    discard_draft(key, session)
+                    await prompt.reply("結算結果寫進表格失敗 QQ，請稍後再試。")
+                    return
+                if not response.ok:
+                    discard_draft(key, session)
+                    await prompt.reply("表格在這幾分鐘內被改過，請重新傳截圖確認：\n" + "\n".join(
+                        f"- {p['tab']} 第 {p['row']} 列：{p['reason']}" for p in response.json().get("problems", [])))
+                    return
+            proposed = deepcopy(state)
+            proposed["commit_attempt"] = {"writes": writes, "prompt_id": prompt.id, "submitter_id": key[1]}
+        else:
+            proposed = deepcopy(state)
+        session["write_started"] = True
+        try:
+            await persist_settlement(proposed)
+        except Exception as e:
+            state.update(proposed)
+            SETTLEMENTS[state["batch"]] = state
+            save_settlements()
+            print("[WARN] 結算確認紀錄無法確認寫入結果:", repr(e))
+            await prompt.reply("結算確認紀錄的寫入結果仍待確認，已保留這張草稿，請稍後重試。")
             return
+        state.update(proposed)
+        SETTLEMENTS[state["batch"]] = state
+        save_settlements()
+        if await write_settlement(prompt, state, writes, retrying=bool(attempt)):
+            restart_timer(key, session)
+            return
+
+        proposed = deepcopy(state)
+        proposed.pop("commit_attempt", None)
+        try:
+            await persist_settlement(proposed)
+        except Exception as e:
+            print("[WARN] 結算結果無法寫進帳本:", repr(e))
+            restart_timer(key, session)
+            await prompt.reply("結算已送出，結算紀錄仍在等待寫入，請稍後再按確認完成。")
+            return
+        state.clear()
+        state.update(proposed)
 
         state["mentions"] = await member_mentions(session["guild"], state)
         SETTLEMENTS[state["batch"]] = state
         save_settlements()
         discard_draft(key, session)
-        sent = await send_chunks(prompt, settle.render(state, final=True, mentions=state["mentions"]), ping=True, register=state)
-        if settle.has_unclassified(state):
-            await safe_react(sent[-1], CLOSE_EMOJI)
+        await send_chunks(prompt, settle.render(state, final=True, mentions=state["mentions"]),
+                          ping=True, register=state, view=settlement_view(state))
 
 
 def claim_numbers(text: str) -> list[int]:
@@ -894,15 +1267,8 @@ def claim_numbers(text: str) -> list[int]:
     return list(dict.fromkeys(nos))
 
 
-async def handle_claim(message: discord.Message, nos: list[int]):
-    if len(nos) > MAX_CLAIMS:
-        await message.reply(f"一次最多認領 {MAX_CLAIMS} 件，請分幾次打 🙏")
-        return
-
-    pool = [s for s in SETTLEMENTS.values() if s["channel_id"] == message.channel.id]
-    replied_to = message.reference.message_id if message.reference else None
-    replied = next((s for s in pool if replied_to in s["message_ids"]), None)
-
+async def apply_claims(pool: list[dict], replied: dict | None, nos: list[int], target) -> tuple[dict, list[str]]:
+    """把這些編號認領給 target。回傳 ({batch: [認領成功的編號]}, [沒領到的原因])。"""
     def find_state(no):
         if replied:
             return replied
@@ -911,23 +1277,65 @@ async def handle_claim(message: discord.Message, nos: list[int]):
         return (next((s for s in reversed(pool) if open_item(s)), None)
                 or next((s for s in reversed(pool) if not s.get("closed") and settle.find_item(s, no)[1]), None))
 
-    target = named_user(message) or message.author
-    claimed: dict[str, list[int]] = {}  # batch → 認領成功的編號
-    failed = []
+    claimed: dict[str, list[int]] = {}
+    failures = {}
+    grouped = {}
     for no in nos:
         state = find_state(no)
         if state is None:
-            error = f"找不到還沒人認領的 #{no} 🙅"
-        else:
-            async with settlement_lock(state["batch"]):
-                error = settle.claim(state, no, target.name)
-                if not error:
-                    state["mentions"][target.name] = target.mention
-                    save_settlements()
-        if error:
-            failed.append(error)
-        else:
-            claimed.setdefault(state["batch"], []).append(no)
+            failures[no] = f"找不到還沒人認領的 #{no} 🙅"
+            continue
+        grouped.setdefault(state["batch"], (state, []))[1].append(no)
+    for batch, (state, numbers) in grouped.items():
+        async with settlement_lock(batch):
+            proposed, done = deepcopy(state), []
+            for no in numbers:
+                error = settle.claim(proposed, no, target.name)
+                if error:
+                    failures[no] = error
+                else:
+                    done.append(no)
+            if not done:
+                continue
+            proposed["mentions"][target.name] = target.mention
+            try:
+                await persist_settlement(proposed)
+            except Exception as e:
+                print("[WARN] 認領寫入失敗:", repr(e))
+                failures.update({no: f"#{no} 的認領暫時無法寫進表格，請稍後重試。" for no in done})
+                continue
+            state.update(proposed)
+            save_settlements()
+            claimed[batch] = done
+    return claimed, [failures[no] for no in nos if no in failures]
+
+
+def claim_message(state: dict, done: list[int], target, failed: list[str]) -> str:
+    items = [settle.find_item(state, no)[1] for no in done]
+    if len(items) == 1:
+        head = f"#{done[0]} {items[0]['name']} 算在 {target.mention} 名下 ✅"
+    else:
+        head = f"{len(items)} 件算在 {target.mention} 名下 ✅\n" + "\n".join(f"#{it['no']} {it['name']}" for it in items)
+    if failed:
+        head += "\n\n沒有認領到：\n" + "\n".join(f"- {e}" for e in failed)
+    tail = (
+        f"{state['payer']} 按 🏁 可以結束認領，剩下的算 {state['payer']} 自己的"
+        if settle.has_unclassified(state)
+        else f"全部都有人認領了，{state['payer']} 按 🏁 公布最終金額並通知大家"
+    )
+    return f"{head}\n\n**結算 {state['batch']} 更新後：**\n{settle.render_totals(state, state['mentions'])}\n\n{tail}"
+
+
+async def handle_claim(message: discord.Message, nos: list[int]):
+    if len(nos) > MAX_CLAIMS:
+        await message.reply(f"一次最多認領 {MAX_CLAIMS} 件，請分幾次打 🙏")
+        return
+
+    pool = [s for s in SETTLEMENTS.values() if s["channel_id"] == message.channel.id and not s.get("commit_attempt")]
+    replied_to = message.reference.message_id if message.reference else None
+    replied = next((s for s in pool if replied_to in s["message_ids"]), None)
+    target = named_user(message) or message.author
+    claimed, failed = await apply_claims(pool, replied, nos, target)
 
     if not claimed:
         if len(failed) == 1 and failed[0].startswith("找不到"):
@@ -937,35 +1345,226 @@ async def handle_claim(message: discord.Message, nos: list[int]):
 
     for i, (batch, done) in enumerate(claimed.items()):
         state = SETTLEMENTS[batch]
-        state["mentions"][target.name] = target.mention
-        items = [settle.find_item(state, no)[1] for no in done]
-        if len(items) == 1:
-            head = f"#{done[0]} {items[0]['name']} 算在 {target.mention} 名下 ✅"
-        else:
-            head = f"{len(items)} 件算在 {target.mention} 名下 ✅\n" + "\n".join(f"#{it['no']} {it['name']}" for it in items)
-        if failed and i == len(claimed) - 1:
-            head += "\n\n沒有認領到：\n" + "\n".join(f"- {e}" for e in failed)
-        tail = (
-            f"{state['payer']} 按 🏁 可以結束認領，剩下的算 {state['payer']} 自己的"
-            if settle.has_unclassified(state)
-            else f"全部都有人認領了，{state['payer']} 按 🏁 公布最終金額並通知大家"
-        )
-        text = f"{head}\n\n**結算 {batch} 更新後：**\n{settle.render_totals(state, state['mentions'])}\n\n{tail}"
-        chunks = settle.split_message(text)
-        reply = await message.reply(chunks[0], allowed_mentions=discord.AllowedMentions(users=[target]))
-        for chunk in chunks[1:]:
-            reply = await message.channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
-        state["message_ids"].append(reply.id)  # 回覆這則也能找到同一次結算，在這則按 🏁 也有效
-        await safe_react(reply, CLOSE_EMOJI)
+        chunks = settle.split_message(claim_message(state, done, target, failed if i == len(claimed) - 1 else []))
+        reply = await message.reply(chunks[0], allowed_mentions=discord.AllowedMentions(users=[target]),
+                                    **({"view": settlement_view(state)} if len(chunks) == 1 else {}))
+        for j, chunk in enumerate(chunks[1:], 2):
+            reply = await message.channel.send(chunk, allowed_mentions=discord.AllowedMentions.none(),
+                                               **({"view": settlement_view(state)} if j == len(chunks) else {}))
+        state["message_ids"].append(reply.id)  # 回覆這則也能找到同一次結算
     save_settlements()
+
+
+# -------------------------------------------------
+#  改歸屬：下單人把某件商品改給別人（對錯人，或幫沒上線的人指定）
+# -------------------------------------------------
+REASSIGN_RE = re.compile(r"^(改歸屬|改)\s*#?\s*\d")
+
+
+async def apply_reassign(state: dict, nos: list[int], target) -> tuple[bool, str]:
+    """回傳 (有沒有改到, 要給大家看的訊息)。"""
+    done, failed, released = [], [], []
+    async with settlement_lock(state["batch"]):
+        proposed = deepcopy(state)
+        for no in nos:
+            item = settle.find_item(proposed, no)[1]
+            row_ids = (item.get("row_ids") or []) if item else []
+            if item and item.get("rows") and (len(row_ids) != len(item["rows"]) or not all(row_ids)):
+                failed.append(f"#{no} 的舊版表格對應還無法唯一確認，請先核對原登記列。")
+                continue
+            error, row_ids = settle.reassign(proposed, no, target.name)
+            if error:
+                failed.append(error)
+            else:
+                done.append(no)
+                released += row_ids
+        if done:
+            proposed["mentions"][target.name] = target.mention
+            try:
+                await persist_settlement(proposed, released)
+            except Exception as e:
+                print("[WARN] 改歸屬寫入失敗:", repr(e))
+                return False, "改歸屬的表格更新暫時失敗，請稍後重試。"
+            state.update(proposed)
+            save_settlements()
+    if not done:
+        return False, failed[0] if len(failed) == 1 else "沒有改到任何一件：\n" + "\n".join(f"- {e}" for e in failed)
+    head = f"✏️ {'、'.join(f'#{n}' for n in done)} 改算在 {target.mention} 名下"
+    if failed:
+        head += "\n\n注意：\n" + "\n".join(f"- {e}" for e in failed)
+    return True, f"{head}\n\n**結算 {state['batch']} 更新後：**\n{settle.render_totals(state, state['mentions'])}"
+
+
+async def handle_reassign(message: discord.Message, nos: list[int]):
+    pool = [s for s in SETTLEMENTS.values() if s["channel_id"] == message.channel.id and not s.get("closed") and not s.get("commit_attempt")]
+    state = replied_settlement(message) or next(
+        (s for s in reversed(pool) if any(settle.find_item(s, n)[1] for n in nos)), None)
+    if state is None:
+        await message.reply("找不到有這個編號、而且還在認領中的結算 🙅")
+        return
+    if not can_manage(state, message.author.id):
+        await message.reply(f"只有下單人（{state['payer']}）或代傳的人可以改歸屬。")
+        return
+    target = named_user(message)
+    if target is None:
+        await message.reply("要改給誰？請打 `改 3 @某人`（可以一次改好幾件：`改 3 5 @某人`）。")
+        return
+    ok, text = await apply_reassign(state, nos, target)
+    reply = await message.reply(text, allowed_mentions=discord.AllowedMentions(users=[target]),
+                                **({"view": settlement_view(state)} if ok else {}))
+    if ok:
+        state["message_ids"].append(reply.id)
+        save_settlements()
+
+
+async def close_settlement(state: dict, channel, ref_message_id: int) -> str:
+    """結束認領並公布最終金額。回傳空字串代表完成，否則是不能結束的原因。"""
+    async with settlement_lock(state["batch"]):
+        if state.get("closed"):
+            return f"結算 {state['batch']} 已經結束認領了。"
+        if state.get("append_attempt") or state.get("commit_attempt"):
+            return "這筆結算的追加已確認，表格寫入結果仍待確認，請先在追加草稿按 ✅ 重試完成，再按 🏁。"
+        proposed = deepcopy(state)
+        settle.close(proposed)
+        try:
+            await persist_settlement(proposed)
+        except Exception as e:
+            print("[WARN] 結束認領寫入失敗:", repr(e))
+            return "結束認領的表格更新暫時失敗，請稍後重試。"
+        state.update(proposed)
+        save_settlements()
+        try:
+            ref = discord.MessageReference(message_id=ref_message_id, channel_id=channel.id, fail_if_not_exists=False)
+            allowed = discord.AllowedMentions(everyone=False, roles=False, users=True)
+            for i, chunk in enumerate(settle.split_message(settle.render_closed(state, state["mentions"]))):
+                await channel.send(chunk, reference=ref if i == 0 else None, allowed_mentions=allowed)
+        except Exception as e:
+            print(f"[ERROR] 結算 {state['batch']} 已結束認領，但公布訊息送不出去:", repr(e))
+    return ""
+
+
+# -------------------------------------------------
+#  按鈕和選單按下去之後
+# -------------------------------------------------
+def _option(item: dict, description: str) -> discord.SelectOption:
+    return discord.SelectOption(label=f"#{item['no']} {item['name']}"[:100], value=str(item["no"]), description=description[:100])
+
+
+async def on_component(interaction, custom_id: str, values: list):
+    prefix, kind, *args = custom_id.split(":")
+    user, msg = interaction.user, interaction.message
+
+    if kind == "draft":
+        hit = next(((k, v) for k, v in PENDING.items() if v["drafts"] and v["drafts"][-1].id == msg.id), None)
+        if hit is None:
+            await ephemeral(interaction, "這張草稿已經確認、取消、過期，或被新的草稿取代了。")
+        elif user.id not in (hit[1]["payer"].id, hit[1]["poster"].id):
+            await ephemeral(interaction, "只有下單人或代傳的人可以按。")
+        else:
+            await interaction.response.defer()
+            await confirm_draft(hit[0], hit[1], msg.id, args[0] == "ok")
+        return
+
+    if kind == "del":
+        pending = DELETE_CHOICES.get((interaction.channel.id, user.id))
+        if not pending or str(pending["id"]) != args[0] or pending.get("prompt_id") != msg.id:
+            await ephemeral(interaction, "這不是你的刪除選項，或選項已經過期了。")
+            return
+        await interaction.response.defer()
+        asker = SimpleNamespace(author=user, channel=interaction.channel, content=f"刪除 {args[1]}", reply=msg.reply)
+        await confirm_delete_choice(asker, int(args[1]), expected_choice_id=args[0])
+        return
+
+    if kind == "dup":
+        pending = ADD_PENDING.get(args[0])
+        if not pending or pending["expires"] <= time.monotonic():
+            ADD_PENDING.pop(args[0], None)
+            await ephemeral(interaction, "這個選項已經過期了，還要加的話請重新打一次。")
+        elif pending["user_id"] != user.id:
+            await ephemeral(interaction, "這是別人的登記，只有他自己可以決定。")
+        elif pending.get("prompt_id") != msg.id or pending.get("channel_id") != interaction.channel.id:
+            await ephemeral(interaction, "請使用這次登記訊息上的選項。")
+        else:
+            ADD_PENDING.pop(args[0])
+            await interaction.response.defer()
+            if args[1] == "y":
+                await send_add(SimpleNamespace(author=user, reply=msg.reply), {**pending["payload"], "force": True})
+            else:
+                await msg.reply("好，沒有重複登記。")
+        return
+
+    # 以下都是某一筆已公布的結算上的操作
+    state = SETTLEMENTS.get(args[0])
+    if state is None or state["channel_id"] != interaction.channel.id:
+        await ephemeral(interaction, "找不到這筆結算的紀錄（可能是太久以前的了）。")
+        return
+    if state.get("closed"):
+        await ephemeral(interaction, f"結算 {state['batch']} 已經結束認領了，有問題請直接找下單的人。")
+        return
+    if state.get("commit_attempt"):
+        await ephemeral(interaction, "這筆結算正在完成表格回寫，請稍後再操作。")
+        return
+    batch = state["batch"]
+    rate_of = {it["no"]: u["rate"] for u in state["units"] for it in u["items"]}
+    all_items = [it for u in state["units"] for it in u["items"]]
+
+    if kind == "claim" and prefix == "sl":
+        mine = [it for it in all_items if settle.is_unclassified(it)]
+        if not mine:
+            await ephemeral(interaction, "已經沒有待認領的商品了。")
+            return
+        options = [_option(it, f"×{it['qty']}　¥{it['line']:.2f} ≈ TWD {it['line'] * rate_of[it['no']]:,.0f}") for it in mine[:25]]
+        more = "\n（只列出前 25 件，其他請打 `認領 編號`）" if len(mine) > 25 else ""
+        await ephemeral(interaction, f"選出你的商品，可以一次選好幾件：{more}",
+                        view_of(SLSelect(f"sls:claim:{batch}", options, "選你的商品", max_values=len(options))))
+    elif kind == "claim":
+        await interaction.response.defer()
+        claimed, failed = await apply_claims([state], state, [int(v) for v in values], user)
+        if not claimed:
+            await interaction.edit_original_response(content="沒有認領到：\n" + "\n".join(f"- {e}" for e in failed), view=None)
+            return
+        await interaction.edit_original_response(content="認領好了 ✅", view=None)
+        await send_chunks(interaction, claim_message(state, claimed[batch], user, failed), ping=[user],
+                          register=state, view=settlement_view(state), channel_only=True)
+
+    elif kind == "re":
+        if not can_manage(state, user.id):
+            await ephemeral(interaction, f"只有下單人（{state['payer']}）或代傳的人可以改歸屬。")
+        elif prefix == "sl":
+            who = lambda it: "、".join("沒人認領" if x["owner"] == settle.UNCLASSIFIED else x["owner"] for x in it["shares"])
+            options = [_option(it, f"目前：{who(it)}") for it in all_items[:25]]
+            more = "\n（只列出前 25 件，其他請打 `改 編號 @某人`）" if len(all_items) > 25 else ""
+            await ephemeral(interaction, f"要改哪幾件？{more}",
+                            view_of(SLSelect(f"sls:re:{batch}", options, "選商品", max_values=min(10, len(options)))))
+        elif prefix == "sls":
+            picked = "、".join(f"#{v}" for v in values)
+            await interaction.response.edit_message(
+                content=f"要把 {picked} 改給誰？", view=view_of(SLUserSelect(f"slu:re:{batch}:{'.'.join(values)}", "選一個人")))
+        else:
+            target = values[0]
+            if getattr(target, "bot", False):
+                await interaction.response.edit_message(content="不能改給機器人，請重新按「改歸屬」。", view=None)
+                return
+            await interaction.response.defer()
+            ok, text = await apply_reassign(state, [int(n) for n in args[1].split(".")], target)
+            await interaction.edit_original_response(content="改好了 ✅" if ok else text, view=None)
+            if ok:
+                await send_chunks(interaction, text, ping=[target], register=state,
+                                  view=settlement_view(state), channel_only=True)
+
+    elif kind == "close":
+        if not can_manage(state, user.id):
+            await ephemeral(interaction, f"只有下單人（{state['payer']}）或代傳的人可以結束認領。")
+            return
+        await interaction.response.defer()
+        reason = await close_settlement(state, interaction.channel, msg.id)
+        if reason:
+            await interaction.followup.send(reason, ephemeral=True)
 
 
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    """草稿上的 ✅／❌ 確認或取消；結算訊息上的 🏁 結束認領。
-
-    用 raw 事件：bot 重啟後、訊息不在快取裡也收得到。
-    """
+    """主要的操作方式是按鈕。手動加表情也還是有效：草稿上的 ✅／❌、結算訊息上的 🏁。"""
     emoji = str(payload.emoji)
     if bot.user and payload.user_id == bot.user.id:
         return
@@ -984,23 +1583,10 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if payload.user_id not in (state["payer_id"], state.get("poster_id", state["payer_id"])):
         return
 
-    async with settlement_lock(state["batch"]):
-        if state.get("closed"):
-            return
-        if state.get("append_attempt"):
-            channel = bot.get_channel(payload.channel_id) or await bot.fetch_channel(payload.channel_id)
-            await channel.send("這筆結算的追加已確認，表格寫入結果仍待確認，請先在追加草稿按 ✅ 重試完成，再按 🏁。")
-            return
-        settle.close(state)
-        save_settlements()
-        try:
-            channel = bot.get_channel(payload.channel_id) or await bot.fetch_channel(payload.channel_id)
-            ref = discord.MessageReference(message_id=payload.message_id, channel_id=payload.channel_id, fail_if_not_exists=False)
-            allowed = discord.AllowedMentions(everyone=False, roles=False, users=True)
-            for i, chunk in enumerate(settle.split_message(settle.render_closed(state, state["mentions"]))):
-                await channel.send(chunk, reference=ref if i == 0 else None, allowed_mentions=allowed)
-        except Exception as e:
-            print(f"[ERROR] 結算 {state['batch']} 已結束認領，但公布訊息送不出去:", repr(e))
+    channel = bot.get_channel(payload.channel_id) or await bot.fetch_channel(payload.channel_id)
+    reason = await close_settlement(state, channel, payload.message_id)
+    if reason and not state.get("closed"):
+        await channel.send(reason)
 
 
 @bot.event
@@ -1013,11 +1599,109 @@ async def on_ready():
     print(f"LLM: Groq {GROQ_MODEL} ✓")
     reader = f"本地 {LOCAL_VISION_MODEL} @ {LOCAL_VISION_URL}（失敗退回 Groq {VISION_MODEL}）" if LOCAL_VISION_URL else f"Groq {VISION_MODEL}"
     print(f"結算: 讀圖 {reader}，已載入 {len(SETTLEMENTS)} 筆結算紀錄")
+    await prepare_sheet()
+    await recover_commits()
     await recover_appends()
 
 
+_sheet_ready = False
+
+
+def migrate_row_ids(state: dict, rows: list[dict]):
+    """舊紀錄只在批次、買家與實際價格能唯一對應時補固定 ID。"""
+    used = {row_id for unit in state["units"] for item in unit["items"] for row_id in item.get("row_ids", []) if row_id}
+    for unit in state["units"]:
+        for item in unit["items"]:
+            row_ids = item.get("row_ids") or []
+            if not item.get("rows") or (len(row_ids) == len(item["rows"]) and all(row_ids)):
+                continue
+            resolved = []
+            owners = {share["owner"] for share in item["shares"]}
+            amounts = [share["cny"] for share in item["shares"]] + [item["line"]]
+            for index, label in enumerate(item["rows"]):
+                if index < len(row_ids) and row_ids[index]:
+                    resolved.append(row_ids[index])
+                    continue
+                tab = next((tab for tab in sheets.TABS if str(label).startswith(tab)), None)
+                candidates = [row for row in rows if row["tab"] == tab and row["batch"] == state["batch"]
+                              and row["buyer"] in owners and row.get("id") and row["id"] not in used
+                              and row["id"] not in resolved]
+                matching = []
+                for row in candidates:
+                    try:
+                        same_price = any(abs(float(row["price"]) - value) < 0.005 for value in amounts)
+                    except (TypeError, ValueError):
+                        same_price = False
+                    if same_price:
+                        matching.append(row)
+                if len(matching) != 1:
+                    break
+                row_id = matching[0]["id"]
+                resolved.append(row_id)
+            if len(resolved) == len(item["rows"]):
+                item["row_ids"] = resolved
+                used.update(resolved)
+
+
+async def prepare_sheet():
+    """啟動時確認表格有需要的欄位和分頁；本機沒有的結算紀錄從表格還原。"""
+    global _sheet_ready
+    if _sheet_ready:
+        return
+    try:
+        done = (await sheet_call({"action": "layout"})).json()["done"]
+        print("表格: " + ("、".join(done) if done else "欄位和分頁都齊全"))
+        saved = (await sheet_call({"action": "states"})).json()["states"]
+        restored = []
+        merged = dict(SETTLEMENTS)
+        for batch, state in saved.items():
+            local = merged.get(batch)
+            if local is None or int(state.get("_version", 0)) >= int(local.get("_version", 0)):
+                merged[batch] = state
+                restored.append(batch)
+        SETTLEMENTS.clear()
+        SETTLEMENTS.update(dict(sorted(merged.items())))
+        rows = (await sheet_call({"action": "all_rows"})).json()["rows"]
+        for batch, state in SETTLEMENTS.items():
+            migrate_row_ids(state, rows)
+            if saved.get(batch) == json.loads(_snapshot(state)):
+                _ledger_synced[batch] = _snapshot(state)
+        if restored:
+            print(f"結算: 從表格還原 {len(restored)} 筆結算紀錄")
+        _sheet_ready = True
+        save_settlements()
+        await sync_ledger(delay=0)
+    except Exception as e:
+        print("[ERROR] 表格準備失敗:", repr(e))
+
+
+async def recover_commits():
+    """接續已確認、尚未完成表格回寫的新結算。"""
+    for state in list(SETTLEMENTS.values()):
+        attempt = state.get("commit_attempt")
+        if not attempt:
+            continue
+        key = (state["channel_id"], attempt["submitter_id"])
+        if key in PENDING:
+            continue
+        try:
+            channel = bot.get_channel(state["channel_id"]) or await bot.fetch_channel(state["channel_id"])
+            prompt = await channel.fetch_message(attempt["prompt_id"])
+            session = PENDING[key] = {
+                "batch": state["batch"], "channel_id": state["channel_id"],
+                "payer": SimpleNamespace(name=state["payer"], id=state["payer_id"]),
+                "poster": SimpleNamespace(name=state.get("poster") or state["payer"],
+                                          id=state.get("poster_id", state["payer_id"])),
+                "lock": asyncio.Lock(), "guild": channel.guild, "drafts": [prompt], "timer": None,
+                "state": state, "writes": attempt["writes"], "shots": [], "write_started": True,
+            }
+            await confirm_draft(key, session, prompt.id, True)
+        except Exception as e:
+            print(f"[ERROR] 無法接續結算 {state['batch']} 的回寫:", repr(e))
+
+
 async def recover_appends():
-    """重啟後接續已按 ✅ 且已存檔的追加，n8n 會接受同批次相同金額的重試。"""
+    """重啟後接續已按 ✅ 且已存檔的追加。同批次、相同金額的寫入可以安全地重送。"""
     for state in list(SETTLEMENTS.values()):
         attempt = state.get("append_attempt")
         if not attempt:
@@ -1074,6 +1758,11 @@ async def on_message(message: discord.Message):
     claim_match = CLAIM_RE.match(text)
     if claim_match:
         await handle_claim(message, claim_numbers(text))
+        await bot.process_commands(message)
+        return
+
+    if REASSIGN_RE.match(text):
+        await handle_reassign(message, claim_numbers(re.sub(r"^(改歸屬|改)", "", text)))
         await bot.process_commands(message)
         return
 
@@ -1173,7 +1862,6 @@ async def on_message(message: discord.Message):
 
     payload = {
         "action": "add",
-        "fullText": text,
         "shareText": text,
         "itemName": item_name,
         "quantity": quantity,
@@ -1181,29 +1869,9 @@ async def on_message(message: discord.Message):
         "url": url,
         "senderId": str(message.author.id),
         "senderName": message.author.name,
-        "channelId": str(message.channel.id),
-        "createdAt": message.created_at.isoformat(),
     }
-
-    try:
-        resp = await post_to_n8n(payload)
-        print("Sent ADD to n8n:", resp.status_code, resp.text[:200])
-
-        await safe_react(message, "⏳", remove=True)
-
-        if resp.ok:
-            summary_parts = [f"{quantity} 件"]
-            if model_spec:
-                summary_parts.append(model_spec)
-            summary_parts.append(f"「{item_name}」")
-            summary = " ".join(summary_parts)
-            await message.reply(f"已把 {summary} 加入購物清單 🧾")
-        else:
-            await message.reply("新增請求傳到 n8n 失敗 QQ")
-    except Exception as e:
-        print("Error sending add to n8n:", e)
-        await safe_react(message, "⏳", remove=True)
-        await message.reply(n8n_failure_reply("新增", "寫進表格", e))
+    await send_add(message, payload)
+    await safe_react(message, "⏳", remove=True)
 
     await bot.process_commands(message)
 
@@ -1212,5 +1880,6 @@ async def on_message(message: discord.Message):
 #  入口
 # -------------------------------------------------
 if __name__ == "__main__":
+    get_store()  # 缺設定就在這裡停下來，不要等到有人用才發現
     load_settlements()
     bot.run(DISCORD_TOKEN)

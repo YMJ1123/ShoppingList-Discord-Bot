@@ -1,9 +1,11 @@
 
 # Shopping List Discord Bot
 
-Discord 購物清單 bot，使用 **AI（Groq，預設 `openai/gpt-oss-120b`）** 自然語言解析 `買` 指令，將商品資訊送到 n8n Webhook，再由 n8n 寫入 Google 試算表。
+Discord 購物清單 bot，使用 **AI（Groq，預設 `openai/gpt-oss-120b`）** 自然語言解析 `買` 和 `刪除` 指令。此分支的 v2 由 Python 直接讀寫 Google 試算表。
 下單的人付款後傳淘寶 App 截圖，bot 會算出每個人應付的台幣。
-A Discord bot that uses **AI-powered natural language processing (Groq, `openai/gpt-oss-120b` by default)** to parse `買` commands and forward structured data to an n8n webhook, which appends rows to a Google Sheet. It can also read order screenshots and split the bill.
+A Discord bot that uses **AI-powered natural language processing (Groq, `openai/gpt-oss-120b` by default)** to manage a shopping list directly in Google Sheets, read order screenshots, and split the bill.
+
+v2 的使用方式見 [USAGE.md](USAGE.md)。本文件後半保留原 n8n workflow 的設定，供既有部署維護時參考。
 
 ---
 
@@ -22,12 +24,13 @@ A Discord bot that uses **AI-powered natural language processing (Groq, `openai/
   - **商品數量**：支援中文數字（兩台 → 2、三個 → 3）
   - **購買人**：Discord username
   - **平台**：依分享文字／網址自動辨識「淘寶 / 京東」
-- 透過 n8n：
-  - 使用 `Code` 節點解析 payload（優先使用 AI 預解析的欄位）
-  - 使用 `Switch` 節點依 `platform` 分流
-  - 將 **淘寶訂單寫入 Sheet「淘寶」**、**京東訂單寫入 Sheet「京東」**
+- 直接讀寫 Google Sheets
+  - 將 **淘寶商品寫入「淘寶」**、**京東商品寫入「京東」**分頁
+  - 每列補上隱藏的固定 ID，刪除與結算寫入前會重新定位商品
+  - 「結算紀錄」分頁列出商品歸屬、人民幣、分攤台幣與每人小計，隱藏的 `_bot` 分頁保存完整恢復狀態
 - **刪除**：自然語言（`刪除電動牙刷`、`小米風扇不用買了`）或 `~刪除 <網址>`。只能刪自己加的；
   網址用**商品 ID** 比對，所以追蹤參數不同的連結也認得出是同一件
+- 刪除對到多筆時會提供選擇按鈕；同一人重複登記同商品時會先詢問是否再加一筆
 - 429 rate limit 自動重試機制
 - **結算**（詳見 [USAGE.md](USAGE.md) 的「結算」一節）：
   - 下單的人把淘寶 App 截圖和「結算」一起傳上來，bot 用視覺模型讀出品項和價格，對到清單上的登記人
@@ -35,14 +38,17 @@ A Discord bot that uses **AI-powered natural language processing (Groq, `openai/
   - 先貼草稿，下單人按 ✅ 才寫回表格（「實際價格」「結算批次」）並公布；按 ✅ 前追加的截圖會併進同一張草稿
   - 對不到人的商品列為 unclassified，用 `認領 N` 認領；下單人按 🏁 結束認領，剩下的算下單人自己的
   - `結算 @某人` 可以幫付錢的人代傳；同一件商品之前結算過時，草稿會提醒可能重複結算
+- 草稿提供確認／取消按鈕，公布後提供認領選單、改歸屬與結束認領按鈕，既有文字指令及表情操作仍可使用
+- 下單人或代傳人可用 `改 3 5 @某人` 更正商品歸屬
 
 ---
 
 ## Requirements / 環境需求
 
 - Python 3.10+
-- n8n（本機或遠端皆可）
+- discord.py 2.6.4（目前使用的部署版本，支援 DynamicItem 與選單）
 - Google 帳號（用來建立試算表與 API 憑證）
+- Google Sheets API，以及可存取該試算表的 OAuth `client_id`、`client_secret`、`refresh_token`
 - **Groq API Key**（免費，不需信用卡，到 [console.groq.com](https://console.groq.com) 申請）
 - 一個 Discord Bot：
   - 已建立於 Discord Developer Portal
@@ -72,20 +78,23 @@ cp env.example .env
 
 ```env
 DISCORD_TOKEN=YOUR_DISCORD_BOT_TOKEN
-N8N_WEBHOOK_URL=http://localhost:5678/webhook/discord-shopping
 ALLOWED_CHANNEL_IDS=123456789012345678,987654321098765432
 GROQ_API_KEY=gsk_your_groq_api_key
+SHEET_ID=YOUR_GOOGLE_SPREADSHEET_ID
+GOOGLE_CREDENTIALS=/run/secrets/google-oauth.json
 ```
 
 * `DISCORD_TOKEN`
 
   * 從 Discord Developer Portal → 你的應用 → Bot → Reset Token 後取得的新 Token
   * **不要** 直接寫死在 `bot.py` 裡
-* `N8N_WEBHOOK_URL`
+* `SHEET_ID`
 
-  * n8n Workflow 的 **Production Webhook URL**
-  * 形如 `http://<your-n8n-host>/webhook/discord-shopping`
-  * 注意：**不是** `/webhook-test/...`
+  * 試算表網址 `/d/` 後、下一個 `/` 前的 ID
+* `GOOGLE_CREDENTIALS`
+
+  * OAuth JSON 檔案路徑，檔案包含 `client_id`、`client_secret`、`refresh_token`
+  * 憑證檔放在 repo 外，檔案權限設為 `600`，Docker 使用唯讀掛載
 * `ALLOWED_CHANNEL_IDS`
 
   * 允許 bot 處理的頻道 ID，逗號分隔
@@ -101,11 +110,11 @@ GROQ_API_KEY=gsk_your_groq_api_key
 |------|------|------|
 | `GROQ_MODEL` | `openai/gpt-oss-120b` | 解析訊息、結算時比對商品用的文字模型 |
 | `VISION_MODEL` | `qwen/qwen3.8-27b` | 結算時讀截圖用的 Groq 視覺模型（沒設本地模型時使用，或本地失敗時的後備） |
-| `LOCAL_VISION_URL` | （不用本地） | 本地視覺模型的 OpenAI 相容網址，例如 Ollama：`http://host.docker.internal:11434/v1`。有設就先用本地讀截圖，截圖不會離開自己的機器 |
+| `LOCAL_VISION_URL` | （不用本地） | 本地視覺模型的 OpenAI 相容網址，例如 Ollama `http://host.docker.internal:11434/v1`。本地失敗、逾時或讀不完整時，截圖會送到 Groq 後備模型 |
 | `LOCAL_VISION_MODEL` | `qwen3-vl:8b-instruct` | 本地視覺模型的名稱 |
 | `LOCAL_VISION_TIMEOUT` | `45` | 本地讀一張圖最多等幾秒，超過就退回 Groq |
-| `N8N_SETTLE_WEBHOOK_URL` | `N8N_WEBHOOK_URL` 加上 `-settle` | 結算用 workflow 的 webhook |
-| `STATE_DIR` | （不存檔） | 存結算紀錄的資料夾。有設的話 bot 重啟後還能 `認領` |
+| `LOCAL_VISION_KEEP_ALIVE` | `2m` | 讀完後本地模型在顯示卡上留多久。和別的模型共用顯示卡時別設成永久，否則顯示記憶體不夠、整台機器會卡死 |
+| `STATE_DIR` | （不存本機快取） | 本機結算快取資料夾。完整結算狀態也會寫入試算表的 `_bot` 分頁 |
 
 ### 2. 安裝相依套件
 
@@ -119,7 +128,54 @@ python -m pip install -r requirements.txt
 python bot.py
 ```
 
-### 部署（Docker Compose）
+### v2 部署（Docker Compose）
+
+v2 的 bot 服務使用以下設定範例。`shoppinglist-bot` 映像採用已驗證的固定套件版本，程式碼和 OAuth 憑證分別唯讀掛載。
+
+```yaml
+name: shoppinglist
+services:
+  bot:
+    image: shoppinglist-bot
+    working_dir: /app
+    command: python -u bot.py
+    restart: unless-stopped
+    volumes:
+      - ./ShoppingList-Discord-Bot:/app:ro
+      - bot_state:/data
+      - ./v2-secrets/google-oauth.json:/run/secrets/google-oauth.json:ro
+    env_file: ./ShoppingList-Discord-Bot/.env
+    environment:
+      GOOGLE_CREDENTIALS: /run/secrets/google-oauth.json
+      LOCAL_VISION_URL: http://host.docker.internal:11434/v1
+      LOCAL_VISION_MODEL: qwen3-vl:8b-instruct
+      STATE_DIR: /data
+      PYTHONDONTWRITEBYTECODE: "1"
+      TZ: Asia/Taipei
+    extra_hosts: ["host.docker.internal:host-gateway"]
+volumes:
+  bot_state:
+```
+
+`SHEET_ID` 填入 bot 的 `.env`。OAuth 憑證檔由部署者提供，保存於 repo 外的 `v2-secrets` 目錄，權限為 `600`。
+本地讀圖可連到 AI-Hotel 開發時使用的同一個 Ollama 與同一個模型。連線失敗、逾時或讀不完整時會改用 Groq，該次截圖會送至 Groq。
+
+啟動時會補齊固定 ID、結算紀錄與隱藏狀態分頁，並恢復已保存的結算。結算確認、追加、認領、改歸屬及結束認領會先保存帳本與完整狀態，再公布結果。
+`STATE_DIR` 保存本機快取，試算表的 `_bot` 分頁保存恢復狀態，`結算紀錄` 分頁提供商品明細與每人小計。
+
+驗證可執行 `python test_bot.py`、`python test_settle.py`、`python test_store.py`。舊版 workflow 的 JavaScript 測試可獨立執行。
+
+### 資料與並行編輯
+
+商品 ID 用來在操作前重新定位列，bot 的表格操作由鎖依序執行。Google Sheets 的刪列與儲存格寫入 API 仍使用列位置，重新定位與送出寫入之間有短暫時間差，人工同時排序、插入或刪列仍可能改變位置。ID 欄應保持原值與唯一性。
+
+草稿、刪除選項及重複登記確認保留 10 分鐘，屬於記憶體內的待確認操作。已公布結算的按鈕與選單可透過持久化結算資料於重啟後繼續使用。
+
+Google 寫入回應遺失時，bot 會讀回完整狀態核對，核對完成前保留已確認操作並阻擋舊快照覆寫。追加帳本已完成、寫入回應及讀回又同時失敗的情況下，帳本可於重試或啟動時恢復，Discord 更新通知仍可能需要補發。
+
+舊版尚未完成的追加若缺少固定商品 ID，回寫會停止並要求核對原登記資料。
+
+### 舊版 n8n 部署參考
 
 正式環境把 n8n 和 bot 放在同一個 compose 專案，開機自動啟動，bot 用 compose 網路裡的 `n8n` 主機名連 webhook。
 compose 檔不在 repo 裡（放在 repo 的上一層），以下是目前使用的內容：
@@ -213,9 +269,8 @@ AI 會自動辨識：
 - 只會在「購買人是自己」的列裡找。
 - 有網址就先用**商品 ID** 比對（淘寶／天貓的 `id=`、京東的 `item.jd.com/<ID>`），抓不到 ID 的短連結比去掉參數的網址；
   沒有網址或網址對不到時，再比商品名稱（完全相同優先，其次互相包含）。
-- 同一層對到好幾筆時不會刪第一筆：workflow 回 `status: "choose"` 和候選清單，bot 列出編號讓使用者選
-  （`刪除 2`，或回覆那則訊息打 `2`），再帶著列號和那一列當時的內容去刪。列號位移時 workflow 會用內容找回同一筆，
-  認不出來就回 `changed`、什麼都不刪。邏輯在 `workflow/delete_target.js`，改完跑 `python3 workflow/build_delete.py`。
+- 名稱比對會先做繁簡轉換。同一層對到好幾筆時提供選擇按鈕，也可打 `刪除 2` 或回覆選項訊息打 `2`。
+  v2 使用使用者選定的固定商品 ID 重新定位與核對後刪除。
 - 找不到時回覆「在你加入的清單裡找不到這筆商品」。
 
 ### 結算／認領／結束認領
@@ -226,13 +281,16 @@ AI 會自動辨識：
 認領 3              ← 沒對到人的 #3 是我的
 認領 3 5 7 / 3-6    ← 一次認領多件
 認領 3 @某人         ← 幫別人認領
+改 3 5 @某人         ← 下單人／代傳人更正歸屬
 ```
 
-草稿上按 ✅ 確認、❌ 取消；正式結果上按 🏁 結束認領。完整說明見 [USAGE.md](USAGE.md)。
+草稿提供「✅ 確認」「❌ 取消」，正式結果提供認領、改歸屬與結束認領按鈕。認領可從選單一次挑多件，原文字指令與表情仍可使用。完整說明見 [USAGE.md](USAGE.md)。
 
 ---
 
-## n8n Workflow Setup / n8n 工作流程設定
+## 舊版 n8n Workflow Setup / n8n 工作流程設定
+
+以下為原 n8n 架構的維護參考。v2 的 Python 表格操作在 `sheets.py`，購物比對邏輯在 `shopping.py`，結算邏輯在 `settle.py`。
 
 整體流程示意：
 
@@ -712,16 +770,21 @@ git push -u origin main
 
   * 確認 `DISCORD_TOKEN` 是否正確、Bot 是否有加入伺服器
   * 確認 `ALLOWED_CHANNEL_IDS` 是否包含目前頻道 ID
-  * 確認訊息是否以 `買` 開頭
+  * 確認訊息使用 `買`、`刪除`、`結算` 等支援的指令，或操作該筆結算的按鈕
+* **Google Sheets 沒有寫入（v2）**
+
+  * 檢查 `SHEET_ID` 與 `GOOGLE_CREDENTIALS`，以及唯讀掛載的 OAuth JSON 是否可讀
+  * 確認 OAuth 帳號可存取目標試算表，查看 bot log 的 Google API 錯誤
+  * 確認淘寶／京東分頁保留必要標題與固定 ID，結算紀錄及 `_bot` 分頁可供 bot 更新
 * **AI 解析失敗（回覆「AI 解析服務暫時忙碌」）**
 
   * 確認 `GROQ_API_KEY` 是否正確設定在 `.env` 中
   * 到 [console.groq.com/settings/limits](https://console.groq.com/settings/limits) 確認 API 額度
   * Bot 有內建 429 rate limit 自動重試（最多 3 次），正常使用不太會撞到限制
-* **改了 n8n workflow 但沒生效**
+* **改了 n8n workflow 但沒生效（舊版）**
 
   * Ctrl+S 只存草稿，要按 **Publish**；用 CLI 發布的話要重啟 n8n
-* **回覆「請求已送出，但 n8n 超過 30 秒沒回應」**
+* **表格回應逾時**
 
   * Google Sheets 偶爾很慢，這筆通常其實已經寫進去了，先看表格再決定要不要重送
 * **結算沒反應或讀不到金額**
@@ -732,11 +795,11 @@ git push -u origin main
 
   * 只有下單人（或代傳的人）按的才算，而且要按在**最新**那張草稿上；追加截圖後舊草稿會被刪掉換新的
   * 草稿只存在記憶體，bot 重啟後沒確認的草稿就沒了，要重新傳
-* **n8n 沒有任何執行紀錄**
+* **n8n 沒有任何執行紀錄（舊版）**
 
   * 確認 workflow 狀態是 Active
   * 確認 `.env` 中使用的是 `/webhook/discord-shopping` 而不是 `/webhook-test/...`
-* **Google Sheets 沒有寫入**
+* **Google Sheets 沒有寫入（舊版 n8n）**
 
   * 在 n8n → Executions 中查看：
 
